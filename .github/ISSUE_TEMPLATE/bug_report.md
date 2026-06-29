@@ -25,3 +25,7 @@ labels: bug
 **Logs / artifacts**
 <!-- Relevant output, the validation report, or a run dir. For a "perfect score",
      check it isn't a blocked/degenerate capture (capture.pollution / capture.blocked). -->
+
+**Responsible disclosure**
+<!-- Do not include secrets, cookies, private URLs, proprietary captures, or security
+     vulnerabilities here. Report vulnerabilities privately via SECURITY.md. -->

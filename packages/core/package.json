@@ -2,6 +2,18 @@
   "name": "@cloner/core",
   "version": "0.1.0",
   "private": true,
+  "description": "Core compiler adapter and file-map helpers for the ditto.site service.",
+  "license": "MIT",
+  "author": "ion-design",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ion-design/ditto.site.git",
+    "directory": "packages/core"
+  },
+  "bugs": {
+    "url": "https://github.com/ion-design/ditto.site/issues"
+  },
+  "homepage": "https://github.com/ion-design/ditto.site#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

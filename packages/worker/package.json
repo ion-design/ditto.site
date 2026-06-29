@@ -2,6 +2,18 @@
   "name": "@cloner/worker",
   "version": "0.1.0",
   "private": true,
+  "description": "Queue worker for ditto.site clone generation, storage, and optional verification.",
+  "license": "MIT",
+  "author": "ion-design",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ion-design/ditto.site.git",
+    "directory": "packages/worker"
+  },
+  "bugs": {
+    "url": "https://github.com/ion-design/ditto.site/issues"
+  },
+  "homepage": "https://github.com/ion-design/ditto.site#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

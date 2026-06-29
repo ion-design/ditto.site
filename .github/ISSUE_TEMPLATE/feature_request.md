@@ -17,3 +17,7 @@ labels: enhancement
 **Scope notes**
 <!-- Does this touch the deterministic compiler (clone fidelity/gates) or only the
      service layer? Anything that affects clone output should stay deterministic. -->
+
+**Responsible-use impact**
+<!-- Note any safeguards needed for public clone endpoints, third-party captures,
+     brand/trademark confusion, or abuse prevention. -->

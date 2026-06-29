@@ -2,6 +2,18 @@
   "name": "@cloner/db",
   "version": "0.1.0",
   "private": true,
+  "description": "Drizzle schema, migrations, repository, and queue integration for ditto.site.",
+  "license": "MIT",
+  "author": "ion-design",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ion-design/ditto.site.git",
+    "directory": "packages/db"
+  },
+  "bugs": {
+    "url": "https://github.com/ion-design/ditto.site/issues"
+  },
+  "homepage": "https://github.com/ion-design/ditto.site#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -13,16 +25,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "drizzle-orm": "^0.38.3",
+    "drizzle-orm": "^0.45.2",
     "pg": "^8.13.1",
     "pg-boss": "^10.1.5"
   },
   "devDependencies": {
     "@cloner/test-utils": "*",
+    "@types/node": "22.10.5",
     "@types/pg": "^8.11.10",
-    "drizzle-kit": "^0.30.1",
+    "drizzle-kit": "^0.31.10",
     "tsx": "4.22.4",
-    "typescript": "5.7.3",
-    "@types/node": "22.10.5"
+    "typescript": "5.7.3"
   }
 }

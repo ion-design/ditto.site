@@ -6,6 +6,19 @@ so minor/patch semantics are not yet guaranteed.
 
 ## [Unreleased]
 
+### Added — Open-source readiness
+
+- Added support, release, responsible-use, CODEOWNERS, and gitattributes files.
+- Made workspace package metadata explicit for license and repository scanners.
+- Tightened contributor and PR checklists around runtime audit, documentation,
+  responsible use, and committed artifacts.
+
+### Changed — Generated app dependency templates
+
+- Updated generated Next apps to the current Next 15 line with React 19.
+- Updated generated Vite apps to Vite 6.4 with React 19, keeping the generated
+  app Node floor compatible with the repo's `>=20` engine policy.
+
 ### Added — Service layer (REST + MCP API)
 
 A hosted service around the deterministic compiler, as an npm-workspaces monorepo

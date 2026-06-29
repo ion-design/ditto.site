@@ -7,7 +7,7 @@ fixtures double as the regression suite.
 ## Setup
 
 ```bash
-npm install                      # installs all workspaces
+npm ci                           # installs the locked workspace graph
 npx playwright install chromium  # for capture / browser-gated tests
 ```
 
@@ -31,9 +31,13 @@ npx playwright install chromium  # for capture / browser-gated tests
   service is a wrapper; clone output must stay byte-deterministic (rubric Gate 6).
   Golden-file tests rely on this.
 - Every change should keep `npm run typecheck` and `npm test` green.
+- Keep runtime dependencies clean with `npm audit --omit=dev --audit-level=moderate`.
 - Database schema changes: edit `packages/db/src/schema.ts`, then
   `npm run db:generate` to produce a migration, and commit it.
 - Keep new code in the style of the surrounding code (naming, comments, idiom).
+- Follow [docs/RESPONSIBLE_USE.md](docs/RESPONSIBLE_USE.md). Changes that make
+  phishing, impersonation, access-control bypass, or unbounded third-party
+  capture easier are not acceptable.
 
 ## Database migrations
 
@@ -52,6 +56,7 @@ npm run db:migrate    # applies to $DATABASE_URL
    include benchmark results (`npm run bench`).
 
 By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
+Support expectations are documented in [SUPPORT.md](SUPPORT.md).
 
 ## Reporting bugs & security issues
 

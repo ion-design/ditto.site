@@ -10,7 +10,14 @@
 
 - [ ] `npm run typecheck` passes
 - [ ] `npm test` passes
+- [ ] `npm audit --omit=dev --audit-level=moderate` passes, or residuals are explained
 - [ ] Added/updated tests for the change
+
+## Open-source readiness
+
+- [ ] Documentation updated where behavior, setup, deployment, or support expectations changed
+- [ ] No secrets, private URLs, proprietary captures, or generated artifacts were committed
+- [ ] Change follows the responsible-use policy
 
 ## Compiler determinism
 

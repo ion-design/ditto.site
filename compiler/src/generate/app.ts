@@ -2528,15 +2528,15 @@ export const PACKAGE_JSON = `{
     "start": "next start"
   },
   "dependencies": {
-    "next": "14.2.21",
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "next": "15.5.19",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
     "typescript": "5.7.3",
     "@types/node": "22.10.5",
-    "@types/react": "18.3.18",
-    "@types/react-dom": "18.3.5"
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3"
   }
 }
 `;
@@ -2552,15 +2552,15 @@ export const PACKAGE_JSON_TW = `{
     "start": "next start"
   },
   "dependencies": {
-    "next": "14.2.21",
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "next": "15.5.19",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
     "typescript": "5.7.3",
     "@types/node": "22.10.5",
-    "@types/react": "18.3.18",
-    "@types/react-dom": "18.3.5",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
     "tailwindcss": "^4",
     "@tailwindcss/postcss": "^4"
   }
@@ -2578,16 +2578,16 @@ export const PACKAGE_JSON_VITE = `{
     "start": "vite preview"
   },
   "dependencies": {
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^5.4.11",
+    "@vitejs/plugin-react": "^4.7.0",
+    "vite": "^6.4.3",
     "typescript": "5.7.3",
     "@types/node": "22.10.5",
-    "@types/react": "18.3.18",
-    "@types/react-dom": "18.3.5"
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3"
   }
 }
 `;
@@ -2603,16 +2603,16 @@ export const PACKAGE_JSON_VITE_TW = `{
     "start": "vite preview"
   },
   "dependencies": {
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^5.4.11",
+    "@vitejs/plugin-react": "^4.7.0",
+    "vite": "^6.4.3",
     "typescript": "5.7.3",
     "@types/node": "22.10.5",
-    "@types/react": "18.3.18",
-    "@types/react-dom": "18.3.5",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
     "tailwindcss": "^4",
     "@tailwindcss/postcss": "^4"
   }

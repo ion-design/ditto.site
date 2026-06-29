@@ -3,3 +3,6 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/ion-design/ditto.site/security/advisories/new
     about: Please report security issues privately — do not open a public issue.
+  - name: Support policy
+    url: https://github.com/ion-design/ditto.site/blob/main/SUPPORT.md
+    about: Read what information to include and what support expectations apply.

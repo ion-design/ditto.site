@@ -78,9 +78,14 @@ export function serveDir(rootDir: string): Promise<{ url: string; close: () => P
 /** Whether a Playwright Chromium browser appears installed (browser tests skip if not). */
 export function hasChromium(): boolean {
   try {
-    const base = process.env.PLAYWRIGHT_BROWSERS_PATH || join(homedir(), ".cache", "ms-playwright");
-    if (!existsSync(base)) return false;
-    return readdirSync(base).some((d) => d.startsWith("chromium"));
+    const bases = process.env.PLAYWRIGHT_BROWSERS_PATH
+      ? [process.env.PLAYWRIGHT_BROWSERS_PATH]
+      : [
+          join(homedir(), ".cache", "ms-playwright"),
+          join(homedir(), "Library", "Caches", "ms-playwright"),
+          ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, "ms-playwright")] : []),
+        ];
+    return bases.some((base) => existsSync(base) && readdirSync(base).some((d) => d.startsWith("chromium")));
   } catch {
     return false;
   }

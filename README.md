@@ -60,7 +60,7 @@ recipes still need a stable target.
 ## Quickstart
 
 ```bash
-npm install
+npm ci
 npx playwright install chromium
 
 # Single-page clone, Tailwind output by default.
@@ -91,6 +91,10 @@ npm run validate-site -- runs/site-example.com/<timestamp> --validate-concurrenc
 
 The root scripts forward into the `compiler` workspace. Running the same commands
 from `compiler/` also works.
+
+The repository is MIT-licensed open source. The npm workspaces are intentionally
+marked `private` for now because the source package boundaries are available for
+contributors, but the packages are not yet prepared for public npm publishing.
 
 Multi-page generation defaults to the fast no-validation path. For production
 delivery, keep first response and QA as separate phases: run single-page first,
@@ -318,6 +322,15 @@ entrance animations remain outside the deterministic contract unless a safe,
 observable recipe exists. Unsupported motion is frozen rather than shipped as a
 broken imitation.
 
+## Responsible Use
+
+Use ditto.site only where you have the right to inspect, copy, transform, and
+operate on the target content. Do not use it for phishing, impersonation,
+credential capture, bypassing access controls, or high-volume third-party
+capture without permission.
+
+See [docs/RESPONSIBLE_USE.md](docs/RESPONSIBLE_USE.md) for the project policy.
+
 ## Contributing
 
 Use `npm run typecheck` and `npm test` before opening a PR. Browser tests require
@@ -326,7 +339,8 @@ stack. Changes that alter compiler output should include focused fixture or
 benchmark evidence.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). For questions and support expectations,
+see [SUPPORT.md](SUPPORT.md).
 
 ## License
 

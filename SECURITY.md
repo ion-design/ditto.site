@@ -33,7 +33,19 @@ See [`docs/DEPLOY.md`](docs/DEPLOY.md) and [`docs/SERVICE.md`](docs/SERVICE.md).
 
 ## Dependency advisories
 
-Dependencies are monitored by [Dependabot](.github/dependabot.yml). One known item:
-the compiler's build harness and the **generated** app pin `next@14.2.21`, which has
-a published advisory. Bumping it should be paired with a benchmark re-run (it affects
-`next build` and the emitted `package.json`), so it's tracked rather than auto-applied.
+Dependencies are monitored by [Dependabot](.github/dependabot.yml). Use
+`npm audit --omit=dev --audit-level=moderate` for runtime dependency checks.
+
+Known residual items:
+
+- A full `npm audit` reports a moderate `esbuild` advisory through
+  `drizzle-kit -> @esbuild-kit/esm-loader -> @esbuild-kit/core-utils`. This is a
+  development-only migration generator path. The audit-suggested downgrade to
+  `drizzle-kit@0.18.1` breaks the current `drizzle-kit generate` workflow, so do
+  not run `npm audit fix --force` blindly.
+- Generated Next.js apps use the current Next 15 line instead of the older 14.x
+  template. npm may still report a moderate PostCSS advisory inherited through
+  Next until the upstream package carries a patched PostCSS version.
+
+Generated apps are static exports by default. Review and update their
+`package.json` before operating them as long-lived public services.
