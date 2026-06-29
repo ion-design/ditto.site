@@ -13,9 +13,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "drizzle-orm": "^0.38.3",
+    "drizzle-orm": "^0.45.2",
     "pg": "^8.13.1",
-    "pg-boss": "^10.1.5"
+    "pg-boss": "^12.23.1"
   },
   "devDependencies": {
     "@cloner/test-utils": "*",
