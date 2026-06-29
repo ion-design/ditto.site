@@ -1,0 +1,17 @@
+{
+  "name": "@cloner/test-utils",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "4.22.4",
+    "typescript": "5.7.3",
+    "@types/node": "22.10.5"
+  }
+}

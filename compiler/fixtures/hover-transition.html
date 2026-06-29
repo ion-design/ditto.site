@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hover transition fixture</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; padding: 60px; }
+    /* a button whose hover EASES (transition), not snaps */
+    .btn {
+      display: inline-block; padding: 12px 24px; border-radius: 8px;
+      background: rgb(238, 238, 238); color: rgb(51, 51, 51);
+      transition: background-color 0.25s ease, color 0.25s ease, transform 0.2s ease;
+      cursor: pointer;
+    }
+    .btn:hover { background: rgb(43, 80, 214); color: rgb(255, 255, 255); transform: translateY(-2px); }
+    /* a link with no transition: its hover should NOT gain a transition rule */
+    .plain { display: inline-block; margin-left: 24px; color: rgb(43, 80, 214); }
+    .plain:hover { color: rgb(20, 30, 90); }
+  </style>
+</head>
+<body>
+  <a class="btn" href="/go">Hover me (eased)</a>
+  <a class="plain" href="/plain">Plain hover (snaps)</a>
+</body>
+</html>

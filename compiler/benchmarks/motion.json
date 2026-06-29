@@ -1,0 +1,8 @@
+[
+  { "id": "motion-001", "url": "https://rauno.me/", "tier": "motion", "notes": "personal site, ~7 CSS @keyframes animations + many transitions" },
+  { "id": "motion-002", "url": "https://www.sive.rs/", "tier": "motion", "notes": "minimal content site, light motion (regression baseline)" },
+  { "id": "motion-003", "url": "https://emilkowal.ski/", "tier": "motion", "notes": "animation-specialist site; entrance motion (some WAAPI finishes before capture)" },
+  { "id": "motion-004", "url": "https://leerob.io/", "tier": "motion", "notes": "personal site, subtle CSS transitions/animations" },
+  { "id": "motion-005", "url": "https://www.joshwcomeau.com/", "tier": "motion", "notes": "playful CSS animations (hero canvas is out of scope, frozen)" },
+  { "id": "motion-006", "url": "https://framer.com/", "tier": "motion", "notes": "Framer Motion (WAAPI) + 16 infinite CSS keyframes — declarative-motion showcase" }
+]

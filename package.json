@@ -1,0 +1,53 @@
+{
+  "name": "ditto.site",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ditto.site deterministic website compiler: compile a public URL into a Next.js app from browser-captured evidence with a REST + MCP service layer.",
+  "license": "MIT",
+  "author": "ion-design",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ion-design/ditto.site.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ion-design/ditto.site/issues"
+  },
+  "homepage": "https://github.com/ion-design/ditto.site#readme",
+  "keywords": [
+    "ditto.site",
+    "website-compiler",
+    "nextjs",
+    "playwright",
+    "deterministic",
+    "compiler",
+    "mcp",
+    "hono",
+    "drizzle"
+  ],
+  "type": "module",
+  "workspaces": [
+    "compiler",
+    "packages/*"
+  ],
+  "scripts": {
+    "clone": "npm run clone --workspace clone-static --",
+    "clone-site": "npm run clone-site --workspace clone-static --",
+    "validate-site": "npm run validate-site --workspace clone-static --",
+    "bench": "npm run bench --workspace clone-static --",
+    "bench-site": "npm run bench-site --workspace clone-static --",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:api": "npm run dev --workspace @cloner/api",
+    "dev:worker": "npm run dev --workspace @cloner/worker",
+    "db:generate": "npm run generate --workspace @cloner/db",
+    "db:migrate": "npm run migrate --workspace @cloner/db"
+  },
+  "devDependencies": {
+    "tsx": "4.22.4",
+    "typescript": "5.7.3",
+    "@types/node": "22.10.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

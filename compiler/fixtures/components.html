@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Component extraction fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #1a1a1a; background: #fff; }
+    header { border-bottom: 1px solid #e5e5e5; }
+    nav { max-width: 960px; margin: 0 auto; padding: 16px 24px; display: flex; gap: 24px; }
+    nav a { color: #374151; text-decoration: none; font-size: 15px; font-weight: 500; }
+    main { max-width: 960px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 34px; margin: 0 0 8px; }
+    .intro { color: #6b7280; font-size: 17px; margin: 0 0 40px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
+    .card-link { display: block; padding: 20px; color: inherit; text-decoration: none; }
+    .badge { display: inline-block; background: #eef2ff; color: #4f46e5; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
+    .card-title { font-size: 19px; margin: 14px 0 6px; line-height: 1.3; }
+    .card-body { font-size: 14px; color: #6b7280; line-height: 1.6; margin: 0 0 14px; }
+    .card-cta { font-size: 14px; font-weight: 600; color: #4f46e5; }
+    footer { max-width: 960px; margin: 0 auto; padding: 32px 24px; color: #9ca3af; font-size: 13px; border-top: 1px solid #e5e5e5; }
+  </style>
+</head>
+<body>
+  <header>
+    <nav aria-label="Primary">
+      <a href="https://example.com/">Home</a>
+      <a href="https://example.com/features">Features</a>
+      <a href="https://example.com/pricing">Pricing</a>
+      <a href="https://example.com/docs">Docs</a>
+    </nav>
+  </header>
+  <main>
+    <h1>From the blog</h1>
+    <p class="intro">Notes, guides, and release updates from the team.</p>
+    <div class="grid">
+      <article class="card">
+        <a class="card-link" href="https://example.com/post/alpha">
+          <span class="badge">News</span>
+          <h3 class="card-title">Announcing the alpha release</h3>
+          <p class="card-body">A first look at everything that shipped in our earliest public build.</p>
+          <span class="card-cta">Read more &rarr;</span>
+        </a>
+      </article>
+      <article class="card">
+        <a class="card-link" href="https://example.com/post/grid-guide">
+          <span class="badge">Guide</span>
+          <h3 class="card-title">A practical guide to CSS grid</h3>
+          <p class="card-body">Lay out responsive card collections without fighting the box model.</p>
+          <span class="card-cta">Read more &rarr;</span>
+        </a>
+      </article>
+      <article class="card">
+        <a class="card-link" href="https://example.com/post/perf">
+          <span class="badge">Engineering</span>
+          <h3 class="card-title">Shipping faster pages in 2026</h3>
+          <p class="card-body">The performance budget we hold every release to, and why it matters.</p>
+          <span class="card-cta">Read more &rarr;</span>
+        </a>
+      </article>
+      <article class="card">
+        <a class="card-link" href="https://example.com/post/changelog">
+          <span class="badge">News</span>
+          <h3 class="card-title">What changed this month</h3>
+          <p class="card-body">A roundup of the fixes and features that landed across the platform.</p>
+          <span class="card-cta">Read more &rarr;</span>
+        </a>
+      </article>
+      <article class="card">
+        <a class="card-link" href="https://example.com/post/design">
+          <span class="badge">Design</span>
+          <h3 class="card-title">Rethinking our color system</h3>
+          <p class="card-body">How we moved to semantic tokens and what we learned along the way.</p>
+          <span class="card-cta">Read more &rarr;</span>
+        </a>
+      </article>
+      <article class="card">
+        <a class="card-link" href="https://example.com/post/community">
+          <span class="badge">Community</span>
+          <h3 class="card-title">Highlights from the meetup</h3>
+          <p class="card-body">Talks, demos, and conversations from our first in-person gathering.</p>
+          <span class="card-cta">Read more &rarr;</span>
+        </a>
+      </article>
+    </div>
+  </main>
+  <footer>&copy; 2026 Example, Inc. All rights reserved.</footer>
+</body>
+</html>

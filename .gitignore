@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+compiler/node_modules/
+
+# Build output
+compiler/dist/
+*.tsbuildinfo
+
+# Run artifacts (immutable captures/generated apps/validation) — large, not committed
+runs/
+
+# Build harness transient inputs (deps reinstalled from package.json/lockfile)
+compiler/.harness/src/
+compiler/.harness/public/
+compiler/.harness/out/
+compiler/.harness/.next/
+compiler/.harness/next.config.mjs
+compiler/.harness/tsconfig.json
+compiler/.harness/next-env.d.ts
+
+# Generated app build artifacts inside runs are covered by runs/, but ignore stray ones
+.next/
+out/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+compiler/.harness2/src/
+compiler/.harness2/public/
+compiler/.harness2/out/
+compiler/.harness2/.next/
+compiler/.harness2/next.config.mjs
+compiler/.harness2/tsconfig.json
+compiler/.harness2/next-env.d.ts
+
+# Service layer (env + per-worker build harnesses + local artifacts)
+.env
+.env.*
+!.env.example
+packages/*/dist/
+packages/*/.turbo/
+.harnesses/
+local-data/
+
+# Local clone outputs + capture bridge certs (this session)
+compiler/output/
+compiler/output-final/
+compiler/.bridge/*.pem
+
+compiler/compiler/

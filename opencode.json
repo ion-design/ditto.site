@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "disabled_providers": ["copilot"],
+  "permission": {
+    "bash": {
+      "rm -rf*": "deny",
+      "git reset --hard*": "deny",
+      "git clean -fd*": "deny",
+      "*": "allow"
+    },
+    "edit": "allow",
+    "webfetch": "allow",
+    "external_directory": "allow"
+  },
+  "mcp": {
+    "image-tools": {
+      "type": "local",
+      "command": ["env", "bunx", "tsx", ".opencode/mcp/image-tools/index.ts"],
+      "enabled": false
+    }
+  }
+}

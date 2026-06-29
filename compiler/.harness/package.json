@@ -1,0 +1,23 @@
+{
+  "name": "clone-build-harness",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "next build"
+  },
+  "dependencies": {
+    "next": "14.2.21",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "@tailwindcss/postcss": "^4.3.1",
+    "@types/node": "22.10.5",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "tailwindcss": "^4.3.1",
+    "typescript": "5.7.3",
+    "vite": "^5.4.11"
+  }
+}

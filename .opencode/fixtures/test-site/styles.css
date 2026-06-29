@@ -1,0 +1,265 @@
+/* Capture fixture stylesheet — deliberately includes patterns that the cropin clone got wrong:
+   vh-based heights, full-bleed widths, lazy-load gating via class toggle, marquee transform,
+   pseudo-element decoration, multi-stop gradient. */
+
+:root {
+  --nav-h: 64px;
+  --accent: #22c55e;
+  --accent-dark: #166534;
+  --bg: #f8fafc;
+  --text: #0f172a;
+  --muted: #64748b;
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.5;
+}
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  height: var(--nav-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background: white;
+  border-bottom: 1px solid #e2e8f0;
+}
+.nav .logo {
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--text);
+}
+.nav nav {
+  display: flex;
+  gap: 16px;
+}
+.nav nav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+.nav nav a:hover {
+  color: var(--text);
+}
+
+/* === Section A: vh-relative hero ===
+   The point of this section: computed.minHeight resolves to 656px at capture,
+   1016px on the user's 1080-tall viewport. The capture's vh-detection pass
+   should flag this as ~91vh. */
+.hero {
+  min-height: calc(100vh - var(--nav-h));
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 32px;
+  text-align: center;
+  background: linear-gradient(135deg, #ecfdf5 0%, #f0f9ff 100%);
+}
+.hero h1 {
+  font-size: clamp(36px, 6vw, 64px);
+  margin: 0;
+}
+.hero p {
+  max-width: 56ch;
+  margin: 0;
+  color: var(--muted);
+}
+.hero .cta {
+  display: inline-block;
+  padding: 12px 24px;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  border-radius: 9999px;
+  text-decoration: none;
+  transition: transform 200ms;
+}
+.hero .cta:hover {
+  transform: translateY(-2px);
+}
+
+/* === Section B: full-width gradient with inner max-width container === */
+.features {
+  width: 100vw;
+  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+  padding: 80px 0;
+}
+.features .inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+.features h2 {
+  font-size: 36px;
+  margin: 0 0 32px;
+}
+.grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+}
+.card {
+  padding: 24px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 4px 12px rgba(0, 0, 0, 0.06);
+}
+.card .icon {
+  width: 32px;
+  height: 32px;
+  color: var(--accent-dark);
+  margin-bottom: 12px;
+}
+.card h3 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+.card p {
+  margin: 0;
+  color: var(--muted);
+}
+
+/* IntersectionObserver reveal — class .is-visible toggled via reveal.js */
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 600ms ease, transform 600ms ease;
+}
+.reveal.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* === Section C: lazy-loaded background image ===
+   The class .is-loaded is added once IO fires. Until then, no bg image — and the
+   browser does NOT GET-request the URL. capture/css-rules/<vp>.json will still
+   contain the rule though, so a CSS-asset-extraction pass should pick it up. */
+.lazy-bg {
+  width: 100%;
+  min-height: 480px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  background-color: #0f172a;
+  color: white;
+  text-align: center;
+  padding: 64px 24px;
+  overflow: hidden;
+}
+.lazy-bg::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(180deg, rgba(15, 23, 42, 0.4) 0%, rgba(15, 23, 42, 0.7) 100%);
+  z-index: 1;
+}
+.lazy-bg .inner {
+  position: relative;
+  z-index: 2;
+  max-width: 720px;
+}
+.lazy-bg h2 {
+  margin: 0 0 16px;
+  font-size: 36px;
+}
+.lazy-bg p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.85);
+}
+.lazy-bg.is-loaded {
+  background-image: url('./hero-bg.svg');
+  background-size: cover;
+  background-position: center;
+}
+/* Decorative content-image ::before that uses url() but is set in the stylesheet only. */
+.lazy-bg::after {
+  content: '';
+  position: absolute;
+  right: 24px;
+  bottom: 24px;
+  width: 64px;
+  height: 64px;
+  background-image: url('./decoration.svg');
+  background-size: contain;
+  background-repeat: no-repeat;
+  z-index: 2;
+  opacity: 0.85;
+}
+
+/* === Section D: marquee with overflow + transform translation === */
+.marquee {
+  padding: 64px 0;
+  background: white;
+  text-align: center;
+  overflow-x: hidden;
+}
+.marquee h2 {
+  margin: 0 0 24px;
+  font-size: 36px;
+}
+.marquee .track {
+  display: flex;
+  gap: 48px;
+  animation: scroll 20s linear infinite;
+  width: max-content;
+  padding: 0 24px;
+}
+.logo-tile {
+  flex: 0 0 auto;
+  height: 32px;
+  width: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+.logo-tile svg {
+  height: 100%;
+  width: 100%;
+}
+@keyframes scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* === Section E: detailed inline SVG === */
+.detailed-svg {
+  padding: 64px 24px;
+  text-align: center;
+}
+.detailed-svg h2 {
+  margin: 0 0 24px;
+  font-size: 36px;
+}
+.detailed-svg svg {
+  display: block;
+  margin: 0 auto;
+}
+
+/* === Footer === */
+.footer {
+  padding: 32px 24px;
+  background: #0f172a;
+  color: rgba(255, 255, 255, 0.7);
+  text-align: center;
+}

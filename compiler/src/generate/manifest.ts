@@ -1,0 +1,72 @@
+import type { IR } from "../normalize/ir.js";
+import type { Section } from "../infer/sections.js";
+import type { Tokens } from "../infer/tokens.js";
+import type { AssetGraph } from "../infer/assets.js";
+import type { FontGraph } from "../infer/fonts.js";
+import type { CaptureResult } from "../capture/capture.js";
+
+export const COMPILER_VERSION = "0.1.0";
+export const SCHEMA_VERSION = 1;
+
+export function buildManifest(args: {
+  ir: IR;
+  sections: Section[];
+  tokens: Tokens;
+  assetGraph: AssetGraph;
+  fontGraph: FontGraph;
+  capture: CaptureResult;
+  componentCount: number;
+}): Record<string, unknown> {
+  const { ir, sections, tokens, assetGraph, fontGraph, capture, componentCount } = args;
+
+  const byType: Record<string, number> = {};
+  let downloaded = 0, skipped = 0;
+  for (const e of assetGraph.entries) {
+    if (e.type === "css") continue;
+    byType[e.type] = (byType[e.type] ?? 0) + 1;
+    if (e.classification === "downloaded") downloaded++;
+    else skipped++;
+  }
+
+  const tokenCounts: Record<string, number> = {};
+  for (const [k, v] of Object.entries(tokens)) tokenCounts[k] = Object.keys(v).length;
+
+  const scrollHeights: Record<string, number> = {};
+  for (const [vp, d] of Object.entries(ir.doc.perViewport)) scrollHeights[vp] = d.scrollHeight;
+
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    compilerVersion: COMPILER_VERSION,
+    sourceUrl: ir.doc.sourceUrl,
+    capturedAt: capture.capturedAt,
+    viewports: ir.doc.viewports,
+    canonicalViewport: ir.doc.canonicalViewport,
+    doc: {
+      title: ir.doc.title,
+      lang: ir.doc.lang,
+      nodeCount: ir.doc.nodeCount,
+      scrollHeights,
+    },
+    sections: { count: sections.length, ids: sections.map((s) => s.id) },
+    tokens: tokenCounts,
+    assets: { total: downloaded + skipped, downloaded, skipped, byType },
+    fonts: {
+      total: fontGraph.entries.length,
+      resolved: fontGraph.entries.filter((f) => f.status === "resolved").length,
+      fallback: fontGraph.entries.filter((f) => f.status === "fallback").length,
+    },
+    components: { count: componentCount },
+    // Stage 2: capture-sanity audit — what overlays were dismissed, whether any
+    // still covered the page, video stills materialized, and per-viewport quiescence.
+    capture: {
+      dismissedOverlays: capture.dismissal?.dismissed ?? [],
+      overlaysRemoved: capture.dismissal?.removed ?? 0,
+      overlaysRemaining: capture.dismissal?.overlaysRemaining ?? 0,
+      blockingModal: capture.dismissal?.blocking ?? false,
+      videoStills: capture.dismissal?.videoStills ?? 0,
+      perViewport: capture.perViewport.map((p) => ({
+        viewport: p.viewport, overlaysRemaining: p.overlaysRemaining ?? 0, blocking: p.blocking ?? false, quiescent: p.quiescent ?? null,
+      })),
+    },
+  };
+}

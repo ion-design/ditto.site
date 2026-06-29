@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Carousel fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #1a1a1a; background: #fff; }
+    main { max-width: 760px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 30px; }
+
+    /* A Swiper-like single-slide carousel: a clipped viewport, a flex track moved
+       by translateX, prev/next buttons, and pagination bullets. */
+    .swiper { position: relative; overflow: hidden; border-radius: 12px; margin-top: 20px; }
+    .swiper-wrapper { display: flex; transition: transform .35s ease; will-change: transform; }
+    .swiper-slide { flex: 0 0 100%; min-width: 100%; height: 280px; display: flex; align-items: center; justify-content: center; font-size: 40px; color: #fff; }
+    .s0 { background: #4f46e5; } .s1 { background: #0891b2; } .s2 { background: #16a34a; } .s3 { background: #db2777; } .s4 { background: #ea580c; }
+    .swiper-button-prev, .swiper-button-next {
+      position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+      width: 44px; height: 44px; border-radius: 50%; border: 0; cursor: pointer;
+      background: rgba(255,255,255,.85); color: #1a1a1a; font-size: 20px;
+    }
+    .swiper-button-prev { left: 12px; } .swiper-button-next { right: 12px; }
+    .swiper-pagination { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+    .swiper-pagination-bullet { width: 10px; height: 10px; border-radius: 50%; border: 0; padding: 0; cursor: pointer; background: #d1d5db; }
+    .swiper-pagination-bullet-active { background: #4f46e5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Carousel</h1>
+    <p>A single-slide, transform-positioned carousel with prev/next and pagination.</p>
+
+    <div class="swiper" aria-roledescription="carousel" aria-label="Featured">
+      <div class="swiper-wrapper">
+        <div class="swiper-slide s0" aria-roledescription="slide" aria-label="1 of 5">Slide 1</div>
+        <div class="swiper-slide s1" aria-roledescription="slide" aria-label="2 of 5">Slide 2</div>
+        <div class="swiper-slide s2" aria-roledescription="slide" aria-label="3 of 5">Slide 3</div>
+        <div class="swiper-slide s3" aria-roledescription="slide" aria-label="4 of 5">Slide 4</div>
+        <div class="swiper-slide s4" aria-roledescription="slide" aria-label="5 of 5">Slide 5</div>
+      </div>
+      <button class="swiper-button-prev" aria-label="Previous slide">‹</button>
+      <button class="swiper-button-next" aria-label="Next slide">›</button>
+      <div class="swiper-pagination">
+        <button class="swiper-pagination-bullet swiper-pagination-bullet-active" aria-label="Go to slide 1"></button>
+        <button class="swiper-pagination-bullet" aria-label="Go to slide 2"></button>
+        <button class="swiper-pagination-bullet" aria-label="Go to slide 3"></button>
+        <button class="swiper-pagination-bullet" aria-label="Go to slide 4"></button>
+        <button class="swiper-pagination-bullet" aria-label="Go to slide 5"></button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    document.querySelectorAll(".swiper").forEach((root) => {
+      const wrap = root.querySelector(".swiper-wrapper");
+      const slides = [...root.querySelectorAll(".swiper-slide")];
+      const bullets = [...root.querySelectorAll(".swiper-pagination-bullet")];
+      let i = 0;
+      const go = (n) => {
+        i = Math.max(0, Math.min(slides.length - 1, n));
+        wrap.style.transform = "translateX(-" + (i * 100) + "%)";
+        bullets.forEach((b, k) => b.classList.toggle("swiper-pagination-bullet-active", k === i));
+      };
+      root.querySelector(".swiper-button-next").addEventListener("click", () => go(i + 1));
+      root.querySelector(".swiper-button-prev").addEventListener("click", () => go(i - 1));
+      bullets.forEach((b, k) => b.addEventListener("click", () => go(k)));
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Layout + Links fixture</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; }
+    body { font-family: system-ui, sans-serif; color: #101010; }
+    /* full-bleed sections: authored fluid (width:100%), must stay fluid in the clone */
+    .bleed { width: 100%; background: #eef2fd; padding: 16px 0; }
+    .bleed.alt { background: #f6f6f6; }
+    /* centered, capped container: fluid up to 960px, capped beyond */
+    .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+    nav { display: flex; gap: 16px; align-items: center; }
+    nav a { color: #2b50d6; text-decoration: none; }
+    h1 { font-size: 40px; line-height: 1.2; margin: 24px 0; }
+    /* a genuinely fixed-width element: must NOT be made fluid */
+    .fixed-box { width: 220px; height: 80px; background: #ccd; }
+    /* an absolute bar pinned to both edges (sticky-nav shape): width is redundant
+       with left:0;right:0 and must stay fluid */
+    .topbar { position: fixed; top: 0; left: 0; right: 0; height: 36px; background: rgb(20, 24, 40); color: #fff; z-index: 100; }
+  </style>
+</head>
+<body>
+  <div class="topbar">pinned bar</div>
+  <header class="bleed">
+    <nav class="container">
+      <a href="/">Home</a>
+      <a href="/pricing">Pricing</a>
+      <a href="/enterprise">Enterprise</a>
+      <a href="https://example.com/external">External</a>
+      <a href="#features">Features</a>
+    </nav>
+  </header>
+  <main>
+    <!-- a full-bleed replaced element (svg): its width:100% must NOT become width:auto,
+         which would collapse it to its intrinsic viewBox width at every viewport -->
+    <svg class="bleed-svg" viewBox="0 0 100 12" preserveAspectRatio="none" style="display:block;width:100%;height:12px;background:rgb(200,60,60)"><rect width="100" height="12" fill="rgb(200,60,60)"/></svg>
+    <section class="bleed alt">
+      <div class="container">
+        <h1 id="features">A full-width hero band</h1>
+        <p>The band background should reach both window edges at any width.</p>
+        <div class="fixed-box">fixed 220px</div>
+      </div>
+    </section>
+    <section class="bleed">
+      <div class="container">
+        <p>Second full-bleed band.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

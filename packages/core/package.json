@@ -1,0 +1,22 @@
+{
+  "name": "@cloner/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "clone-static": "*"
+  },
+  "devDependencies": {
+    "@cloner/test-utils": "*",
+    "tsx": "4.22.4",
+    "typescript": "5.7.3",
+    "@types/node": "22.10.5"
+  }
+}

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polish fixture — iframe + inline-block headings</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; color: #111; background: #fff; }
+    main { max-width: 760px; margin: 0 auto; padding: 56px 24px 96px; }
+    section { margin: 0 0 64px; }
+    .label { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #888; margin: 0 0 16px; }
+
+    /* Control: plain block heading */
+    h1.plain { font-size: 56px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; max-width: 520px; margin: 0; }
+
+    /* The linear/notion pattern: each word an inline-block, wraps across lines */
+    h1.words { font-size: 56px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; max-width: 520px; margin: 0; }
+    h1.words .w { display: inline-block; }
+
+    /* Same, plus zero-width inline spacer spans between words (staggered-text rigs) */
+    h1.spacer { font-size: 56px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; max-width: 520px; margin: 0; }
+    h1.spacer .w { display: inline-block; }
+    h1.spacer .sp { display: inline-block; width: 0.28em; }
+
+    /* iframe embed: a sized box that should be preserved as a placeholder */
+    .embed { width: 100%; max-width: 560px; height: 315px; border: 1px solid #ddd; border-radius: 12px; display: block; }
+    .map { width: 320px; height: 200px; border: 0; margin-top: 24px; }
+
+    .grid { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 24px; }
+    .chip { display: inline-block; background: #f1f5f9; border-radius: 8px; padding: 10px 16px; font-size: 15px; }
+
+    footer { border-top: 1px solid #eee; padding: 24px; text-align: center; color: #999; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <p class="label">Control · plain heading</p>
+      <h1 class="plain">Build better products with a faster planning tool</h1>
+    </section>
+
+    <section>
+      <p class="label">Words · inline-block per word</p>
+      <h1 class="words"><span class="w">Build</span> <span class="w">better</span> <span class="w">products</span> <span class="w">with</span> <span class="w">a</span> <span class="w">faster</span> <span class="w">planning</span> <span class="w">tool</span></h1>
+    </section>
+
+    <section>
+      <p class="label">Words + zero-width spacers</p>
+      <h1 class="spacer"><span class="w">Build</span><span class="sp"></span><span class="w">better</span><span class="sp"></span><span class="w">products</span><span class="sp"></span><span class="w">with</span><span class="sp"></span><span class="w">a</span><span class="sp"></span><span class="w">faster</span><span class="sp"></span><span class="w">planning</span><span class="sp"></span><span class="w">tool</span></h1>
+    </section>
+
+    <section>
+      <p class="label">iframe · video embed placeholder</p>
+      <iframe class="embed" src="https://www.youtube.com/embed/dQw4w9WgXcQ" title="Embedded video" allowfullscreen></iframe>
+      <iframe class="map" src="https://www.openstreetmap.org/export/embed.html" title="Map"></iframe>
+    </section>
+
+    <section>
+      <p class="label">flex chips (inline-block, control for layout)</p>
+      <div class="grid">
+        <span class="chip">Planning</span>
+        <span class="chip">Issues</span>
+        <span class="chip">Roadmaps</span>
+        <span class="chip">Insights</span>
+      </div>
+    </section>
+  </main>
+  <footer>Polish fixture · deterministic local test</footer>
+</body>
+</html>

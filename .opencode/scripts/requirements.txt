@@ -1,0 +1,7 @@
+playwright>=1.40
+httpx>=0.25
+tinycss2>=1.2
+pixelmatch>=0.3
+pillow>=10
+numpy>=1.26
+scipy>=1.11
