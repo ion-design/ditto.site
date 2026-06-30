@@ -160,6 +160,8 @@ export function stripDeliveryDataCids(appDir: string): { removed: number; kept: 
       for (const line of text.split("\n")) {
         if (line.includes("<DittoMotion")) {
           for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "motion");
+        } else if (line.includes("<DittoLottie")) {
+          for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "lottie");
         } else if (line.includes("<DittoWire") || line.includes("<Accordion")) {
           for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "interaction");
         } else if (line.includes("<DropdownMenu")) {
@@ -205,7 +207,7 @@ export function stripDeliveryDataCids(appDir: string): { removed: number; kept: 
     if (isCodeFile(f)) {
       next = rewriteDeliveryImportsAndMeta(next, componentsWithMetaAnchors);
       next = rewriteRuntimeAnchorQueries(next, basename(f));
-      if (/\bDittoMotion\b/.test(next)) next = next.replace(/"cid":/g, '"anchor":');
+      if (/\bDittoMotion\b|\bDittoLottie\b/.test(next)) next = next.replace(/"cid":/g, '"anchor":');
       next = next.replace(/\sdata-cid="([^"]+)"/g, (_full, cid: string) => {
         const anchor = anchors.get(cid)?.name;
         if (anchor) { kept++; return ` data-ditto-id="${anchor}"`; }
@@ -383,13 +385,13 @@ function pruneUnusedSvgDittoIds(files: string[]): void {
 }
 
 function rewriteRuntimeAnchorQueries(text: string, fileName: string): string {
-  if (!/^(?:DittoMotion|DittoWire|DropdownMenu|Accordion)\.tsx$/.test(fileName)) return text;
+  if (!/^(?:DittoMotion|DittoLottie|DittoWire|DropdownMenu|Accordion)\.tsx$/.test(fileName)) return text;
   let next = text
     .replace(/\bbyCid\b/g, "byDittoId")
     .replace(/const byDittoId = \(cid: string\): HTMLElement \| null => document\.querySelector\('\[data-cid="' \+ cid \+ '"\]'\);/g,
       `const byDittoId = (id: string): HTMLElement | null => document.querySelector('[data-ditto-id="' + id + '"]');`)
     .replace(/data-cid/g, "data-ditto-id");
-  if (fileName === "DittoMotion.tsx") {
+  if (fileName === "DittoMotion.tsx" || fileName === "DittoLottie.tsx") {
     next = next
       .replace(/\bcid: string/g, "anchor: string")
       .replace(/\.cid\b/g, ".anchor");

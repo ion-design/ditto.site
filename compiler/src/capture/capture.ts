@@ -826,6 +826,11 @@ export async function captureSite(opts: {
       if (opts.motion && vw === canonical) {
         try { motion = await captureMotion(page, { log }); }
         catch (e) { log({ event: "motion_error", error: String(e).slice(0, 200) }); }
+        // Register lottie source JSONs as assets so the asset stage downloads + materializes
+        // them (the in-page detector only records the URL; the fallback fetch grabs the file).
+        for (const l of motion?.lotties ?? []) {
+          if (l.src) recordAsset(l.src, "lottie", null, null, "lottie");
+        }
       }
 
       perViewport.push({

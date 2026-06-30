@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import { captureLotties, type LottieSpec } from "./lottie.js";
 
 /**
  * Stage 5 motion capture. Runs at the canonical viewport AFTER `tagElements` (so every
@@ -55,6 +56,8 @@ export type MotionCapture = {
   rotators: RotatorSpec[];
   reveals: RevealSpec[]; // scroll-triggered entrance reveals (start hidden, reveal on view)
   marquees: MarqueeSpec[]; // rAF-driven continuous tickers (Framer Motion etc.) — not in getAnimations()
+  lotties: LottieSpec[]; // lottie-web JSON animations (third-party JS the CSS/WAAPI paths can't reproduce)
+  lottieInline: Record<string, unknown>; // animationData only available in-memory, keyed by LottieSpec.inlineKey
   cssAnimated: number; // elements with a computed animation-name (informational)
 };
 
@@ -329,7 +332,7 @@ export async function captureMotion(page: Page, opts?: { observeMs?: number; log
 
         return { waapi, rotators, reveals, cssAnimated };
       }, observeMs),
-      new Promise<Omit<MotionCapture, "marquees">>((res) => setTimeout(() => res({ waapi: [], rotators: [], reveals: [], cssAnimated: 0 }), observeMs + 4000)),
+      new Promise<Omit<MotionCapture, "marquees" | "lotties" | "lottieInline">>((res) => setTimeout(() => res({ waapi: [], rotators: [], reveals: [], cssAnimated: 0 }), observeMs + 4000)),
     ]);
     // Scroll-scrub reveals: scroll-linked panels probeReveals can't see (they start only
     // partially hidden). Merge into reveals, preferring the probe-confirmed entry when a cap
@@ -341,10 +344,12 @@ export async function captureMotion(page: Page, opts?: { observeMs?: number; log
     // Marquees run as a separate pass (scrolls each track into view to wake the paused
     // rAF ticker; kept after the rotator MutationObserver window so it can't add false text rotators).
     const marquees = await detectMarquees(page);
-    log({ event: "motion_captured", waapi: result.waapi.length, rotators: result.rotators.length, reveals: reveals.length, marquees: marquees.length, cssAnimated: result.cssAnimated });
-    return { ...result, reveals, marquees };
+    // Lottie: third-party JSON animations, captured separately (registry + static markup scan).
+    const lottie = await captureLotties(page, { log });
+    log({ event: "motion_captured", waapi: result.waapi.length, rotators: result.rotators.length, reveals: reveals.length, marquees: marquees.length, lotties: lottie.lotties.length, cssAnimated: result.cssAnimated });
+    return { ...result, reveals, marquees, lotties: lottie.lotties, lottieInline: lottie.inline };
   } catch (e) {
     log({ event: "motion_error", error: String(e).slice(0, 200) });
-    return { waapi: [], rotators: [], reveals: [], marquees: [], cssAnimated: 0 };
+    return { waapi: [], rotators: [], reveals: [], marquees: [], lotties: [], lottieInline: {}, cssAnimated: 0 };
   }
 }

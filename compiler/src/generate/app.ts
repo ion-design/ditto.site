@@ -7,6 +7,7 @@ import { generateCss, RESET_CSS } from "./css.js";
 import { generateInteractionCss } from "./interactionCss.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, accordionJsx, accordionImportPath, ACCORDION_TSX, type AccordionRuntimeSpec, type RuntimeSpec } from "./interactive.js";
 import { buildMotionSpec, motionWireJsx, dittoMotionImportPath, motionHasContent, DITTO_MOTION_TSX, type MotionSpec } from "./motion.js";
+import { buildLottieSpec, lottieWireJsx, dittoLottieImportPath, lottieHasContent, DITTO_LOTTIE_TSX, type LottieSpec as LottieRuntimeSpec } from "./lottie.js";
 import { buildMenuSpecs, menusJsx, dropdownMenuImportPath, DROPDOWN_MENU_TSX, type RTMenu } from "./menu.js";
 import type { AssetGraph } from "../infer/assets.js";
 import type { FontGraph } from "../infer/fonts.js";
@@ -2035,15 +2036,17 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
   return { files, contentDecls };
 }
 
-export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl: string, ctx?: RenderCtx, wires?: RuntimeSpec[], motionSpec?: MotionSpec, menus?: RTMenu[], accordions?: AccordionRuntimeSpec[]): string {
+export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl: string, ctx?: RenderCtx, wires?: RuntimeSpec[], motionSpec?: MotionSpec, menus?: RTMenu[], accordions?: AccordionRuntimeSpec[], lottieSpec?: LottieRuntimeSpec): string {
   // page renders the body's children; the <body> element itself (c0) is rendered
   // by layout so cid alignment is preserved.
   const hasWires = !!wires && wires.length > 0;
   const hasMotion = !!motionSpec && motionHasContent(motionSpec);
+  const hasLottie = !!lottieSpec && lottieHasContent(lottieSpec);
   const hasMenus = !!menus && menus.length > 0;
   const hasAccordions = !!accordions && accordions.length > 0;
   const wiresBlock = hasWires ? "\n" + wiresJsx(wires!, 3) : "";
   const motionBlock = hasMotion ? "\n" + motionWireJsx(motionSpec!, 3) : "";
+  const lottieBlock = hasLottie ? "\n" + lottieWireJsx(lottieSpec!, 3) : "";
   const menusBlock = hasMenus ? "\n" + menusJsx(menus!, 3) : "";
   const accordionBlock = hasAccordions ? "\n" + accordionJsx(accordions!, 3) : "";
   // Render the body first so component extraction populates the registry, then import
@@ -2061,6 +2064,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
     hasWires ? `import DittoWire from "${dittoWireImportPath(0)}";` : "",
     hasAccordions ? `import Accordion from "${accordionImportPath(0)}";` : "",
     hasMotion ? `import DittoMotion from "${dittoMotionImportPath(0)}";` : "",
+    hasLottie ? `import DittoLottie from "${dittoLottieImportPath(0)}";` : "",
     hasMenus ? `import DropdownMenu from "${dropdownMenuImportPath(0)}";` : "",
     ...compImports,
   ].filter(Boolean).join("\n");
@@ -2068,7 +2072,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
   return `${importBlock}export default function Page() {
   return (
     <>
-${body}${wiresBlock}${accordionBlock}${motionBlock}${menusBlock}
+${body}${wiresBlock}${accordionBlock}${motionBlock}${lottieBlock}${menusBlock}
     </>
   );
 }
@@ -2365,6 +2369,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const accordions = runtimeSpecs.filter((s): s is AccordionRuntimeSpec => s.kind === "accordion");
   const wires = runtimeSpecs.filter((s) => s.kind !== "accordion");
   const motionSpec = buildMotionSpec(ir, input.motion);
+  const lottieSpec = buildLottieSpec(ir, input.motion, assetGraph);
   const components = input.components ? buildComponentRegistry(ir, input.primitives, input.recipeReport) : undefined;
   const linkRewrite = sameOriginRelativeLinkRewrite(sourceUrl);
   const menus = buildMenuSpecs(ir, input.interaction?.menus, assetMap, sourceUrl, linkRewrite);
@@ -2386,7 +2391,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const sectionPlan = humanize ? planSections(ir, input.recipeReport) : undefined;
   const sections: SectionRegistry | undefined = sectionPlan && sectionPlan.roots.size > 0 ? { plan: sectionPlan, modules: new Map(), order: [] } : undefined;
   const svgs: SvgRegistry | undefined = humanize ? { byKey: new Map(), defs: new Map(), order: [], nameCount: new Map() } : undefined;
-  const pageTsx = generatePageTsx(ir, assetMap, sourceUrl, { primitives: input.primitives, components, linkRewrite, classOf, styleOf, sections, svgs }, wires, motionSpec, menus, accordions);
+  const pageTsx = generatePageTsx(ir, assetMap, sourceUrl, { primitives: input.primitives, components, linkRewrite, classOf, styleOf, sections, svgs }, wires, motionSpec, menus, accordions, lottieSpec);
   // Tailwind mode: utilities live in the JSX; ditto.css carries only pseudo-elements +
   // keyframes + interaction CSS (keyed by [data-cid], since nodes have no c<id> class).
   // Tailwind mode folds hover/focus into the className as `hover:`/`focus:` variant utilities
@@ -2398,7 +2403,8 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const contentTs = contentModule(components, sectionOut.contentDecls);
 
   // Scaffold
-  writeText(join(appDir, "package.json"), framework === "vite" ? (tw ? PACKAGE_JSON_VITE_TW : PACKAGE_JSON_VITE) : (tw ? PACKAGE_JSON_TW : PACKAGE_JSON));
+  const pkgBase = framework === "vite" ? (tw ? PACKAGE_JSON_VITE_TW : PACKAGE_JSON_VITE) : (tw ? PACKAGE_JSON_TW : PACKAGE_JSON);
+  writeText(join(appDir, "package.json"), lottieHasContent(lottieSpec) ? injectLottieDep(pkgBase) : pkgBase);
   writeText(join(appDir, "tsconfig.json"), framework === "vite" ? TSCONFIG_JSON_VITE : TSCONFIG_JSON);
   if (framework === "vite") {
     rmSync(join(appDir, "next.config.mjs"), { force: true });
@@ -2482,6 +2488,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   if (wires.length) writeText(join(rootDir, "ditto", "DittoWire.tsx"), DITTO_WIRE_TSX);
   if (accordions.length) writeText(join(rootDir, "ditto", "Accordion.tsx"), ACCORDION_TSX);
   if (motionHasContent(motionSpec)) writeText(join(rootDir, "ditto", "DittoMotion.tsx"), DITTO_MOTION_TSX);
+  if (lottieHasContent(lottieSpec)) writeText(join(rootDir, "ditto", "DittoLottie.tsx"), DITTO_LOTTIE_TSX);
   if (menus.length) writeText(join(rootDir, "ditto", "DropdownMenu.tsx"), DROPDOWN_MENU_TSX);
   const routeSummary = routeSummaryFromIr(ir, "/", "/", sourceUrl);
   if (framework === "next") {
@@ -2511,11 +2518,19 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
       ...(wires.length ? ["DittoWire"] : []),
       ...(accordions.length ? ["Accordion"] : []),
       ...(motionHasContent(motionSpec) ? ["DittoMotion"] : []),
+      ...(lottieHasContent(lottieSpec) ? ["DittoLottie"] : []),
       ...(menus.length ? ["DropdownMenu"] : []),
     ],
   });
 
   return { pageTsx, cloneCss, components: components ? summarizeComponents(components) : [] };
+}
+
+/** Add lottie-web to a generated package.json's dependencies — DittoLottie imports it at
+ *  runtime, so it must be installed alongside react/next. Injected only when the page
+ *  actually has lottie content, keeping lottie-free clones byte-identical to before. */
+export function injectLottieDep(pkgJson: string): string {
+  return pkgJson.replace(/("dependencies":\s*\{\n)/, `$1    "lottie-web": "5.12.2",\n`);
 }
 
 export const PACKAGE_JSON = `{
