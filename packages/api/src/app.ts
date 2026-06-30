@@ -1,4 +1,5 @@
-import { Hono } from "hono";
+import { randomBytes } from "node:crypto";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -6,7 +7,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { normalizeCloneRequestOptions } from "@cloner/core";
 import type { Backend } from "./backend.js";
 import { createMcpServer } from "./mcp.js";
-import { apiKeyAuth, rateLimit, type AuthConfig } from "./auth.js";
+import { apiKeyAuth, hashApiKey, rateLimit, type AuthConfig } from "./auth.js";
 
 const OptionsSchema = z
   .object({
@@ -37,6 +38,19 @@ const CloneRequest = z.object({
   options: OptionsSchema.optional(),
 });
 
+const SignupRequest = z
+  .object({
+    email: z.string().email().max(320).transform((s) => s.trim().toLowerCase()),
+    label: z.string().trim().min(1).max(120).optional(),
+  })
+  .strict();
+
+export type SignupDeps = {
+  createApiKey: (input: { keyHash: string; label: string; rateLimit?: number }) => Promise<void>;
+  defaultRateLimit?: number;
+  rateLimitPerHour?: number;
+};
+
 export type AppDeps = {
   backend: Backend;
   /** absolute base URL used in MCP-returned references (binary/bundle URLs). */
@@ -47,6 +61,8 @@ export type AppDeps = {
   auth?: AuthConfig;
   /** per-window request cap on /v1/* and /mcp (omit = unlimited). */
   rateLimitPerMinute?: number;
+  /** public key minting endpoint at POST /v1/signup (omit = disabled). */
+  signup?: SignupDeps;
   /** SSRF guard run on submit (omit = no check — set in production). Throws to reject. */
   assertUrl?: (url: string) => Promise<void>;
 };
@@ -60,16 +76,53 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
-  // Protect the API + MCP surfaces (not /healthz). Auth before rate-limit so the
-  // limiter can key by API key.
+  if (deps.signup) {
+    const signupRateLimit = deps.signup.rateLimitPerHour ?? 3;
+    const signupHandler = async (c: Context) => {
+      const body = await c.req.json().catch(() => null);
+      const parsed = SignupRequest.safeParse(body);
+      if (!parsed.success) {
+        return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+      }
+      const apiKey = `dtto_live_${randomBytes(32).toString("base64url")}`;
+      const label = parsed.data.label ? `${parsed.data.email} (${parsed.data.label})` : parsed.data.email;
+      await deps.signup!.createApiKey({
+        keyHash: hashApiKey(apiKey),
+        label,
+        rateLimit: deps.signup!.defaultRateLimit,
+      });
+      return c.json(
+        {
+          apiKey,
+          message: "Save this key now; it will not be shown again.",
+        },
+        201,
+      );
+    };
+    if (signupRateLimit > 0) {
+      app.post("/v1/signup", rateLimit({ perMinute: signupRateLimit, windowMs: 60 * 60 * 1000 }), signupHandler);
+    } else {
+      app.post("/v1/signup", signupHandler);
+    }
+  }
+
+  const skipSignup = (mw: MiddlewareHandler): MiddlewareHandler => {
+    return async (c, next) => {
+      if (c.req.path === "/v1/signup") return next();
+      return mw(c, next);
+    };
+  };
+
+  // Protect the clone API + MCP surfaces (not /healthz or /v1/signup). Auth
+  // before rate-limit so the limiter can key by API key.
   if (deps.auth) {
     const mw = apiKeyAuth(deps.auth);
-    app.use("/v1/*", mw);
+    app.use("/v1/*", skipSignup(mw));
     app.use("/mcp", mw);
   }
   if (deps.rateLimitPerMinute && deps.rateLimitPerMinute > 0) {
     const mw = rateLimit({ perMinute: deps.rateLimitPerMinute });
-    app.use("/v1/*", mw);
+    app.use("/v1/*", skipSignup(mw));
     app.use("/mcp", mw);
   }
 

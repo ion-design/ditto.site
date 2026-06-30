@@ -214,6 +214,10 @@ arbitrary third-party JavaScript are not replayed.
 For the detailed service API, see [docs/SERVICE.md](docs/SERVICE.md). For
 deployment, see [docs/DEPLOY.md](docs/DEPLOY.md).
 
+Hosted deployments should keep `/v1/clones*` and `/mcp` behind API-key auth.
+When `SIGNUP_ENABLED=true` in DB mode, `POST /v1/signup` can publicly mint
+`dtto_live_...` keys from an email address while storing only key hashes.
+
 ## Repository Map
 
 | Path | Purpose |

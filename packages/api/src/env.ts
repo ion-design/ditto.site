@@ -18,6 +18,12 @@ export type ApiEnv = {
   apiKeys: string[];
   /** per-minute request cap on /v1/* and /mcp (0 = unlimited). */
   rateLimitPerMinute: number;
+  /** allow public API-key minting at POST /v1/signup. Requires DATABASE_URL. */
+  signupEnabled: boolean;
+  /** requests per hour per IP for POST /v1/signup (0 = unlimited). */
+  signupRateLimitPerHour: number;
+  /** per-key requests/minute stored on keys minted through signup. */
+  defaultSignupKeyRateLimit: number;
   /** SSRF guard (default on). */
   ssrfEnabled: boolean;
   /** allow loopback targets through SSRF (local dev cloning of localhost). */
@@ -34,6 +40,9 @@ export function loadEnv(): ApiEnv {
     publicBaseUrl: process.env.PUBLIC_BASE_URL,
     apiKeys: (process.env.API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
     rateLimitPerMinute: parseInt(process.env.RATE_LIMIT_PER_MINUTE ?? "0", 10),
+    signupEnabled: process.env.SIGNUP_ENABLED === "true",
+    signupRateLimitPerHour: parseInt(process.env.SIGNUP_RATE_LIMIT_PER_HOUR ?? "3", 10),
+    defaultSignupKeyRateLimit: parseInt(process.env.DEFAULT_SIGNUP_KEY_RATE_LIMIT ?? "30", 10),
     ssrfEnabled: process.env.SSRF_DISABLE !== "true",
     ssrfAllowLoopback: process.env.SSRF_ALLOW_LOOPBACK === "true",
   };

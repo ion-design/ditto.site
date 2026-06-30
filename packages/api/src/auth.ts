@@ -35,6 +35,8 @@ export function apiKeyAuth(cfg: AuthConfig): MiddlewareHandler {
 
 export type RateLimitConfig = {
   perMinute: number;
+  /** window length in milliseconds (default: one minute). */
+  windowMs?: number;
   /** key the limit by (default: API-key hash, else client IP). */
   keyFn?: (c: Parameters<MiddlewareHandler>[0]) => string;
 };
@@ -43,7 +45,7 @@ export type RateLimitConfig = {
  *  shared store (Redis/PG) would be needed across replicas. Keyed by API key when
  *  present, else client IP. */
 export function rateLimit(cfg: RateLimitConfig): MiddlewareHandler {
-  const windowMs = 60_000;
+  const windowMs = cfg.windowMs ?? 60_000;
   const buckets = new Map<string, { count: number; reset: number }>();
   const keyFn =
     cfg.keyFn ??

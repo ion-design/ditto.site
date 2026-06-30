@@ -50,6 +50,9 @@ PORT=8787
 PUBLIC_BASE_URL=https://api.yourdomain.com   # so MCP-returned URLs are absolute
 API_KEYS=key_live_xxx,key_live_yyy           # require auth
 RATE_LIMIT_PER_MINUTE=60
+SIGNUP_ENABLED=true                          # optional: public API-key minting
+SIGNUP_RATE_LIMIT_PER_HOUR=3
+DEFAULT_SIGNUP_KEY_RATE_LIMIT=30
 # SSRF is on by default; do NOT set SSRF_ALLOW_LOOPBACK in prod.
 ```
 

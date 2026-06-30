@@ -49,6 +49,16 @@ async function main(): Promise<void> {
     baseUrl: env.publicBaseUrl,
     auth,
     rateLimitPerMinute: env.rateLimitPerMinute,
+    signup:
+      env.signupEnabled && db
+        ? {
+            createApiKey: async (input) => {
+              await repo.createApiKey(db!, input);
+            },
+            defaultRateLimit: env.defaultSignupKeyRateLimit,
+            rateLimitPerHour: env.signupRateLimitPerHour,
+          }
+        : undefined,
     assertUrl: env.ssrfEnabled ? async (url) => void (await assertPublicUrl(url, { allowLoopback: env.ssrfAllowLoopback })) : undefined,
   });
 
@@ -58,6 +68,7 @@ async function main(): Promise<void> {
         event: "api_listening",
         port: info.port,
         auth: !!auth,
+        signup: env.signupEnabled && !!db,
         rateLimitPerMinute: env.rateLimitPerMinute || null,
         ssrf: env.ssrfEnabled,
       }),

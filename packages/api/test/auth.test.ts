@@ -22,6 +22,56 @@ test("auth: 401 without key / with wrong key, 200 with a valid key; /healthz sta
   assert.equal((await app.request("/healthz")).status, 200, "health check is unauthenticated");
 });
 
+test("signup: public endpoint mints a stored-hash API key that can access protected routes", async () => {
+  const created: { keyHash: string; label: string; rateLimit?: number }[] = [];
+  const app = appWith({
+    auth: {
+      keyHashes: new Set(),
+      lookup: async (h) => created.some((k) => k.keyHash === h),
+    },
+    signup: {
+      createApiKey: async (input) => {
+        created.push(input);
+      },
+      defaultRateLimit: 30,
+      rateLimitPerHour: 3,
+    },
+  });
+
+  const res = await app.request("/v1/signup", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-forwarded-for": "2.2.2.2" },
+    body: JSON.stringify({ email: "USER@Example.com", label: "Beta" }),
+  });
+  assert.equal(res.status, 201);
+  const body = await res.json();
+  assert.match(body.apiKey, /^dtto_live_/);
+  assert.equal(body.message, "Save this key now; it will not be shown again.");
+  assert.equal(created.length, 1);
+  assert.equal(created[0]!.keyHash, hashApiKey(body.apiKey));
+  assert.equal(created[0]!.label, "user@example.com (Beta)");
+  assert.equal(created[0]!.rateLimit, 30);
+
+  assert.equal((await app.request("/v1/clones")).status, 401, "clone routes still require auth");
+  assert.equal((await app.request("/v1/clones", { headers: { authorization: `Bearer ${body.apiKey}` } })).status, 200);
+});
+
+test("signup: validates email and rate-limits per IP", async () => {
+  const app = appWith({
+    signup: {
+      createApiKey: async () => {},
+      rateLimitPerHour: 1,
+    },
+  });
+  assert.equal(
+    (await app.request("/v1/signup", { method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": "3.3.3.3" }, body: JSON.stringify({ email: "not-an-email" }) })).status,
+    400,
+  );
+  const headers = { "content-type": "application/json", "x-forwarded-for": "4.4.4.4" };
+  assert.equal((await app.request("/v1/signup", { method: "POST", headers, body: JSON.stringify({ email: "a@example.com" }) })).status, 201);
+  assert.equal((await app.request("/v1/signup", { method: "POST", headers, body: JSON.stringify({ email: "b@example.com" }) })).status, 429);
+});
+
 test("rate limit: 429 once the per-minute cap is exceeded", async () => {
   const app = appWith({ rateLimitPerMinute: 2 });
   const headers = { "x-forwarded-for": "9.9.9.9" };
