@@ -56,9 +56,21 @@ export const apiKeys = pgTable("api_keys", {
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
 });
 
+/** One-time email verification tokens for public API-key signup. */
+export const signupTokens = pgTable("signup_tokens", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  email: text("email").notNull(),
+  tokenHash: text("token_hash").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+});
+
 export type Job = typeof jobs.$inferSelect;
 export type NewJob = typeof jobs.$inferInsert;
 export type Clone = typeof clones.$inferSelect;
 export type NewClone = typeof clones.$inferInsert;
 export type CacheRow = typeof cache.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;
+export type SignupToken = typeof signupTokens.$inferSelect;
+export type NewSignupToken = typeof signupTokens.$inferInsert;

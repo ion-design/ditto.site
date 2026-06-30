@@ -72,6 +72,112 @@ test("signup: validates email and rate-limits per IP", async () => {
   assert.equal((await app.request("/v1/signup", { method: "POST", headers, body: JSON.stringify({ email: "b@example.com" }) })).status, 429);
 });
 
+test("signup email verification: request sends a one-time link; verify mints a working key", async () => {
+  const createdKeys: { keyHash: string; label: string; rateLimit?: number }[] = [];
+  const tokens = new Map<string, string>();
+  let sent: { email: string; verifyUrl: string; expiresAt: Date } | undefined;
+  const app = appWith({
+    auth: {
+      keyHashes: new Set(),
+      lookup: async (h) => createdKeys.some((k) => k.keyHash === h),
+    },
+    signup: {
+      createApiKey: async (input) => {
+        createdKeys.push(input);
+      },
+      defaultRateLimit: 30,
+      directEnabled: false,
+      email: {
+        createToken: async (input) => {
+          tokens.set(input.tokenHash, input.email);
+        },
+        consumeToken: async (tokenHash) => {
+          const email = tokens.get(tokenHash);
+          if (!email) return undefined;
+          tokens.delete(tokenHash);
+          return { email };
+        },
+        sendVerificationEmail: async (input) => {
+          sent = input;
+        },
+        verifyUrl: "https://ditto.site/api-key",
+        tokenTtlMs: 30 * 60 * 1000,
+      },
+    },
+  });
+
+  assert.equal((await app.request("/v1/signup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "a@example.com" }) })).status, 404);
+  const request = await app.request("/v1/signup/request", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-forwarded-for": "5.5.5.5" },
+    body: JSON.stringify({ email: "USER@Example.com" }),
+  });
+  assert.equal(request.status, 202);
+  assert.equal((await request.json()).message, "Check your email for a verification link.");
+  assert.equal(sent?.email, "user@example.com");
+  assert.ok(sent?.verifyUrl.startsWith("https://ditto.site/api-key?token=dtto_signup_"));
+
+  const token = new URL(sent!.verifyUrl).searchParams.get("token")!;
+  const verify = await app.request("/v1/signup/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  assert.equal(verify.status, 201);
+  const body = await verify.json();
+  assert.match(body.apiKey, /^dtto_live_/);
+  assert.equal(createdKeys.length, 1);
+  assert.equal(createdKeys[0]!.label, "user@example.com");
+  assert.equal((await app.request("/v1/clones", { headers: { authorization: `Bearer ${body.apiKey}` } })).status, 200);
+
+  const replay = await app.request("/v1/signup/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  assert.equal(replay.status, 400);
+});
+
+test("signup: browser CORS is allowed only for configured origins", async () => {
+  const app = appWith({
+    signupCorsOrigins: ["https://ditto.site"],
+    signup: {
+      createApiKey: async () => {},
+      rateLimitPerHour: 0,
+      directEnabled: false,
+      email: {
+        createToken: async () => {},
+        consumeToken: async () => undefined,
+        sendVerificationEmail: async () => {},
+        verifyUrl: "https://ditto.site/api-key",
+        tokenTtlMs: 30 * 60 * 1000,
+      },
+    },
+  });
+
+  const preflight = await app.request("/v1/signup/request", {
+    method: "OPTIONS",
+    headers: {
+      origin: "https://ditto.site",
+      "access-control-request-method": "POST",
+      "access-control-request-headers": "content-type",
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), "https://ditto.site");
+  assert.match(preflight.headers.get("access-control-allow-methods") ?? "", /POST/);
+  assert.match(preflight.headers.get("access-control-allow-headers") ?? "", /content-type/i);
+
+  const denied = await app.request("/v1/signup/request", {
+    method: "OPTIONS",
+    headers: {
+      origin: "https://evil.example",
+      "access-control-request-method": "POST",
+    },
+  });
+  assert.equal(denied.headers.get("access-control-allow-origin"), null);
+});
+
 test("rate limit: 429 once the per-minute cap is exceeded", async () => {
   const app = appWith({ rateLimitPerMinute: 2 });
   const headers = { "x-forwarded-for": "9.9.9.9" };

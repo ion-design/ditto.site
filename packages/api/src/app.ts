@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { cors } from "hono/cors";
 import { z } from "zod";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -45,10 +46,24 @@ const SignupRequest = z
   })
   .strict();
 
+const SignupVerifyRequest = z
+  .object({
+    token: z.string().min(24).max(256),
+  })
+  .strict();
+
 export type SignupDeps = {
   createApiKey: (input: { keyHash: string; label: string; rateLimit?: number }) => Promise<void>;
   defaultRateLimit?: number;
   rateLimitPerHour?: number;
+  directEnabled?: boolean;
+  email?: {
+    createToken: (input: { email: string; tokenHash: string; expiresAt: Date }) => Promise<void>;
+    consumeToken: (tokenHash: string) => Promise<{ email: string } | undefined>;
+    sendVerificationEmail: (input: { email: string; verifyUrl: string; expiresAt: Date }) => Promise<void>;
+    verifyUrl: string;
+    tokenTtlMs: number;
+  };
 };
 
 export type AppDeps = {
@@ -63,6 +78,8 @@ export type AppDeps = {
   rateLimitPerMinute?: number;
   /** public key minting endpoint at POST /v1/signup (omit = disabled). */
   signup?: SignupDeps;
+  /** browser origins allowed to call public signup routes. */
+  signupCorsOrigins?: string[];
   /** SSRF guard run on submit (omit = no check — set in production). Throws to reject. */
   assertUrl?: (url: string) => Promise<void>;
 };
@@ -73,24 +90,44 @@ export type AppDeps = {
 export function createApp(deps: AppDeps): Hono {
   const { backend } = deps;
   const app = new Hono();
+  const signupCorsOrigins = deps.signupCorsOrigins ?? [];
+
+  if (signupCorsOrigins.length > 0) {
+    const allowedOrigins = new Set(signupCorsOrigins);
+    const signupCors = cors({
+      origin: (origin) => (allowedOrigins.has(origin) ? origin : null),
+      allowMethods: ["POST", "OPTIONS"],
+      allowHeaders: ["content-type"],
+      maxAge: 86400,
+    });
+    app.use("/v1/signup", signupCors);
+    app.use("/v1/signup/*", signupCors);
+  }
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
   if (deps.signup) {
-    const signupRateLimit = deps.signup.rateLimitPerHour ?? 3;
-    const signupHandler = async (c: Context) => {
+    const signup = deps.signup;
+    const signupRateLimit = signup.rateLimitPerHour ?? 3;
+    const signupLimiter = rateLimit({ perMinute: signupRateLimit, windowMs: 60 * 60 * 1000 });
+    const mintKey = async (email: string, label?: string) => {
+      const apiKey = `dtto_live_${randomBytes(32).toString("base64url")}`;
+      const storedLabel = label ? `${email} (${label})` : email;
+      await signup.createApiKey({
+        keyHash: hashApiKey(apiKey),
+        label: storedLabel,
+        rateLimit: signup.defaultRateLimit,
+      });
+      return apiKey;
+    };
+
+    const directSignupHandler = async (c: Context) => {
       const body = await c.req.json().catch(() => null);
       const parsed = SignupRequest.safeParse(body);
       if (!parsed.success) {
         return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
       }
-      const apiKey = `dtto_live_${randomBytes(32).toString("base64url")}`;
-      const label = parsed.data.label ? `${parsed.data.email} (${parsed.data.label})` : parsed.data.email;
-      await deps.signup!.createApiKey({
-        keyHash: hashApiKey(apiKey),
-        label,
-        rateLimit: deps.signup!.defaultRateLimit,
-      });
+      const apiKey = await mintKey(parsed.data.email, parsed.data.label);
       return c.json(
         {
           apiKey,
@@ -99,16 +136,66 @@ export function createApp(deps: AppDeps): Hono {
         201,
       );
     };
-    if (signupRateLimit > 0) {
-      app.post("/v1/signup", rateLimit({ perMinute: signupRateLimit, windowMs: 60 * 60 * 1000 }), signupHandler);
-    } else {
-      app.post("/v1/signup", signupHandler);
+
+    if (signup.directEnabled !== false) {
+      if (signupRateLimit > 0) app.post("/v1/signup", signupLimiter, directSignupHandler);
+      else app.post("/v1/signup", directSignupHandler);
+    }
+
+    const emailSignup = signup.email;
+    if (emailSignup) {
+      const requestSignupHandler = async (c: Context) => {
+        const body = await c.req.json().catch(() => null);
+        const parsed = SignupRequest.safeParse(body);
+        if (!parsed.success) {
+          return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+        }
+        const rawToken = `dtto_signup_${randomBytes(32).toString("base64url")}`;
+        const expiresAt = new Date(Date.now() + emailSignup.tokenTtlMs);
+        const url = new URL(emailSignup.verifyUrl);
+        url.searchParams.set("token", rawToken);
+        await emailSignup.createToken({
+          email: parsed.data.email,
+          tokenHash: hashApiKey(rawToken),
+          expiresAt,
+        });
+        await emailSignup.sendVerificationEmail({
+          email: parsed.data.email,
+          verifyUrl: url.toString(),
+          expiresAt,
+        });
+        return c.json({ message: "Check your email for a verification link." }, 202);
+      };
+
+      const verifySignupHandler = async (c: Context) => {
+        const body = await c.req.json().catch(() => null);
+        const parsed = SignupVerifyRequest.safeParse(body);
+        if (!parsed.success) {
+          return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+        }
+        const token = await emailSignup.consumeToken(hashApiKey(parsed.data.token));
+        if (!token) {
+          return c.json({ error: "invalid or expired signup token" }, 400);
+        }
+        const apiKey = await mintKey(token.email);
+        return c.json(
+          {
+            apiKey,
+            message: "Save this key now; it will not be shown again.",
+          },
+          201,
+        );
+      };
+
+      if (signupRateLimit > 0) app.post("/v1/signup/request", signupLimiter, requestSignupHandler);
+      else app.post("/v1/signup/request", requestSignupHandler);
+      app.post("/v1/signup/verify", verifySignupHandler);
     }
   }
 
   const skipSignup = (mw: MiddlewareHandler): MiddlewareHandler => {
     return async (c, next) => {
-      if (c.req.path === "/v1/signup") return next();
+      if (c.req.path === "/v1/signup" || c.req.path === "/v1/signup/request" || c.req.path === "/v1/signup/verify") return next();
       return mw(c, next);
     };
   };

@@ -10,6 +10,7 @@ import type { Backend } from "./backend.js";
 import { hashApiKey, type AuthConfig } from "./auth.js";
 import { assertPublicUrl } from "./ssrf.js";
 import { loadEnv, type ApiEnv } from "./env.js";
+import { sendSignupEmail } from "./resend.js";
 
 function buildAuth(env: ApiEnv, db?: Db): AuthConfig | undefined {
   const keyHashes = new Set(env.apiKeys.map(hashApiKey));
@@ -44,11 +45,32 @@ async function main(): Promise<void> {
   }
 
   const auth = buildAuth(env, db);
+  const emailSignup =
+    db && env.resendApiKey && env.signupFromEmail && env.signupVerifyUrl
+      ? {
+          createToken: async (input: { email: string; tokenHash: string; expiresAt: Date }) => {
+            await repo.createSignupToken(db!, input);
+          },
+          consumeToken: async (tokenHash: string) => repo.consumeSignupToken(db!, tokenHash),
+          sendVerificationEmail: async (input: { email: string; verifyUrl: string; expiresAt: Date }) => {
+            await sendSignupEmail({
+              apiKey: env.resendApiKey!,
+              from: env.signupFromEmail!,
+              to: input.email,
+              verifyUrl: input.verifyUrl,
+              expiresAt: input.expiresAt,
+            });
+          },
+          verifyUrl: env.signupVerifyUrl,
+          tokenTtlMs: Math.max(1, env.signupTokenTtlMinutes) * 60 * 1000,
+        }
+      : undefined;
   const app = createApp({
     backend,
     baseUrl: env.publicBaseUrl,
     auth,
     rateLimitPerMinute: env.rateLimitPerMinute,
+    signupCorsOrigins: env.signupCorsOrigins,
     signup:
       env.signupEnabled && db
         ? {
@@ -57,6 +79,8 @@ async function main(): Promise<void> {
             },
             defaultRateLimit: env.defaultSignupKeyRateLimit,
             rateLimitPerHour: env.signupRateLimitPerHour,
+            directEnabled: env.signupDirectEnabled,
+            email: emailSignup,
           }
         : undefined,
     assertUrl: env.ssrfEnabled ? async (url) => void (await assertPublicUrl(url, { allowLoopback: env.ssrfAllowLoopback })) : undefined,
@@ -69,6 +93,7 @@ async function main(): Promise<void> {
         port: info.port,
         auth: !!auth,
         signup: env.signupEnabled && !!db,
+        emailSignup: !!emailSignup,
         rateLimitPerMinute: env.rateLimitPerMinute || null,
         ssrf: env.ssrfEnabled,
       }),

@@ -1,7 +1,7 @@
 export * as schema from "./schema.js";
 export {
-  jobs, clones, cache, apiKeys,
-  type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey,
+  jobs, clones, cache, apiKeys, signupTokens,
+  type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey, type SignupToken, type NewSignupToken,
 } from "./schema.js";
 export { createDb, type Db, type DbHandle } from "./client.js";
 export * as repo from "./repo.js";

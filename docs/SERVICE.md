@@ -64,7 +64,9 @@ curl -s -X POST localhost:8787/v1/clones -H 'content-type: application/json' \
 
 ```
 POST   /v1/clones                 { url, options? }  → 202 {jobId,status} | 200 {cached result | inline result}
-POST   /v1/signup                 { email, label? } → 201 {apiKey,message}  (public when enabled)
+POST   /v1/signup                 { email, label? } → 201 {apiKey,message}  (direct public signup when enabled)
+POST   /v1/signup/request         { email } → 202 {message}                 (send verification email)
+POST   /v1/signup/verify          { token } → 201 {apiKey,message}          (consume email token)
 GET    /v1/clones                  → list (metadata)
 GET    /v1/clones/:id              → status + metadata (fileCount, totalBytes, capture, timings)
 GET    /v1/clones/:id/result       → the eager CloneResult (text files inline; binaries by URL)
@@ -76,10 +78,13 @@ GET    /healthz                    → { ok: true }  (unauthenticated)
 
 `/v1/clones*` and `/mcp` are authenticated when `API_KEYS` is set or DB-backed
 keys exist. Use `Authorization: Bearer <key>` or `x-api-key: <key>`.
-`/v1/signup` is intentionally public only when `SIGNUP_ENABLED=true` **and**
-`DATABASE_URL` is set. It mints a `dtto_live_...` key, stores only its SHA-256
-hash in Postgres, stores the submitted email in the key label for attribution,
-and returns the raw key once.
+Signup routes are intentionally public only when `SIGNUP_ENABLED=true` **and**
+`DATABASE_URL` is set. Direct `POST /v1/signup` mints a `dtto_live_...` key
+immediately when `SIGNUP_DIRECT_ENABLED=true`. For public production signup,
+prefer the Resend-backed verified flow: `POST /v1/signup/request` sends a
+one-time email link, and `POST /v1/signup/verify` consumes the token, stores
+only the API key's SHA-256 hash in Postgres, stores the verified email in the
+key label for attribution, and returns the raw key once.
 
 Normal product `options` are `{ mode?: "single" | "multi", styling?: "tailwind" | "css", framework?: "next" | "vite" }`.
 `mode` defaults to `"single"`, `styling` defaults to `"tailwind"`, and `framework` defaults to `"next"`. Operational options
@@ -132,9 +137,15 @@ List-then-read so a clone never floods the agent's context:
 | `PUBLIC_BASE_URL` | api | — | absolute base for MCP-returned URLs |
 | `API_KEYS` | api | — | comma-separated keys; empty = open |
 | `RATE_LIMIT_PER_MINUTE` | api | `0` | per key/IP cap (0 = unlimited) |
-| `SIGNUP_ENABLED` | api | `false` | DB mode only: expose public `POST /v1/signup` for API-key minting |
+| `SIGNUP_ENABLED` | api | `false` | DB mode only: expose public API-key signup routes |
 | `SIGNUP_RATE_LIMIT_PER_HOUR` | api | `3` | per-IP signup cap; `0` disables signup throttling |
 | `DEFAULT_SIGNUP_KEY_RATE_LIMIT` | api | `30` | stored on keys minted by signup; service-wide enforcement still uses `RATE_LIMIT_PER_MINUTE` |
+| `SIGNUP_DIRECT_ENABLED` | api | `true` | keep direct `POST /v1/signup` enabled; set `false` when Resend verification is configured |
+| `RESEND_API_KEY` | api | — | enables verified-email signup request/verify endpoints |
+| `SIGNUP_FROM_EMAIL` | api | — | verified sender, e.g. `Ditto <hello@ditto.site>` |
+| `SIGNUP_VERIFY_URL` | api | — | landing-page URL that receives `?token=...`, e.g. `https://ditto.site/api-key` |
+| `SIGNUP_TOKEN_TTL_MINUTES` | api | `30` | one-time email verification token lifetime |
+| `SIGNUP_CORS_ORIGINS` | api | `https://ditto.site` | comma-separated browser origins allowed to call public signup routes |
 | `SSRF_DISABLE` | api | `false` | turn off the SSRF guard (not recommended) |
 | `SSRF_ALLOW_LOOPBACK` | api | `false` | allow cloning localhost (local dev) |
 | `S3_BUCKET` / `S3_ENDPOINT` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_FORCE_PATH_STYLE` / `S3_PUBLIC_URL` | api, worker | — | set `S3_BUCKET` ⇒ object storage |

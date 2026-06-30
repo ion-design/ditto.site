@@ -17,10 +17,20 @@ frozen capture in, byte-stable app out.
 
 ## Usage
 
-The hosted URLs below are placeholders until the public service is live:
-
 - REST API: `https://api.ditto.site`
-- MCP server: `https://mcp.ditto.site/mcp`
+- MCP server: `https://api.ditto.site/mcp`
+
+Get a hosted key at `https://ditto.site/api-key`, or call the verified-email
+signup flow directly:
+
+```bash
+curl -sS -X POST "https://api.ditto.site/v1/signup/request" \
+  -H "content-type: application/json" \
+  -d '{"email":"you@example.com"}'
+```
+
+The emailed verification link lands on `/api-key?token=...`, which calls
+`POST /v1/signup/verify` and displays the new `dtto_live_...` key once.
 
 ### REST API
 
@@ -92,7 +102,7 @@ Connect an MCP client to the hosted Streamable HTTP endpoint:
 {
   "mcpServers": {
     "ditto": {
-      "url": "https://mcp.ditto.site/mcp",
+      "url": "https://api.ditto.site/mcp",
       "headers": {
         "Authorization": "Bearer ${DITTO_API_KEY}"
       }
@@ -215,8 +225,11 @@ For the detailed service API, see [docs/SERVICE.md](docs/SERVICE.md). For
 deployment, see [docs/DEPLOY.md](docs/DEPLOY.md).
 
 Hosted deployments should keep `/v1/clones*` and `/mcp` behind API-key auth.
-When `SIGNUP_ENABLED=true` in DB mode, `POST /v1/signup` can publicly mint
-`dtto_live_...` keys from an email address while storing only key hashes.
+When `SIGNUP_ENABLED=true` in DB mode, the Resend-backed
+`POST /v1/signup/request` and `POST /v1/signup/verify` flow can publicly mint
+`dtto_live_...` keys from verified email links while storing only key hashes.
+Keep `SIGNUP_DIRECT_ENABLED=false` in production unless direct unauthenticated
+minting is intentional.
 
 ## Repository Map
 

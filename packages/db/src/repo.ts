@@ -1,6 +1,6 @@
-import { and, desc, eq, gt, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { Db } from "./client.js";
-import { jobs, clones, cache, apiKeys, type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey } from "./schema.js";
+import { jobs, clones, cache, apiKeys, signupTokens, type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey, type SignupToken } from "./schema.js";
 
 // ---- jobs ----
 
@@ -92,4 +92,22 @@ export async function getApiKeyByHash(db: Db, keyHash: string): Promise<ApiKey |
 export async function createApiKey(db: Db, input: { keyHash: string; label?: string; rateLimit?: number }): Promise<ApiKey> {
   const [row] = await db.insert(apiKeys).values(input).returning();
   return row!;
+}
+
+// ---- signup tokens ----
+
+export async function createSignupToken(db: Db, input: { email: string; tokenHash: string; expiresAt: Date }): Promise<SignupToken> {
+  const [row] = await db.insert(signupTokens).values(input).returning();
+  return row!;
+}
+
+/** Atomically consume a still-fresh signup token. Returns undefined for missing,
+ * expired, or already-used tokens. */
+export async function consumeSignupToken(db: Db, tokenHash: string): Promise<SignupToken | undefined> {
+  const [row] = await db
+    .update(signupTokens)
+    .set({ consumedAt: new Date() })
+    .where(and(eq(signupTokens.tokenHash, tokenHash), gt(signupTokens.expiresAt, new Date()), isNull(signupTokens.consumedAt)))
+    .returning();
+  return row;
 }
