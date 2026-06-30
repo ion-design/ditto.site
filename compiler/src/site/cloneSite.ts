@@ -128,7 +128,7 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
         // Only capture interactions on full (all-viewport) route captures, never the
         // light single-viewport sibling probes used for collection confirmation.
         const full = viewports.length === REQUIRED_VIEWPORTS.length;
-        const capture = await captureSite({ url, outDir: sourceDir, viewports, interactions: opts.interactions && full, screenshots, log: () => {} });
+        const capture = await captureSite({ url, outDir: sourceDir, viewports, interactions: opts.interactions && full, motion: full, screenshots, log: () => {} });
         const ir = buildIR(sourceDir, viewports);
         const assetGraph = buildAssetGraph(capture);
         const fontGraph = buildFontGraph(capture.fontFaces, assetGraph, url);
