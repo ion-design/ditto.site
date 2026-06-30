@@ -2,7 +2,7 @@
   <img src="docs/assets/ditto.svg" alt="ditto.site logo" width="112" />
 </p>
 
-# ditto.site
+# [ditto.site](https://ditto.site)
 
 [![CI](https://github.com/ion-design/ditto.site/actions/workflows/ci.yml/badge.svg)](https://github.com/ion-design/ditto.site/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -14,6 +14,9 @@ Router project by default, or Vite React when requested.
 
 The compiler is not an LLM page author. It is a capture-to-code pipeline: same
 frozen capture in, byte-stable app out.
+
+Read the public development and evaluation method in
+[docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Usage
 
@@ -222,7 +225,8 @@ observed safely. Unsupported app logic, auth, payments, personalization, and
 arbitrary third-party JavaScript are not replayed.
 
 For the detailed service API, see [docs/SERVICE.md](docs/SERVICE.md). For
-deployment, see [docs/DEPLOY.md](docs/DEPLOY.md).
+deployment, see [docs/DEPLOY.md](docs/DEPLOY.md). For the development method
+behind the compiler, see [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 Hosted deployments should keep `/v1/clones*` and `/mcp` behind API-key auth.
 When `SIGNUP_ENABLED=true` in DB mode, the Resend-backed
@@ -241,7 +245,7 @@ minting is intentional.
 | `packages/db/` | Drizzle schema, migrations, repository, and queue wrapper |
 | `packages/storage/` | local and S3/R2 artifact storage |
 | `packages/worker/` | queued clone runner and optional verification |
-| `docs/` | service, deployment, release, and responsible-use docs |
+| `docs/` | methodology, service, deployment, release, and responsible-use docs |
 | `examples/` | benchmark results and visual evidence |
 
 ## Responsible Use
