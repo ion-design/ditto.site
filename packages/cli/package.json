@@ -1,0 +1,30 @@
+{
+  "name": "ditto",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Official ditto.site command-line helper: unpack a clone JSON result into a project tree on disk.",
+  "license": "MIT",
+  "author": "ion-design",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ion-design/ditto.site.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/ion-design/ditto.site/issues"
+  },
+  "homepage": "https://github.com/ion-design/ditto.site#readme",
+  "type": "module",
+  "bin": {
+    "ditto": "./bin/ditto.mjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

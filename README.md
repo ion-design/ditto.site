@@ -56,20 +56,50 @@ curl -sS -X POST "$DITTO_API_URL/v1/clones" \
   }'
 ```
 
-The service returns either an inline result or a queued job:
+The service returns either a queued job or an inline result. A finished result
+is a file map — every generated file keyed by its app-relative path:
 
 ```json
-{ "jobId": "job_123", "status": "queued" }
+{
+  "jobId": "job_123",
+  "status": "succeeded",
+  "files": {
+    "package.json": { "type": "text", "content": "{ ... }", "bytes": 812, "sha256": "..." },
+    "src/app/page.tsx": { "type": "text", "content": "export default ...", "bytes": 2048, "sha256": "..." },
+    "public/assets/logo.png": { "type": "binary", "url": ".../files/public/assets/logo.png", "bytes": 5123, "sha256": "..." }
+  }
+}
 ```
 
-Poll and download the generated app:
+**Turn that JSON into a project on disk** with the official unpacker — pipe the
+response straight in, no temp file:
+
+```bash
+curl -sS -X POST "$DITTO_API_URL/v1/clones" \
+  -H "authorization: Bearer $DITTO_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
+  | npx ditto unpack - ./out
+```
+
+`ditto unpack <clone.json|-> <out-dir>` writes the text files inline and
+materializes binary assets (inline base64, or fetched from their `url` using
+`$DITTO_API_URL` / `$DITTO_API_KEY`). See
+[`packages/cli`](packages/cli/README.md) for options.
+
+If you got back a queued job (`{ "jobId": "job_123", "status": "queued" }`),
+poll it, then unpack the finished result — or download the whole app as one
+archive:
 
 ```bash
 JOB_ID="job_123"
 
+# poll status, then unpack the finished file map
 curl -sS -H "authorization: Bearer $DITTO_API_KEY" \
-  "$DITTO_API_URL/v1/clones/$JOB_ID"
+  "$DITTO_API_URL/v1/clones/$JOB_ID/result" \
+  | npx ditto unpack - ./out
 
+# ...or grab the whole app as a single archive
 curl -L -H "authorization: Bearer $DITTO_API_KEY" \
   "$DITTO_API_URL/v1/clones/$JOB_ID/bundle?format=tgz" \
   -o ditto-clone.tgz
@@ -241,6 +271,7 @@ minting is intentional.
 | --- | --- |
 | `compiler/` | deterministic capture, inference, generation, and validation |
 | `packages/core/` | compiler adapter and file-map helpers |
+| `packages/cli/` | `ditto` CLI — unpack a clone result JSON into a project tree |
 | `packages/api/` | Hono REST API and MCP server |
 | `packages/db/` | Drizzle schema, migrations, repository, and queue wrapper |
 | `packages/storage/` | local and S3/R2 artifact storage |
