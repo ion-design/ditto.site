@@ -1,0 +1,35 @@
+{
+  "name": "@cloner/storage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local and S3-compatible artifact storage for ditto.site clone results.",
+  "license": "MIT",
+  "author": "ion-design",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ion-design/ditto.site.git",
+    "directory": "packages/storage"
+  },
+  "bugs": {
+    "url": "https://github.com/ion-design/ditto.site/issues"
+  },
+  "homepage": "https://github.com/ion-design/ditto.site#readme",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloner/core": "*",
+    "@aws-sdk/client-s3": "^3.726.0",
+    "@aws-sdk/s3-request-presigner": "^3.726.0"
+  },
+  "devDependencies": {
+    "tsx": "4.22.4",
+    "typescript": "5.7.3",
+    "@types/node": "22.10.5"
+  }
+}

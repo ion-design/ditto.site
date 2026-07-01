@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Acme — FAQ</title>
+  <style>
+    *{box-sizing:border-box} body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;color:#1a1a1a;background:#fff}
+    header{border-bottom:1px solid #e5e7eb}
+    nav{max-width:960px;margin:0 auto;padding:16px 24px;display:flex;gap:20px;align-items:center}
+    nav .brand{font-weight:700;margin-right:auto}
+    nav a{color:#374151;text-decoration:none;font-size:15px;font-weight:500}
+    main{max-width:760px;margin:0 auto;padding:48px 24px}
+    h1{font-size:32px;margin:0 0 24px}
+    .acc{border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}
+    .acc-item+.acc-item{border-top:1px solid #e5e7eb}
+    .acc-trigger{appearance:none;width:100%;text-align:left;border:0;background:#fafafa;padding:16px 18px;font-size:16px;cursor:pointer;color:#1a1a1a}
+    .acc-trigger[aria-expanded=true]{background:#eef2ff;color:#4f46e5}
+    .acc-panel{padding:4px 18px 20px;font-size:15px;line-height:1.6;color:#4b5563}
+    .acc-panel[hidden]{display:none}
+    footer{max-width:960px;margin:0 auto;padding:32px 24px;color:#9ca3af;font-size:13px;border-top:1px solid #e5e5e5}
+  </style>
+</head>
+<body>
+  <header>
+    <nav aria-label="Primary">
+      <span class="brand">Acme</span>
+      <a href="/">Home</a>
+      <a href="blog.html">Blog</a>
+      <a href="faq.html">FAQ</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Frequently asked questions</h1>
+    <div class="acc">
+      <div class="acc-item">
+        <button class="acc-trigger" id="a1" aria-controls="s1" aria-expanded="true">How do I get started?</button>
+        <div class="acc-panel" id="s1" role="region" aria-labelledby="a1"><p>Sign up for the Starter plan and follow the onboarding guide.</p></div>
+      </div>
+      <div class="acc-item">
+        <button class="acc-trigger" id="a2" aria-controls="s2" aria-expanded="false">Can I upgrade later?</button>
+        <div class="acc-panel" id="s2" role="region" aria-labelledby="a2" hidden><p>Yes — upgrade to Pro anytime from your account settings.</p></div>
+      </div>
+      <div class="acc-item">
+        <button class="acc-trigger" id="a3" aria-controls="s3" aria-expanded="false">Do you offer refunds?</button>
+        <div class="acc-panel" id="s3" role="region" aria-labelledby="a3" hidden><p>We offer a 30-day money-back guarantee on all paid plans.</p></div>
+      </div>
+    </div>
+  </main>
+  <footer>&copy; 2026 Acme, Inc. All rights reserved.</footer>
+  <script>
+    document.querySelectorAll('.acc-trigger').forEach((btn)=>{btn.addEventListener('click',()=>{const open=btn.getAttribute('aria-expanded')==='true';btn.setAttribute('aria-expanded',open?'false':'true');const p=document.getElementById(btn.getAttribute('aria-controls'));if(p)p.hidden=open;});});
+  </script>
+</body>
+</html>

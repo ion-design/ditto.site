@@ -1,0 +1,30 @@
+[
+  {
+    "id": "site-overreacted",
+    "url": "https://overreacted.io/",
+    "notes": "flat root-level blog collection (/:slug); home acts as the listing. Tests root-collection collapse + structural confirmation (home vs post)."
+  },
+  {
+    "id": "site-brew",
+    "url": "https://brew.sh/",
+    "notes": "tiny site: home + blog listing + one post. Pure multi-page singletons + shared chrome baseline."
+  },
+  {
+    "id": "site-jamstack",
+    "url": "https://jamstack.org/",
+    "maxRoutes": 12,
+    "notes": "directory site: large /generators, /headless-cms, /glossary collections collapsed to listing + representative."
+  },
+  {
+    "id": "site-gatsby",
+    "url": "https://www.gatsbyjs.com/",
+    "notes": "marketing + /docs collection + a /contributing pair kept whole; route-cap exercise."
+  },
+  {
+    "id": "site-11ty",
+    "url": "https://www.11ty.dev/",
+    "maxRoutes": 12,
+    "maxCollectionInstances": 500,
+    "notes": "docs+blog multi-collection incl. nested /docs/:id/:id and an 882-instance authors directory (listing capped via maxCollectionInstances)."
+  }
+]

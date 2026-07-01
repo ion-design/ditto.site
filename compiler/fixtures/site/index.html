@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Acme — Home</title>
+  <style>
+    *{box-sizing:border-box} body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;color:#1a1a1a;background:#fff}
+    header{border-bottom:1px solid #e5e7eb}
+    nav{max-width:960px;margin:0 auto;padding:16px 24px;display:flex;gap:20px;align-items:center}
+    nav .brand{font-weight:700;margin-right:auto}
+    nav a{color:#374151;text-decoration:none;font-size:15px;font-weight:500}
+    main{max-width:960px;margin:0 auto;padding:48px 24px}
+    h1{font-size:34px;margin:0 0 8px}
+    .intro{color:#6b7280;font-size:17px;margin:0 0 40px}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+    .feature{border:1px solid #e5e7eb;border-radius:12px;padding:22px}
+    .feature .ico{width:36px;height:36px;border-radius:8px;background:#eef2ff}
+    .feature h3{font-size:18px;margin:14px 0 6px}
+    .feature p{font-size:14px;color:#6b7280;line-height:1.6;margin:0}
+    footer{max-width:960px;margin:0 auto;padding:32px 24px;color:#9ca3af;font-size:13px;border-top:1px solid #e5e5e5}
+  </style>
+</head>
+<body>
+  <header>
+    <nav aria-label="Primary">
+      <span class="brand">Acme</span>
+      <a href="/">Home</a>
+      <a href="blog.html">Blog</a>
+      <a href="faq.html">FAQ</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Build faster with Acme</h1>
+    <p class="intro">Everything your team needs to ship, in one place.</p>
+    <div class="grid">
+      <div class="feature">
+        <div class="ico"></div>
+        <h3>Fast by default</h3>
+        <p>Sensible defaults and zero-config builds get you to production quickly.</p>
+      </div>
+      <div class="feature">
+        <div class="ico"></div>
+        <h3>Collaborative</h3>
+        <p>Share previews and gather feedback without leaving your editor.</p>
+      </div>
+      <div class="feature">
+        <div class="ico"></div>
+        <h3>Secure</h3>
+        <p>SSO, audit logs, and granular permissions for every workspace.</p>
+      </div>
+      <div class="feature">
+        <div class="ico"></div>
+        <h3>Observable</h3>
+        <p>Built-in metrics and tracing so you always know what shipped.</p>
+      </div>
+      <div class="feature">
+        <div class="ico"></div>
+        <h3>Extensible</h3>
+        <p>A plugin API and webhooks connect Acme to the rest of your stack.</p>
+      </div>
+      <div class="feature">
+        <div class="ico"></div>
+        <h3>Supported</h3>
+        <p>Priority support and a responsive community keep you unblocked.</p>
+      </div>
+    </div>
+  </main>
+  <footer>&copy; 2026 Acme, Inc. All rights reserved.</footer>
+</body>
+</html>

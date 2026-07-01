@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Motion fixture 2 — WAAPI + rotating text</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: #ffffff; color: #111418;
+    font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 80px 24px; }
+  h1 { font-size: 48px; line-height: 1.1; font-weight: 800; margin: 0 0 24px; letter-spacing: -0.02em; }
+  .rot { color: #5b5bff; }
+  p { font-size: 18px; line-height: 1.6; color: #5a626e; margin: 0 0 16px; max-width: 600px; }
+  .orbit { width: 56px; height: 56px; margin-top: 56px; border-radius: 12px; background: #5b5bff; }
+  .fade { margin-top: 48px; padding: 24px; border: 1px solid #e6e8ec; border-radius: 14px; }
+  .fade h3 { margin: 0 0 8px; font-size: 18px; }
+  .fade p { margin: 0; }
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Build <span class="rot" id="rot">faster</span></h1>
+    <p>The highlighted word rotates on an interval. The square orbits via the Web Animations API, and the card below fades in via WAAPI on load.</p>
+    <div class="orbit" id="orbit" aria-hidden="true"></div>
+    <div class="fade" id="fade">
+      <h3>WAAPI entrance</h3>
+      <p>This card is animated with element.animate(), not CSS keyframes.</p>
+    </div>
+    <ul style="margin-top:40px;padding:0;list-style:none;display:grid;gap:12px">
+      <li style="padding:14px 16px;border:1px solid #e6e8ec;border-radius:10px">Deterministic reconstruction from observed evidence.</li>
+      <li style="padding:14px 16px;border:1px solid #e6e8ec;border-radius:10px">Recognized-pattern allowlist, fixed templates, no synthesis.</li>
+      <li style="padding:14px 16px;border:1px solid #e6e8ec;border-radius:10px">Gate-verified motion: reproduce, or freeze honestly.</li>
+    </ul>
+    <footer style="margin-top:56px;color:#9aa0aa;font-size:14px">Motion replays on load; the gates grade the settled frame.</footer>
+  </main>
+  <script>
+    // Rotating text on an interval (the shopify/notion pattern).
+    (function () {
+      var el = document.getElementById('rot');
+      var words = ['faster', 'cleaner', 'smarter', 'together'];
+      var i = 0;
+      setInterval(function () { i = (i + 1) % words.length; el.textContent = words[i]; }, 1400);
+    })();
+    // WAAPI: infinite orbit (translate loop) — persistent, observable at capture time.
+    document.getElementById('orbit').animate(
+      [
+        { transform: 'translateX(0) rotate(0deg)' },
+        { transform: 'translateX(120px) rotate(180deg)' },
+        { transform: 'translateX(0) rotate(360deg)' }
+      ],
+      { duration: 2400, iterations: Infinity, easing: 'ease-in-out' }
+    );
+    // WAAPI: finite fade+rise entrance on the card.
+    document.getElementById('fade').animate(
+      [ { opacity: 0, transform: 'translateY(24px)' }, { opacity: 1, transform: 'translateY(0)' } ],
+      { duration: 600, easing: 'ease-out', fill: 'both' }
+    );
+  </script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+[
+  {
+    "id": "hard-001",
+    "url": "https://www.paulgraham.com/",
+    "tier": "hard",
+    "notes": "1996 nested-table/font typography"
+  },
+  {
+    "id": "hard-002",
+    "url": "https://news.ycombinator.com/",
+    "tier": "hard",
+    "notes": "dense table layout"
+  },
+  {
+    "id": "hard-003",
+    "url": "https://en.wikipedia.org/wiki/Cascading_Style_Sheets",
+    "tier": "hard",
+    "notes": "heavy nested DOM article"
+  },
+  {
+    "id": "hard-004",
+    "url": "https://tailwindcss.com/",
+    "tier": "hard",
+    "notes": "dense component showcase"
+  },
+  {
+    "id": "hard-005",
+    "url": "https://developer.mozilla.org/en-US/",
+    "tier": "hard",
+    "notes": "dense docs"
+  },
+  {
+    "id": "hard-006",
+    "url": "https://stripe.com/",
+    "tier": "hard",
+    "notes": "dense, gradients, complex"
+  },
+  {
+    "id": "hard-007",
+    "url": "https://github.com/",
+    "tier": "hard",
+    "notes": "dense landing"
+  },
+  {
+    "id": "hard-008",
+    "url": "https://www.apple.com/",
+    "tier": "hard",
+    "notes": "complex typography, scroll anim"
+  },
+  {
+    "id": "hard-009",
+    "url": "https://www.engadget.com/",
+    "tier": "hard",
+    "notes": "tech news, dense"
+  },
+  {
+    "id": "hard-010",
+    "url": "https://www.theregister.com/",
+    "tier": "hard",
+    "notes": "tech news, dense"
+  },
+  {
+    "id": "hard-011",
+    "url": "https://react.dev/",
+    "tier": "hard",
+    "notes": "docs, dense"
+  },
+  {
+    "id": "hard-012",
+    "url": "https://www.netlify.com/",
+    "tier": "hard",
+    "notes": "dense marketing"
+  },
+  {
+    "id": "hard-013",
+    "url": "https://www.smashingmagazine.com/",
+    "tier": "hard",
+    "notes": "dense editorial"
+  },
+  {
+    "id": "hard-014",
+    "url": "https://css-tricks.com/",
+    "tier": "hard",
+    "notes": "dense content"
+  },
+  {
+    "id": "hard-015",
+    "url": "https://www.sitepoint.com/",
+    "tier": "hard",
+    "notes": "editorial, dense"
+  },
+  {
+    "id": "hard-016",
+    "url": "https://dev.to/",
+    "tier": "hard",
+    "notes": "dense content feed"
+  },
+  {
+    "id": "hard-017",
+    "url": "https://www.producthunt.com/",
+    "tier": "hard",
+    "notes": "dense product feed"
+  },
+  {
+    "id": "hard-018",
+    "url": "https://www.awwwards.com/",
+    "tier": "hard",
+    "notes": "design gallery"
+  },
+  {
+    "id": "hard-019",
+    "url": "https://medium.com/",
+    "tier": "hard",
+    "notes": "editorial typography"
+  },
+  {
+    "id": "hard-020",
+    "url": "https://hackernoon.com/",
+    "tier": "hard",
+    "notes": "editorial feed, dense"
+  },
+  {
+    "id": "hard-021",
+    "url": "https://www.gov.uk/",
+    "tier": "hard",
+    "notes": "dense govt, static"
+  },
+  {
+    "id": "hard-022",
+    "url": "https://blog.cloudflare.com/",
+    "tier": "hard",
+    "notes": "dense technical blog"
+  },
+  {
+    "id": "hard-023",
+    "url": "https://www.nasa.gov/",
+    "tier": "hard",
+    "notes": "dense, many media assets"
+  },
+  {
+    "id": "hard-024",
+    "url": "https://www.mozilla.org/en-US/",
+    "tier": "hard",
+    "notes": "dense marketing"
+  },
+  {
+    "id": "hard-025",
+    "url": "https://web.dev/",
+    "tier": "hard",
+    "notes": "dense docs/articles"
+  },
+  {
+    "id": "hard-026",
+    "url": "https://www.nike.com/",
+    "tier": "hard",
+    "notes": "ecommerce; dense, popups"
+  },
+  {
+    "id": "hard-027",
+    "url": "https://www.zara.com/",
+    "tier": "hard",
+    "notes": "ecommerce; minimalist complex grid"
+  },
+  {
+    "id": "hard-028",
+    "url": "https://www.ssense.com/",
+    "tier": "hard",
+    "notes": "ecommerce; editorial luxury, dense"
+  },
+  {
+    "id": "hard-029",
+    "url": "https://www.gymshark.com/",
+    "tier": "hard",
+    "notes": "ecommerce; Shopify DTC, popups"
+  },
+  {
+    "id": "hard-030",
+    "url": "https://www.sephora.com/",
+    "tier": "hard",
+    "notes": "ecommerce; very dense, popups"
+  },
+  {
+    "id": "hard-031",
+    "url": "https://www.etsy.com/",
+    "tier": "hard",
+    "notes": "ecommerce; dense product grid"
+  },
+  {
+    "id": "hard-032",
+    "url": "https://www.uniqlo.com/us/en/",
+    "tier": "hard",
+    "notes": "ecommerce; dense, complex"
+  }
+]

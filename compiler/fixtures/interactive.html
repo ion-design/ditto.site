@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Interactive patterns fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #1a1a1a; background: #fff; }
+    main { max-width: 760px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 32px; }
+    h2 { font-size: 22px; margin-top: 48px; }
+
+    /* Tabs */
+    .tabs { margin-top: 16px; }
+    [role="tablist"] { display: flex; gap: 4px; border-bottom: 2px solid #e5e5e5; }
+    [role="tab"] {
+      appearance: none; border: 0; background: transparent; cursor: pointer;
+      padding: 10px 18px; font-size: 15px; color: #6b7280;
+      border-bottom: 3px solid transparent; margin-bottom: -2px;
+    }
+    [role="tab"][aria-selected="true"] { color: #4f46e5; border-bottom-color: #4f46e5; font-weight: 600; }
+    [role="tabpanel"] { padding: 20px 4px; font-size: 15px; line-height: 1.6; }
+    [role="tabpanel"][hidden] { display: none; }
+
+    /* Accordion */
+    .accordion { margin-top: 16px; border: 1px solid #e5e5e5; border-radius: 8px; overflow: hidden; }
+    .accordion-item + .accordion-item { border-top: 1px solid #e5e5e5; }
+    .accordion-trigger {
+      appearance: none; width: 100%; text-align: left; border: 0; background: #fafafa;
+      padding: 16px 18px; font-size: 16px; cursor: pointer; color: #1a1a1a;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .accordion-trigger[aria-expanded="true"] { background: #eef2ff; color: #4f46e5; }
+    .accordion-trigger .chev { transition: transform .15s; }
+    .accordion-trigger[aria-expanded="true"] .chev { transform: rotate(180deg); }
+    .accordion-panel { padding: 4px 18px 20px; font-size: 15px; line-height: 1.6; color: #4b5563; }
+    .accordion-panel[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Interactive patterns</h1>
+    <p>A fixture exercising the recognized Stage-4 patterns with panels kept in the DOM.</p>
+
+    <h2>Tabs</h2>
+    <div class="tabs">
+      <div role="tablist" aria-label="Fruit">
+        <button role="tab" id="t1" aria-controls="p1" aria-selected="true">Apples</button>
+        <button role="tab" id="t2" aria-controls="p2" aria-selected="false" tabindex="-1">Oranges</button>
+        <button role="tab" id="t3" aria-controls="p3" aria-selected="false" tabindex="-1">Pears</button>
+      </div>
+      <div role="tabpanel" id="p1" aria-labelledby="t1"><p>Apples are crisp and come in many varieties such as Fuji and Gala.</p></div>
+      <div role="tabpanel" id="p2" aria-labelledby="t2" hidden><p>Oranges are citrus fruits rich in vitamin C and very juicy.</p></div>
+      <div role="tabpanel" id="p3" aria-labelledby="t3" hidden><p>Pears have a soft, sweet flesh and a distinctive shape.</p></div>
+    </div>
+
+    <h2>Accordion</h2>
+    <div class="accordion">
+      <div class="accordion-item">
+        <button class="accordion-trigger" id="a1" aria-controls="s1" aria-expanded="true"><span>What is your return policy?</span><span class="chev">▾</span></button>
+        <div class="accordion-panel" id="s1" role="region" aria-labelledby="a1"><p>You can return any item within 30 days of purchase for a full refund.</p></div>
+      </div>
+      <div class="accordion-item">
+        <button class="accordion-trigger" id="a2" aria-controls="s2" aria-expanded="false"><span>Do you ship internationally?</span><span class="chev">▾</span></button>
+        <div class="accordion-panel" id="s2" role="region" aria-labelledby="a2" hidden><p>Yes, we ship to over 50 countries with tracked delivery.</p></div>
+      </div>
+      <div class="accordion-item">
+        <button class="accordion-trigger" id="a3" aria-controls="s3" aria-expanded="false"><span>How do I track my order?</span><span class="chev">▾</span></button>
+        <div class="accordion-panel" id="s3" role="region" aria-labelledby="a3" hidden><p>A tracking link is emailed to you as soon as your order ships.</p></div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // Minimal ARIA tabs: keep panels mounted, toggle [hidden] + aria-selected.
+    document.querySelectorAll('[role="tablist"]').forEach((list) => {
+      const tabs = [...list.querySelectorAll('[role="tab"]')];
+      tabs.forEach((tab) => tab.addEventListener('click', () => {
+        tabs.forEach((t) => {
+          const sel = t === tab;
+          t.setAttribute('aria-selected', sel ? 'true' : 'false');
+          t.tabIndex = sel ? 0 : -1;
+          const panel = document.getElementById(t.getAttribute('aria-controls'));
+          if (panel) panel.hidden = !sel;
+        });
+      }));
+    });
+    // Minimal accordion: toggle [hidden] + aria-expanded.
+    document.querySelectorAll('.accordion-trigger').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const open = btn.getAttribute('aria-expanded') === 'true';
+        btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+        const panel = document.getElementById(btn.getAttribute('aria-controls'));
+        if (panel) panel.hidden = open;
+      });
+    });
+  </script>
+</body>
+</html>

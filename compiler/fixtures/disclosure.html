@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Disclosure fixture — dropdown, mega-menu, modal</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #1a1a1a; background: #fff; }
+    main { max-width: 820px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 30px; } h2 { font-size: 20px; margin-top: 40px; }
+    nav { display: flex; gap: 8px; }
+    .menu-root { position: relative; }
+    .menu-trigger, .modal-trigger {
+      appearance: none; border: 1px solid #d1d5db; background: #fff; border-radius: 8px;
+      padding: 10px 16px; font-size: 15px; cursor: pointer; color: #1a1a1a;
+    }
+    .menu-trigger[aria-expanded="true"] { background: #eef2ff; border-color: #4f46e5; color: #4f46e5; }
+    .menu-panel {
+      position: absolute; top: calc(100% + 6px); left: 0; z-index: 10;
+      min-width: 200px; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.12); padding: 8px; list-style: none; margin: 0;
+    }
+    .menu-panel[hidden] { display: none; }
+    .menu-panel li > a { display: block; padding: 8px 12px; border-radius: 6px; color: #1a1a1a; text-decoration: none; }
+    .mega { min-width: 520px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 50;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .modal-dialog { background: #fff; border-radius: 14px; padding: 28px; max-width: 440px; width: 90%; }
+    .modal-dialog h3 { margin: 0 0 8px; font-size: 22px; }
+    .modal-close { float: right; border: 0; background: transparent; font-size: 22px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Disclosure patterns</h1>
+
+    <h2>Dropdown menu</h2>
+    <nav>
+      <div class="menu-root">
+        <button class="menu-trigger" id="mt1" aria-haspopup="menu" aria-expanded="false" aria-controls="m1">Products ▾</button>
+        <ul class="menu-panel" id="m1" role="menu" aria-labelledby="mt1" hidden>
+          <li role="none"><a role="menuitem" href="#search">Search</a></li>
+          <li role="none"><a role="menuitem" href="#recommend">Recommend</a></li>
+          <li role="none"><a role="menuitem" href="#analytics">Analytics</a></li>
+        </ul>
+      </div>
+
+      <div class="menu-root">
+        <button class="menu-trigger" id="mt2" aria-haspopup="menu" aria-expanded="false" aria-controls="m2">Solutions ▾</button>
+        <ul class="menu-panel mega" id="m2" role="menu" aria-labelledby="mt2" hidden>
+          <li role="none"><a role="menuitem" href="#ecommerce">Ecommerce — fast product discovery</a></li>
+          <li role="none"><a role="menuitem" href="#media">Media — content recommendations</a></li>
+          <li role="none"><a role="menuitem" href="#saas">SaaS — in-app search</a></li>
+          <li role="none"><a role="menuitem" href="#marketplaces">Marketplaces — ranking</a></li>
+        </ul>
+      </div>
+    </nav>
+
+    <h2>Modal dialog</h2>
+    <button class="modal-trigger" id="open-dlg" aria-haspopup="dialog" aria-controls="dlg">Open dialog</button>
+    <div class="modal-backdrop" id="dlg-backdrop" hidden>
+      <div class="modal-dialog" id="dlg" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+        <button class="modal-close" id="dlg-close" aria-label="Close dialog">×</button>
+        <h3 id="dlg-title">Subscribe</h3>
+        <p>Get product updates in your inbox. We send at most one email a month.</p>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // Dropdown menus: toggle on click, open on hover, close on outside click / Escape.
+    document.querySelectorAll(".menu-root").forEach((root) => {
+      const trigger = root.querySelector(".menu-trigger");
+      const panel = document.getElementById(trigger.getAttribute("aria-controls"));
+      const set = (open) => { trigger.setAttribute("aria-expanded", open ? "true" : "false"); panel.hidden = !open; };
+      trigger.addEventListener("click", () => set(trigger.getAttribute("aria-expanded") !== "true"));
+      root.addEventListener("mouseenter", () => set(true));
+      root.addEventListener("mouseleave", () => set(false));
+    });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") document.querySelectorAll(".menu-trigger").forEach((t) => { t.setAttribute("aria-expanded", "false"); document.getElementById(t.getAttribute("aria-controls")).hidden = true; }); });
+
+    // Modal: open from trigger, close from close button / backdrop / Escape.
+    const backdrop = document.getElementById("dlg-backdrop");
+    const openModal = (open) => { backdrop.hidden = !open; };
+    document.getElementById("open-dlg").addEventListener("click", () => openModal(true));
+    document.getElementById("dlg-close").addEventListener("click", () => openModal(false));
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) openModal(false); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") openModal(false); });
+  </script>
+</body>
+</html>

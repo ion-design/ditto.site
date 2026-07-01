@@ -1,0 +1,19 @@
+{
+  "name": "SEO Rich Fixture",
+  "short_name": "SEOFixture",
+  "icons": [
+    {
+      "src": "/manifest-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/brand.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ],
+  "theme_color": "#123456",
+  "background_color": "#ffffff",
+  "display": "standalone"
+}

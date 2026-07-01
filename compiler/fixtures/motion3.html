@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Motion fixture 3 — scroll-triggered reveals</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: #0c0d12; color: #eef0f4; font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 64px 24px 160px; }
+  h1 { font-size: 44px; line-height: 1.1; font-weight: 800; margin: 0 0 12px; letter-spacing: -0.02em; }
+  .lede { font-size: 18px; color: #9aa2ad; margin: 0 0 48px; }
+  /* Scroll-reveal: start hidden + lifted, transition in when .in is added on intersection. */
+  .reveal { opacity: 0; transform: translateY(36px); transition: opacity 0.6s ease, transform 0.6s cubic-bezier(0.22,1,0.36,1); }
+  .reveal.in { opacity: 1; transform: translateY(0); }
+  .card { margin: 28px 0; padding: 28px; background: #15171f; border: 1px solid #242732; border-radius: 16px; }
+  .card h2 { margin: 0 0 8px; font-size: 22px; font-weight: 700; }
+  .card p { margin: 0; color: #9aa2ad; line-height: 1.6; }
+  .spacer { height: 40vh; }
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Scroll to reveal</h1>
+    <p class="lede">Each card below starts hidden and animates in when it scrolls into view.</p>
+    <div class="spacer"></div>
+    <section class="card reveal"><h2>First reveal</h2><p>Fades and slides up as it enters the viewport, driven by IntersectionObserver toggling a class with a CSS transition.</p></section>
+    <section class="card reveal"><h2>Second reveal</h2><p>The same entrance, staggered down the page so it is comfortably below the initial fold.</p></section>
+    <section class="card reveal"><h2>Third reveal</h2><p>A deterministic reproduction target: hidden at load, revealed on scroll, settling to full opacity.</p></section>
+    <section class="card reveal"><h2>Fourth reveal</h2><p>The clone should hide these on load and reveal them on scroll, then the gate verifies it.</p></section>
+    <section class="card reveal"><h2>Fifth reveal</h2><p>Content is never lost: a force-reveal timer guarantees everything appears even without scrolling.</p></section>
+  </main>
+  <script>
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+    }, { rootMargin: '0px 0px -10% 0px' });
+    document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
+  </script>
+</body>
+</html>
