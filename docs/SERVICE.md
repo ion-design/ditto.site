@@ -89,6 +89,11 @@ GET    /healthz                    → { ok: true }  (unauthenticated)
 
 `/v1/clones*` and `/mcp` are authenticated when `API_KEYS` is set or DB-backed
 keys exist. Use `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+> **Treat keys as secrets.** In any snippet you copy or share, template the key as
+> an environment variable (`Authorization: Bearer $DITTO_API_KEY`) rather than an
+> inline `dtto_live_...` token — inline keys leak into shell history, logs, and
+> pasted transcripts. Never commit a key; rotate a leaked one from the dashboard.
 Signup routes are intentionally public only when `SIGNUP_ENABLED=true` **and**
 `DATABASE_URL` is set. Direct `POST /v1/signup` mints a `dtto_live_...` key
 immediately when `SIGNUP_DIRECT_ENABLED=true`. For public production signup,

@@ -15,8 +15,14 @@ Router project by default, or Vite React when requested.
 The compiler is not an LLM page author. It is a capture-to-code pipeline: same
 frozen capture in, byte-stable app out.
 
+> **"Cloning" here means generating a codebase from a live URL — not `git clone`.**
+> You don't need an existing repository, and you don't need the site's source. Point
+> ditto.site at a public URL and it writes you a fresh project from what the page
+> renders in a browser.
+
 Read the public development and evaluation method in
-[docs/METHODOLOGY.md](docs/METHODOLOGY.md).
+[docs/METHODOLOGY.md](docs/METHODOLOGY.md). For a map of all the docs, see
+[docs/README.md](docs/README.md).
 
 ## Usage
 
@@ -34,6 +40,11 @@ curl -sS -X POST "https://api.ditto.site/v1/signup/request" \
 
 The emailed verification link lands on `/api-key?token=...`, which calls
 `POST /v1/signup/verify` and displays the new `dtto_live_...` key once.
+
+> **Keys are secrets.** Put your key in an environment variable (`export
+> DITTO_API_KEY=dtto_live_...`) and reference `$DITTO_API_KEY` in every command —
+> never paste the raw key inline, where it lands in shell history, logs, or a chat.
+> Don't commit it. You can rotate a key anytime from the dashboard.
 
 ### REST API
 
@@ -169,6 +180,8 @@ src/app/page.tsx, and src/app/ditto.css.
 ### Local CLI
 
 ```bash
+# this git clone gets the ditto.site tool itself — the URL you clone into a
+# codebase comes later, as the argument to `npm run clone`.
 git clone https://github.com/ion-design/ditto.site.git
 cd ditto.site
 
@@ -178,7 +191,17 @@ npx playwright install chromium
 npm run clone -- https://example.com/ --out=./output
 ```
 
-The generated app lands under `output/<site>/app`.
+The generated app lands under `output/<site>/app`. On success the CLI prints a
+copy-paste-safe summary — a single quoted `cd … && npm install && npm run dev`
+line and pointers to the safe-to-edit files (`src/app/content.ts`,
+`src/app/components/`; the app's `AGENTS.md` has the full guide).
+
+To skip the copy-paste entirely and go straight to a running preview:
+
+```bash
+npm run clone -- https://example.com/ --serve        # clone, npm install, npm run dev
+npm run clone -- https://example.com/ --open         # ...and open the browser too
+```
 
 Common local variants:
 
@@ -188,6 +211,10 @@ npm run clone -- https://example.com/ --styling=css
 npm run clone -- https://example.com/ --framework=vite
 npm run validate-site -- runs/site-example.com/<timestamp>
 ```
+
+Without `--out`, runs land under `runs/<site>/<timestamp>/` and a stable
+`runs/<site>/latest` symlink always points at the newest clone, so scripts and
+`cd` targets don't depend on the timestamp.
 
 ### Local REST And MCP Service
 
