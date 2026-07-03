@@ -39,18 +39,24 @@ export function relativizeExportRefs(content: string, depth: number, kind: "html
         new RegExp(`(src|href|poster|content)=(["'])/${root}/`, "g"),
         (_m, attr, q) => `${attr}=${q}${rel}${root}/`,
       );
-      // srcset can carry several comma-separated URLs inside one attribute value.
-      out = out.replace(/srcset=(["'])([^"']*)\1/g, (_m, q, val: string) => {
-        let v = val;
-        for (const r of REWRITE_ROOTS) v = v.split(`/${r}/`).join(`${rel}${r}/`);
-        return `srcset=${q}${v}${q}`;
-      });
+      // RSC flight data carries JSON-escaped refs (\"/_next/…\") that drive runtime
+      // preloads — rewrite those too so they resolve from any mount path.
+      out = out.replace(new RegExp(`\\\\"/${root}/`, "g"), `\\"${rel}${root}/`);
     }
     // url(/assets/…), url("/assets/…"), url('/_next/…') — html <style> blocks too.
     out = out.replace(
       new RegExp(`url\\((["']?)/${root}/`, "g"),
       (_m, q) => `url(${q}${rel}${root}/`,
     );
+  }
+  // srcset carries several comma-separated URLs in one attribute value; each URL
+  // starts a token after `"` or `, `. Run ONCE outside the roots loop — the values
+  // it inserts (`./assets/…`) contain `/assets/` themselves and would compound.
+  if (kind === "html") {
+    out = out.replace(/srcset=(["'])([^"']*)\1/g, (_m, q, val: string) => {
+      const v = val.replace(new RegExp(`(^|,\\s*)/(${REWRITE_ROOTS.join("|")})/`, "g"), (_s, pre, root) => `${pre}${rel}${root}/`);
+      return `srcset=${q}${v}${q}`;
+    });
   }
   return out;
 }
@@ -66,12 +72,19 @@ function walkFiles(dir: string, acc: string[] = []): string[] {
 
 export function ensureAppPreview(
   runDir: string,
-  opts?: { harnessDir?: string; log?: (e: Record<string, unknown>) => void },
+  opts?: {
+    harnessDir?: string;
+    /** the harness already holds a fresh build of THIS app (a verify pass that did
+     *  not prune interactions just ran) — publish its export instead of rebuilding. */
+    reusePriorBuild?: boolean;
+    log?: (e: Record<string, unknown>) => void;
+  },
 ): AppPreviewResult {
   const t0 = Date.now();
   const log = opts?.log ?? (() => {});
   const appDir = join(runDir, "generated", "app");
   const previewDir = join(appDir, "public", "app-preview");
+  const harnessDir = opts?.harnessDir ?? DEFAULT_HARNESS_DIR;
   // Never let a stale preview ride into the harness copy (self-inclusion).
   rmSync(previewDir, { recursive: true, force: true });
   if (!existsSync(appDir)) {
@@ -79,13 +92,23 @@ export function ensureAppPreview(
   }
 
   log({ event: "app_build_start" });
-  const build = buildApp(appDir, opts?.harnessDir ?? DEFAULT_HARNESS_DIR);
-  if (!build.ok || !build.outDir) {
-    log({ event: "app_build_done", ok: false, ms: build.durationMs });
-    return { ok: false, previewMs: Date.now() - t0, files: 0, error: build.stderr.slice(-2000) };
+  let outDir: string | null = null;
+  let reused = false;
+  if (opts?.reusePriorBuild) {
+    for (const d of ["out", "dist"]) {
+      if (existsSync(join(harnessDir, d, "index.html"))) { outDir = join(harnessDir, d); reused = true; break; }
+    }
+  }
+  if (!outDir) {
+    const build = buildApp(appDir, harnessDir);
+    if (!build.ok || !build.outDir) {
+      log({ event: "app_build_done", ok: false, ms: build.durationMs });
+      return { ok: false, previewMs: Date.now() - t0, files: 0, error: build.stderr.slice(-2000) };
+    }
+    outDir = build.outDir;
   }
 
-  cpSync(build.outDir, previewDir, { recursive: true });
+  cpSync(outDir, previewDir, { recursive: true });
   let files = 0;
   for (const file of walkFiles(previewDir)) {
     files++;
@@ -97,6 +120,6 @@ export function ensureAppPreview(
     const rewritten = relativizeExportRefs(src, depth, isHtml ? "html" : "css");
     if (rewritten !== src) writeFileSync(file, rewritten);
   }
-  log({ event: "app_build_done", ok: true, ms: build.durationMs, files });
+  log({ event: "app_build_done", ok: true, ms: Date.now() - t0, files, reused });
   return { ok: true, previewMs: Date.now() - t0, files };
 }

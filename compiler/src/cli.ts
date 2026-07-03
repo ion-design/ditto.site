@@ -439,6 +439,7 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
   } else {
     capture = await captureSite({ url: opts.url, outDir: sourceDir, viewports: captureViewports, interactions: opts.interactions, motion: opts.motion, screenshots: opts.screenshots, log: logBoth });
   }
+  logBoth({ event: "captured", reused: !!opts.reuseSource });
 
   // Stage 4.5: persist the component-extraction choice in the source dir so every
   // generateAll for this run (deliverable + determinism/prune regens, possibly in a

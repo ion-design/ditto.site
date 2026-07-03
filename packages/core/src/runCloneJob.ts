@@ -111,6 +111,13 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
     let routes: RouteInfo[] | undefined;
     let sanity: CaptureSanity;
     let captureReused = false;
+    // The compiler emits `captured` when the live phase ends; timestamping it splits
+    // the capture/generate wall-clock that used to be lumped into captureMs.
+    let capturedTs: number | undefined;
+    const timedLog = (e: Record<string, unknown>) => {
+      if (e.event === "captured" && capturedTs === undefined) capturedTs = Date.now();
+      log(e);
+    };
     // Persistent entry-capture cache (the single→multi speed path), keyed by URL.
     const cacheEntry = input.captureCacheDir ? entryCacheSource(input.captureCacheDir, input.url) : undefined;
 
@@ -173,7 +180,7 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
         framework: options.framework,
         screenshots: captureValidationArtifacts,
         reuseSource,
-        log,
+        log: timedLog,
       });
       runDir = res.runDir;
       sanity = captureSanity(res.sourceDir, options.viewports ?? [375, 768, 1280, 1920]);
@@ -181,7 +188,9 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       // reuse: re-copying identical data would only refresh the TTL artificially.
       if (cacheEntry && !captureReused) persistCapture(res.sourceDir, cacheEntry);
     }
-    const captureMs = Date.now() - t0;
+    const cloneMs = Date.now() - t0;
+    const captureMs = capturedTs !== undefined ? capturedTs - t0 : cloneMs;
+    const generateMs = capturedTs !== undefined ? cloneMs - captureMs : 0;
 
     // Optional verify (build + serve + re-render + grade). The single isolation-
     // sensitive step: pass a per-worker harnessDir so concurrent builds don't collide.
@@ -197,7 +206,15 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
     // file map. Build failure is non-fatal — the clone's sources still deliver.
     let previewMs: number | undefined;
     if (options.preview) {
-      const p = ensureAppPreview(runDir, { harnessDir: input.harnessDir, log });
+      // A verify pass that built cleanly and pruned nothing leaves a fresh build of
+      // this exact app in the harness — publish that instead of building twice.
+      // (Interaction pruning regenerates the app AFTER the build, so the harness
+      // export would be stale in that case.)
+      const report = verify as { gates?: Record<string, { pass?: boolean; metrics?: { rejected?: string[] } }> } | undefined;
+      const reusePriorBuild =
+        !!(syncVerify && kind === "clone" && report?.gates?.build?.pass) &&
+        ((report?.gates?.interaction?.metrics?.rejected ?? []).length === 0);
+      const p = ensureAppPreview(runDir, { harnessDir: input.harnessDir, reusePriorBuild, log });
       previewMs = p.previewMs;
       if (!p.ok) log({ event: "app_preview_failed", error: p.error?.slice(-400) });
     }
@@ -210,7 +227,7 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       options: requestOptions,
       status: "succeeded",
       compilerVersion: COMPILER_VERSION,
-      timings: { captureMs, generateMs: 0, ...(verifyMs !== undefined ? { verifyMs } : {}), ...(previewMs !== undefined ? { previewMs } : {}) },
+      timings: { captureMs, generateMs, ...(verifyMs !== undefined ? { verifyMs } : {}), ...(previewMs !== undefined ? { previewMs } : {}) },
       routes,
       files,
       capture: sanity,
