@@ -1,11 +1,12 @@
 #!/usr/bin/env -S npx tsx
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { captureSite, REQUIRED_VIEWPORTS, SAMPLE_VIEWPORTS, type CaptureResult } from "./capture/capture.js";
 import { fileURLToPath } from "node:url";
 import { generateAll } from "./generate/pipeline.js";
 import { refineSizing } from "./generate/refineSizing.js";
 import { writeJSON, writeText, ensureDir, readJSON, fileExists } from "./util/fsx.js";
+import { doneSummary, serveApp } from "./cliSummary.js";
 import type { AppFramework } from "./generate/app.js";
 
 export type CloneOptions = {
@@ -34,6 +35,9 @@ export type CloneResult = {
   sourceDir: string;
   appDir: string;
   sourceUrl: string;
+  /** A stable, timestamp-free path to the app (via the `runs/<site>/latest` symlink),
+   *  present in runs-layout mode when the symlink could be created. */
+  stableAppDir?: string;
 };
 
 export function siteIdFromUrl(url: string): string {
@@ -462,16 +466,34 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
 
   writeText(join(runDir, "logs", "compiler.log.jsonl"), logEvents.map((e) => JSON.stringify(e)).join("\n") + "\n");
 
+  let stableAppDir: string | undefined;
   if (out) {
     // Publish the deliverable to <siteName>/app; keep working artifacts in .clone.
     exportApp(appDir, out.appDir);
     logBoth({ event: "exported", app: out.appDir });
   } else {
-    // latest pointer (runs/ layout, used by --reuse / regen)
-    writeJSON(join(runsDir, siteId, "latest.json"), { runDir, ts: timestamp() });
+    // latest pointer (runs/ layout, used by --reuse / regen) + a `latest` symlink so the
+    // app has a stable, timestamp-free path that survives copy-paste.
+    stableAppDir = writeLatestPointer(runsDir, siteId, runDir);
   }
 
-  return { runDir, sourceDir, appDir: out ? out.appDir : appDir, sourceUrl: opts.url };
+  return { runDir, sourceDir, appDir: out ? out.appDir : appDir, sourceUrl: opts.url, stableAppDir };
+}
+
+/** Record the newest run for a site in the runs layout: a `latest.json` breadcrumb (used by
+ *  `--reuse`/regen) and a `latest` symlink → runDir. Returns the stable app path when the
+ *  symlink was created (symlinks can be unavailable, e.g. Windows without privilege — non-fatal). */
+export function writeLatestPointer(runsDir: string, siteId: string, runDir: string): string | undefined {
+  writeJSON(join(runsDir, siteId, "latest.json"), { runDir, ts: timestamp() });
+  const link = join(runsDir, siteId, "latest");
+  try {
+    // Refresh an existing symlink; refuse (via non-recursive rm) to clobber a real directory.
+    rmSync(link, { force: true });
+    symlinkSync(runDir, link, "junction");
+    return join(link, "generated", "app");
+  } catch {
+    return undefined;
+  }
 }
 
 function copySourceRef(from: string, to: string): void {
@@ -543,12 +565,22 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const url = args.find((a) => !a.startsWith("--"));
   if (!url) {
-    console.error("usage: clone-static <url> [--mode=single|multi] [--styling=tailwind|css] [--framework=next|vite] [--out=<dir>]");
+    console.error("usage: clone-static <url> [--mode=single|multi] [--styling=tailwind|css] [--framework=next|vite] [--out=<dir>] [--serve] [--open]");
     process.exit(1);
   }
   const mode = parseProductMode(args);
   const styling = parseProductStyling(args);
   const framework = parseProductFramework(args);
+  // --serve installs deps + starts the dev server after cloning; --open also launches the browser.
+  const open = hasAnyFlag(args, ["--open"]);
+  const serve = open || hasAnyFlag(args, ["--serve"]);
+  const finish = async (res: { appDir: string; stableAppDir?: string }) => {
+    if (serve) {
+      await serveApp(res.appDir, { open });
+    } else {
+      process.stderr.write(doneSummary({ url, appDir: res.appDir, framework, stableAppDir: res.stableAppDir }));
+    }
+  };
   const vpArg = firstFlagValue(args, ["--dev-viewports", "--viewports"]);
   const runsArg = firstFlagValue(args, ["--dev-runs", "--runs"]);
   // --out=<dir>: clean <dir>/<siteName>/{app,.clone} layout (default: ./output when bare --out).
@@ -604,7 +636,8 @@ async function main(): Promise<void> {
       tier,
       log: (e) => console.log(JSON.stringify(e)),
     });
-    console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir }));
+    console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir, stableApp: res.stableAppDir }));
+    await finish(res);
     return;
   }
 
@@ -625,7 +658,8 @@ async function main(): Promise<void> {
     reuseSource,
     log: (e) => console.log(JSON.stringify(e)),
   });
-  console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir }));
+  console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir, stableApp: res.stableAppDir }));
+  await finish(res);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

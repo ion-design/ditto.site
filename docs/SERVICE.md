@@ -60,6 +60,21 @@ curl -s -X POST localhost:8787/v1/clones -H 'content-type: application/json' \
   -d '{"url":"https://example.com/","options":{"mode":"single","styling":"tailwind"}}' | jq '.files | keys'
 ```
 
+To turn that `files` map into a project on disk, pipe the response into the
+repo-local `ditto` CLI (`packages/cli`) instead of inspecting the JSON by hand:
+
+```bash
+curl -s -X POST localhost:8787/v1/clones -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
+  | npm run --silent unpack -- - ./out
+# binary assets: set DITTO_API_URL (and DITTO_API_KEY when authenticated) so the
+# CLI can fetch each file's reference URL; --no-fetch writes only the text tree.
+```
+
+The CLI package is intentionally private for now; run this command from a
+checked-out `ditto.site` repo with dependencies installed. Do not use
+`npx ditto` until this package is published.
+
 ## REST surface
 
 ```
@@ -78,6 +93,11 @@ GET    /healthz                    → { ok: true }  (unauthenticated)
 
 `/v1/clones*` and `/mcp` are authenticated when `API_KEYS` is set or DB-backed
 keys exist. Use `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+> **Treat keys as secrets.** In any snippet you copy or share, template the key as
+> an environment variable (`Authorization: Bearer $DITTO_API_KEY`) rather than an
+> inline `dtto_live_...` token — inline keys leak into shell history, logs, and
+> pasted transcripts. Never commit a key; rotate a leaked one from the dashboard.
 Signup routes are intentionally public only when `SIGNUP_ENABLED=true` **and**
 `DATABASE_URL` is set. Direct `POST /v1/signup` mints a `dtto_live_...` key
 immediately when `SIGNUP_DIRECT_ENABLED=true`. For public production signup,

@@ -21,7 +21,7 @@ import { structurallySimilar } from "./signature.js";
 import { generateSiteApp, routeToSegment, routeKey, type RouteArtifact } from "./generateSite.js";
 import { detectSharedChrome, chromeSignatureId } from "./sharedLayout.js";
 import { validateSite, type SiteReport } from "./validateSite.js";
-import { siteIdFromUrl, namedOutDirs, exportApp } from "../cli.js";
+import { siteIdFromUrl, namedOutDirs, exportApp, writeLatestPointer } from "../cli.js";
 import { writeJSON, readJSON, ensureDir, fileExists, writeText } from "../util/fsx.js";
 import { seoInventoryToMarkdown } from "../generate/seo.js";
 import type { AppFramework } from "../generate/app.js";
@@ -56,6 +56,8 @@ export type CloneSiteResult = {
   plan: RoutePlan;
   routes: RouteArtifact[];
   siteReport?: SiteReport;
+  /** Stable, timestamp-free path to the app (via the `runs/<site>/latest` symlink), when created. */
+  stableAppDir?: string;
 };
 
 function timestamp(): string {
@@ -236,8 +238,10 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
     siteReport = await validateSite(runDir, { tier: opts.tier ?? "stage2", routeConcurrency: opts.validationConcurrency, viewportConcurrency: opts.viewportConcurrency, log });
   }
 
+  let stableAppDir: string | undefined;
   if (out) { exportApp(appDir, out.appDir); log({ event: "exported", app: out.appDir }); }
-  return { runDir, appDir: out ? out.appDir : appDir, siteId, plan, routes, siteReport };
+  else { stableAppDir = writeLatestPointer(runsDir, siteId, runDir); }
+  return { runDir, appDir: out ? out.appDir : appDir, siteId, plan, routes, siteReport, stableAppDir };
 }
 
 type ManifestForRegen = {

@@ -6,6 +6,38 @@ so minor/patch semantics are not yet guaranteed.
 
 ## [Unreleased]
 
+### Changed — Local CLI success output and orientation
+
+- The `clone-static` CLI now prints a copy-paste-safe success summary to stderr: a
+  single **quoted** `cd "<app>" && npm install && npm run dev` line (survives terminal
+  wrapping — no more broken `cd` from a wrapped timestamped path) plus the key
+  `AGENTS.md` safe-to-edit pointers (`src/app/content.ts`, `src/app/components/`). The
+  machine-readable `{ "event": "done", ... }` JSON line on stdout is unchanged (now
+  also carrying `stableApp`).
+- Added `--serve` (run `npm install` + `npm run dev` in the generated app) and
+  `--open` (also launch the browser at the dev URL) so "see it locally" is one flag.
+- In the default runs layout, each clone now refreshes a `runs/<site>/latest` symlink
+  pointing at the newest run, giving a stable, timestamp-free path for `cd` and scripts.
+
+### Added — Docs hub and terminology/secret-hygiene clarifications
+
+- Added [`docs/README.md`](docs/README.md) as a central documentation index.
+- Clarified prominently that ditto.site "cloning" means generating a codebase from a
+  live URL, **not** `git clone` (no source repo required), in the README and docs hub.
+- Added an explicit "API keys are secrets — use `$DITTO_API_KEY`, never inline/commit,
+  rotate anytime" note beside the key/auth examples in the README and `docs/SERVICE.md`.
+
+### Added — `ditto` unpack CLI
+
+- **`packages/cli`** — a zero-dependency `ditto` command-line helper. `npm run
+  unpack -- <clone.json|-> <out-dir>` turns the `files` map returned by
+  `POST /v1/clones` (or `GET /v1/clones/:id/result`) into a real project tree on
+  disk: text files written inline, binary assets materialized from inline base64
+  or fetched from their reference URL (`$DITTO_API_URL` / `$DITTO_API_KEY`), with
+  path-traversal guards and pre-write `sha256` integrity checks. Reads from stdin
+  so a `curl` response can be piped straight in. Documented next to the REST
+  examples in the README and `docs/SERVICE.md`.
+
 ### Added — Open-source readiness
 
 - Added support, release, responsible-use, CODEOWNERS, and gitattributes files.

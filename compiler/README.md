@@ -16,6 +16,8 @@ npm install
 npx playwright install chromium
 
 npm run clone -- https://example.com/
+npm run clone -- https://example.com/ --serve   # then npm install + npm run dev
+npm run clone -- https://example.com/ --open    # ...and open the browser too
 npm run clone -- https://example.com/ --mode=multi --styling=tailwind
 npm run clone -- https://example.com/ --mode=single --framework=vite
 npm run clone-site -- https://example.com/
@@ -33,6 +35,13 @@ npm run typecheck
 
 Root-level scripts forward to these commands, so `npm run clone -- <url>` works
 from the repository root too.
+
+("Clone" here = generating a codebase from a live URL, not `git clone`; no source
+repo required.) On success the CLI prints a copy-paste-safe summary: a single
+quoted `cd … && npm install && npm run dev` line plus safe-to-edit pointers. Pass
+`--serve` to run install + dev automatically, or `--open` to also launch the
+browser. Without `--out`, a `runs/<site>/latest` symlink always points at the
+newest run so paths aren't timestamp-fragile.
 
 Multi-page generation defaults to the fast no-validation path. Use `--validate`
 when the clone command itself should run the full build/render/gates QA pass, or
