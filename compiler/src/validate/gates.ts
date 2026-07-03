@@ -8,6 +8,7 @@ import type { FontGraph } from "../infer/fonts.js";
 import type { Section } from "../infer/sections.js";
 import type { CaptureResult } from "../capture/capture.js";
 import { collectSrcNodes, normText } from "./gateHelpers.js";
+import { WALL_RE } from "../util/wallText.js";
 
 export type GateResult = {
   gate: string;
@@ -73,8 +74,6 @@ function hasVisibleElementChild(node: IRNode, vp: number): boolean {
 // page: an egress/bot wall, a near-empty shell, or a cookie/consent modal that was
 // never dismissed (the clone then reproduces the modal, so the perceptual gate is
 // fooled too). This gate flags those captures so a "perfect" score can't hide them.
-const WALL_RE = /blocked by egress|access denied|access to this page has been denied|are you a (human|robot)|verify you are human|enable javascript to|please enable javascript|checking your browser|just a moment|attention required|request blocked|why have i been blocked|captcha|cf-browser-verification|ddos protection by/i;
-
 export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[]): GateResult {
   const issues: string[] = [];
   const nodeCount = ir.doc.nodeCount;

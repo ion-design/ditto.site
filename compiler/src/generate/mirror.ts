@@ -43,7 +43,9 @@ function injectMirrorBase(html: string): string {
   return `<!DOCTYPE html><html><head>${base}</head>${html}</html>`;
 }
 
-function rewriteHtmlAssetUrls(html: string, graph: AssetGraph, sourceUrl: string): string {
+const RE_ESCAPE = /[.*+?^${}()|[\]\\]/g;
+
+export function rewriteHtmlAssetUrls(html: string, graph: AssetGraph, sourceUrl: string): string {
   let out = html;
   const origin = (() => { try { return new URL(sourceUrl).origin; } catch { return ""; } })();
   const entries = [...graph.entries].filter((e) => e.classification === "downloaded" && e.localPath);
@@ -54,7 +56,12 @@ function rewriteHtmlAssetUrls(html: string, graph: AssetGraph, sourceUrl: string
     if (!local) continue;
     const variants = urlVariants(e.sourceUrl, origin);
     for (const v of variants) {
-      out = out.split(v).join(local);
+      // Delimiter-guarded replacement: the URL must start a token (after a quote,
+      // '=', '(', ',' or whitespace) and end at one. A bare split/join corrupted
+      // unrelated substrings — e.g. a same-origin asset at pathname "/css" used to
+      // rewrite the tail of every `type="text/css"` attribute (ooni.com).
+      const re = new RegExp(`(^|[\\s"'=,(])${v.replace(RE_ESCAPE, "\\$&")}(?=$|[\\s"'),?#&\\\\])`, "g");
+      out = out.replace(re, (_m, pre: string) => pre + local);
     }
   }
   // Protocol-relative CDN refs

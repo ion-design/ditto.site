@@ -7,6 +7,7 @@ import { discoverBreakpoints } from "./breakpoints.js";
 import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.js";
 import { sha1_12, round } from "../util/canonical.js";
 import { scrollForLazyLoad, preScreenshotSettle } from "../settle/recipe.js";
+import { isWallText } from "../util/wallText.js";
 import { writeLiveWitnessViewport, liveWitnessDir } from "../evidence/liveWitness.js";
 import { baseEvidenceManifest, writeEvidenceManifest } from "../evidence/manifest.js";
 import { hashAssetStore } from "../materialize/manifest-hash.js";
@@ -658,20 +659,48 @@ export async function captureSite(opts: {
     });
 
     // Single navigation at the canonical width; every viewport below is a resize.
+    // Bounded by a TOTAL budget (not per-attempt × retries) so a hanging origin
+    // fails fast with a clear error instead of stalling the pipeline for minutes.
     log({ event: "goto", url: opts.url });
+    const NAV_BUDGET_MS = 60_000;
+    const navStart = Date.now();
     let navigated = false;
     let navErr: unknown = null;
     for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
+      const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
+      if (remaining < 5_000) break;
       try {
-        await page.goto(opts.url, { waitUntil: attempt === 0 ? "load" : "domcontentloaded", timeout: 45000 });
+        await page.goto(opts.url, {
+          waitUntil: attempt === 0 ? "load" : "domcontentloaded",
+          timeout: Math.min(attempt === 0 ? 30_000 : 15_000, remaining),
+        });
         navigated = true;
       } catch (e) {
         navErr = e;
         await page.waitForTimeout(1000);
       }
     }
-    if (!navigated) throw navErr;
+    if (!navigated) {
+      throw new Error(
+        `navigation failed for ${opts.url} within ${Math.round((Date.now() - navStart) / 1000)}s: ${String(navErr).slice(0, 300)}`,
+      );
+    }
     await settle(page);
+
+    // Auth/bot-wall fast fail: a wall page would otherwise burn the full
+    // multi-viewport capture and only get flagged by the pollution gate afterward.
+    // Same signature set as the gate (util/wallText.ts) so the judgments agree.
+    const wallProbe = await page
+      .evaluate(() => ({
+        text: (document.body?.innerText ?? "").slice(0, 20_000),
+        nodes: document.querySelectorAll("*").length,
+      }))
+      .catch(() => null);
+    if (wallProbe && wallProbe.nodes < 220 && isWallText(wallProbe.text)) {
+      throw new Error(
+        `auth/bot wall detected at ${opts.url} (${wallProbe.nodes} nodes, wall text matched): capture aborted early`,
+      );
+    }
 
     for (const vw of viewports) {
       const vh = viewportHeight(vw);
