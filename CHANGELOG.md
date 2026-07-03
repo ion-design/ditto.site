@@ -29,13 +29,14 @@ so minor/patch semantics are not yet guaranteed.
 
 ### Added — `ditto` unpack CLI
 
-- **`packages/cli`** — a zero-dependency `ditto` command-line helper. `ditto unpack
-  <clone.json|-> <out-dir>` turns the `files` map returned by `POST /v1/clones` (or
-  `GET /v1/clones/:id/result`) into a real project tree on disk: text files written
-  inline, binary assets materialized from inline base64 or fetched from their
-  reference URL (`$DITTO_API_URL` / `$DITTO_API_KEY`), with path-traversal guards
-  and `sha256` integrity checks. Reads from stdin so a `curl` response can be piped
-  straight in. Documented next to the REST examples in the README and `docs/SERVICE.md`.
+- **`packages/cli`** — a zero-dependency `ditto` command-line helper. `npm run
+  unpack -- <clone.json|-> <out-dir>` turns the `files` map returned by
+  `POST /v1/clones` (or `GET /v1/clones/:id/result`) into a real project tree on
+  disk: text files written inline, binary assets materialized from inline base64
+  or fetched from their reference URL (`$DITTO_API_URL` / `$DITTO_API_KEY`), with
+  path-traversal guards and pre-write `sha256` integrity checks. Reads from stdin
+  so a `curl` response can be piped straight in. Documented next to the REST
+  examples in the README and `docs/SERVICE.md`.
 
 ### Added — Open-source readiness
 

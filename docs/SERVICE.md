@@ -61,15 +61,19 @@ curl -s -X POST localhost:8787/v1/clones -H 'content-type: application/json' \
 ```
 
 To turn that `files` map into a project on disk, pipe the response into the
-`ditto` CLI (`packages/cli`) instead of inspecting the JSON by hand:
+repo-local `ditto` CLI (`packages/cli`) instead of inspecting the JSON by hand:
 
 ```bash
 curl -s -X POST localhost:8787/v1/clones -H 'content-type: application/json' \
   -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
-  | npx ditto unpack - ./out
+  | npm run --silent unpack -- - ./out
 # binary assets: set DITTO_API_URL (and DITTO_API_KEY when authenticated) so the
 # CLI can fetch each file's reference URL; --no-fetch writes only the text tree.
 ```
+
+The CLI package is intentionally private for now; run this command from a
+checked-out `ditto.site` repo with dependencies installed. Do not use
+`npx ditto` until this package is published.
 
 ## REST surface
 

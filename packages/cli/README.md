@@ -6,21 +6,25 @@ the giant blob you get back from `POST /v1/clones` or
 
 Zero dependencies. Needs Node >= 20.
 
+This workspace is currently private and repo-local. Run these commands from the
+repository root after `npm install`; do not use `npx ditto` until the package is
+published.
+
 ## Unpack
 
 ```bash
 # from a saved file
-ditto unpack clone.json ./out
+npm run unpack -- clone.json ./out
 
 # straight from curl, no temp file
 curl -sS -X POST "$DITTO_API_URL/v1/clones" \
   -H "authorization: Bearer $DITTO_API_KEY" \
   -H "content-type: application/json" \
   -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
-  | ditto unpack - ./out
+  | npm run --silent unpack -- - ./out
 ```
 
-`ditto unpack <clone.json|-> <out-dir>`:
+`npm run unpack -- <clone.json|-> <out-dir>`:
 
 - writes every text file from its inline `content`,
 - materializes binary assets from inline base64 when present, otherwise fetches
@@ -31,8 +35,8 @@ curl -sS -X POST "$DITTO_API_URL/v1/clones" \
 ### Binary assets
 
 Clone results return binaries by reference (`{ "type": "binary", "url": ... }`)
-rather than inlining megabytes of base64. To fetch them, `ditto` needs to know
-where the API lives:
+rather than inlining megabytes of base64. To fetch them, the unpacker needs to
+know where the API lives:
 
 | Source | Flag | Env |
 | --- | --- | --- |
@@ -43,4 +47,4 @@ Use `--no-fetch` to write only the text tree and list the binaries as skipped.
 To grab everything in one shot instead, download the archive directly:
 `GET /v1/clones/<id>/bundle?format=tgz`.
 
-Run `ditto --help` for the full option list.
+Run `npm run unpack -- --help` for the full option list.

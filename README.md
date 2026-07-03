@@ -82,20 +82,22 @@ is a file map — every generated file keyed by its app-relative path:
 }
 ```
 
-**Turn that JSON into a project on disk** with the official unpacker — pipe the
-response straight in, no temp file:
+**Turn that JSON into a project on disk** with the official unpacker — from a
+checked-out `ditto.site` repo with dependencies installed, pipe the response
+straight in with no temp file:
 
 ```bash
 curl -sS -X POST "$DITTO_API_URL/v1/clones" \
   -H "authorization: Bearer $DITTO_API_KEY" \
   -H "content-type: application/json" \
   -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
-  | npx ditto unpack - ./out
+  | npm run --silent unpack -- - ./out
 ```
 
-`ditto unpack <clone.json|-> <out-dir>` writes the text files inline and
+`npm run unpack -- <clone.json|-> <out-dir>` writes the text files inline and
 materializes binary assets (inline base64, or fetched from their `url` using
-`$DITTO_API_URL` / `$DITTO_API_KEY`). See
+`$DITTO_API_URL` / `$DITTO_API_KEY`). The CLI package is repo-local until the
+npm distribution story is ready, so do not use `npx ditto` yet. See
 [`packages/cli`](packages/cli/README.md) for options.
 
 If you got back a queued job (`{ "jobId": "job_123", "status": "queued" }`),
@@ -108,7 +110,7 @@ JOB_ID="job_123"
 # poll status, then unpack the finished file map
 curl -sS -H "authorization: Bearer $DITTO_API_KEY" \
   "$DITTO_API_URL/v1/clones/$JOB_ID/result" \
-  | npx ditto unpack - ./out
+  | npm run --silent unpack -- - ./out
 
 # ...or grab the whole app as a single archive
 curl -L -H "authorization: Bearer $DITTO_API_KEY" \

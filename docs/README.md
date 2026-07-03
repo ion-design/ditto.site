@@ -15,7 +15,7 @@ The central index for ditto.site's docs. Start here.
 | --- | --- |
 | Understand what ditto.site is and see it run | [Project README](../README.md) |
 | Call the hosted **REST API** or **MCP** server | [Project README → Usage](../README.md#usage), [SERVICE.md](SERVICE.md) |
-| Turn a clone result JSON into files on disk | [`ditto unpack` CLI](../packages/cli/README.md) |
+| Turn a clone result JSON into files on disk | [Repo-local unpack CLI](../packages/cli/README.md) |
 | Run the **compiler locally** from the command line | [compiler/README.md](../compiler/README.md) |
 | Deploy the service | [DEPLOY.md](DEPLOY.md) |
 | Read the development & evaluation method | [METHODOLOGY.md](METHODOLOGY.md) |
@@ -39,7 +39,7 @@ never commit one. Rotate a leaked key anytime from the dashboard. See
 ## The short version of the workflow
 
 1. **Clone** a URL → `POST /v1/clones` (API) or `npm run clone -- <url>` (local CLI).
-2. **Get the app** → unpack the result JSON with [`ditto unpack`](../packages/cli/README.md),
+2. **Get the app** → unpack the result JSON with the [repo-local unpack CLI](../packages/cli/README.md),
    download the `bundle?format=tgz` archive, or read files from `runs/<site>/latest/`.
 3. **Preview it** → `cd` into the app and `npm install && npm run dev` (or let the
    local CLI do it for you with `--serve` / `--open`).
@@ -54,4 +54,4 @@ never commit one. Rotate a leaked key anytime from the dashboard. See
 - [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) — acceptable-use boundaries.
 - [RELEASING.md](RELEASING.md) — release process.
 - [../compiler/README.md](../compiler/README.md) — local compiler commands.
-- [../packages/cli/README.md](../packages/cli/README.md) — the `ditto unpack` CLI.
+- [../packages/cli/README.md](../packages/cli/README.md) — the repo-local unpack CLI.

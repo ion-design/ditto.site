@@ -175,6 +175,7 @@ test("unpack: reports sha256 mismatch as a failure", async () => {
     const res = await run(["unpack", "-", out], { stdin: JSON.stringify(doc) });
     assert.notEqual(res.code, 0);
     assert.match(res.err, /integrity check/);
+    await assert.rejects(stat(join(out, "a.txt")));
   });
 });
 

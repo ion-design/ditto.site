@@ -32,13 +32,14 @@ Options:
   -h, --help         Show this help.
 
 Examples:
+  npm run unpack -- clone.json ./out
+
   curl -sS -X POST "$DITTO_API_URL/v1/clones" \\
     -H "authorization: Bearer $DITTO_API_KEY" \\
     -H "content-type: application/json" \\
     -d '{"url":"https://example.com/","options":{"mode":"single"}}' \\
-    | ditto unpack - ./out
+    | npm run --silent unpack -- - ./out
 
-  ditto unpack clone.json ./out
 `;
 
 /** Print to stderr and exit non-zero. */
@@ -166,7 +167,6 @@ async function unpack(positionals, flags) {
 
   let written = 0;
   let bytes = 0;
-  let hashMismatch = 0;
   const skipped = [];
 
   for (const [path, entry] of Object.entries(files)) {
@@ -199,18 +199,17 @@ async function unpack(positionals, flags) {
       buf = Buffer.from(typeof entry.content === "string" ? entry.content : "", "utf8");
     }
 
+    if (typeof entry.sha256 === "string" && entry.sha256 && sha256(buf) !== entry.sha256) {
+      log(`  ! ${path}: sha256 mismatch`);
+      fail(`${path} failed sha256 integrity check`);
+    }
+
     const dest = safeJoin(outAbs, path);
     await mkdir(dirname(dest), { recursive: true });
     await writeFile(dest, buf);
     written++;
     bytes += buf.length;
-
-    if (typeof entry.sha256 === "string" && entry.sha256 && sha256(buf) !== entry.sha256) {
-      hashMismatch++;
-      log(`  ! ${path}: sha256 mismatch`);
-    } else {
-      log(`  + ${path}`);
-    }
+    log(`  + ${path}`);
   }
 
   const kb = (bytes / 1024).toFixed(1);
@@ -229,7 +228,6 @@ async function unpack(positionals, flags) {
       );
     }
   }
-  if (hashMismatch) fail(`${hashMismatch} file(s) failed sha256 integrity check`);
 }
 
 async function main() {
