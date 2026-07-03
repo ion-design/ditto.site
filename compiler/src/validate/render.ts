@@ -15,6 +15,10 @@ const ESBUILD_SHIM =
 const VIEWPORT_HEIGHTS: Record<number, number> = { 375: 812, 768: 1024, 1280: 800, 1920: 1080 };
 function viewportHeight(w: number): number { return VIEWPORT_HEIGHTS[w] ?? Math.round(w * 0.66); }
 
+/** The compiler's shared build harness (deps preinstalled). Exposed so the service
+ *  layer can build previews without duplicating the path convention. */
+export const DEFAULT_HARNESS_DIR = new URL("../../.harness", import.meta.url).pathname;
+
 export type BuildResult = {
   ok: boolean;
   outDir: string | null;
