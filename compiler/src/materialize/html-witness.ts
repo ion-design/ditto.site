@@ -25,12 +25,19 @@ export function extractHtmlRefs(html: string): string[] {
   return [...refs].sort();
 }
 
+/** File extensions the pipeline materializes. The witness HTML also references
+ *  pages (`<a href>`), scripts, and API endpoints — none of which the clone ships
+ *  by design, so counting them as "unresolved assets" made this gate fail on every
+ *  site. Only asset-like refs participate. */
+const ASSET_EXT_RE = /\.(png|jpe?g|webp|avif|gif|svg|ico|woff2?|ttf|otf|eot|mp4|webm|mp3|css|webmanifest)(\?|#|$)/i;
+
 export function gate2bHtmlWitness(sourceDir: string, assetGraph: AssetGraph, sourceUrl: string, strict = false): GateResult {
   const issues: string[] = [];
   const witnessRoot = join(sourceDir, "evidence", "live-witness");
   let pagesChecked = 0;
   let remoteRefs = 0;
   let unresolved = 0;
+  let untracked = 0;
 
   if (!fileExists(witnessRoot)) {
     return { gate: "html_witness", pass: false, metrics: { pagesChecked: 0 }, issues: ["missing evidence/live-witness"] };
@@ -51,21 +58,26 @@ export function gate2bHtmlWitness(sourceDir: string, assetGraph: AssetGraph, sou
       try {
         if (new URL(abs).origin !== origin) continue;
       } catch { continue; }
+      if (!ASSET_EXT_RE.test(abs)) continue;
       remoteRefs++;
       const hit = assetGraph.byUrl.get(abs)
         ?? assetGraph.entries.find((e) => normalizeFetchUrl(e.sourceUrl) === abs);
-      if (!hit || hit.classification !== "downloaded") unresolved++;
+      // A tracked entry skipped WITH a recorded reason is deliberate policy (e.g.
+      // css_referenced_unfetched, http_404) — surfaced by gate 2, not a witness gap.
+      if (!hit) untracked++;
+      else if (hit.classification !== "downloaded" && !hit.reason) unresolved++;
     }
   }
 
   if (pagesChecked === 0) issues.push("no live-witness HTML pages");
   if (unresolved > 0) issues.push(`${unresolved}/${remoteRefs} origin asset refs not materialized locally`);
-  if (strict && unresolved > 0) issues.push("strict mode: all HTML asset refs must resolve");
+  if (untracked > 0) issues.push(`${untracked}/${remoteRefs} origin asset refs never discovered by capture`);
+  if (strict && (unresolved > 0 || untracked > 0)) issues.push("strict mode: all HTML asset refs must resolve");
 
   return {
     gate: "html_witness",
     pass: issues.length === 0,
-    metrics: { pagesChecked, remoteRefs, unresolved },
+    metrics: { pagesChecked, remoteRefs, unresolved, untracked },
     issues,
   };
 }
