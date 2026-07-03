@@ -6,7 +6,7 @@ import type { CloneJobResult, CloneOptions } from "@cloner/core";
  *  it is removed on eviction. M2/M4 replace this with DB rows + S3 objects. */
 export type JobRecord = {
   id: string;
-  status: "succeeded" | "failed";
+  status: "running" | "succeeded" | "failed";
   url: string;
   kind: "clone" | "clone_site";
   options: CloneOptions;
@@ -14,6 +14,8 @@ export type JobRecord = {
   result?: CloneJobResult;
   base?: string;
   error?: string;
+  /** pipeline progress events (compiler log stream + service phases), poll via /events */
+  events?: Array<Record<string, unknown>>;
 };
 
 /** In-memory result store with TTL eviction. Swapped for a DB-backed store in M2. */

@@ -56,4 +56,6 @@ export interface Backend {
   facets(jobId: string): Promise<FileFacet[] | null>;
   /** The whole app as one compressed archive (null if not ready/found). */
   bundle(jobId: string, format?: BundleFormat): Promise<CloneBundle | null>;
+  /** Pipeline progress events for polling UIs (null if unsupported or job unknown). */
+  events?(jobId: string): Promise<Array<Record<string, unknown>> | null>;
 }

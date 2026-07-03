@@ -22,12 +22,22 @@ export class InMemoryBackend implements Backend {
   async submit(url: string, options: CloneOptions | undefined): Promise<SubmitOutcome> {
     const id = randomUUID();
     const base = this.makeBase();
+    // Record the job BEFORE running it so a second connection can poll
+    // /v1/clones/:id and /events while the inline clone is in flight.
+    const events: Array<Record<string, unknown>> = [];
+    const kind: "clone" | "clone_site" = resolveCloneMode(options) === "multi" ? "clone_site" : "clone";
+    const rec = { id, status: "running" as const, url, kind, options: options ?? {}, createdAt: Date.now(), base, events };
+    this.deps.store.put(rec);
+    const log = (e: Record<string, unknown>) => {
+      events.push({ t: Date.now(), ...e });
+    };
     try {
       // captureCacheDir (persistent, shared across submits) powers the single→multi
       // reuse: a single-page submit stashes its capture; a later multi-page submit for
       // the same URL reuses it as the entry route (no re-capture) and expands the site.
-      const result = await this.deps.runJob({ url, options, runsDir: base, captureCacheDir: this.deps.captureCacheDir });
-      this.deps.store.put({ id, status: "succeeded", url, kind: result.kind, options: result.options, createdAt: Date.now(), result, base });
+      const result = await this.deps.runJob({ url, options, runsDir: base, captureCacheDir: this.deps.captureCacheDir, log });
+      log({ event: "clone_done" });
+      this.deps.store.put({ id, status: "succeeded", url, kind: result.kind, options: result.options, createdAt: rec.createdAt, result, base, events });
       if (result.options.asyncVerify) {
         void verifyCloneJobResult(result, {
           validationConcurrency: result.options.validationConcurrency,
@@ -46,9 +56,16 @@ export class InMemoryBackend implements Backend {
       } catch {
         /* best effort */
       }
-      this.deps.store.put({ id, status: "failed", url, kind: resolveCloneMode(options) === "multi" ? "clone_site" : "clone", options: options ?? {}, createdAt: Date.now(), error: String(e) });
+      log({ event: "clone_error", error: String(e).slice(0, 300) });
+      this.deps.store.put({ id, status: "failed", url, kind, options: options ?? {}, createdAt: rec.createdAt, error: String(e), events });
       throw e;
     }
+  }
+
+  async events(jobId: string): Promise<Array<Record<string, unknown>> | null> {
+    const rec = this.deps.store.get(jobId);
+    if (!rec) return null;
+    return rec.events ?? [];
   }
 
   async status(jobId: string): Promise<JobView | null> {
