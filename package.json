@@ -41,7 +41,8 @@
     "dev:api": "npm run dev --workspace @cloner/api",
     "dev:worker": "npm run dev --workspace @cloner/worker",
     "db:generate": "npm run generate --workspace @cloner/db",
-    "db:migrate": "npm run migrate --workspace @cloner/db"
+    "db:migrate": "npm run migrate --workspace @cloner/db",
+    "unpack": "node packages/cli/bin/ditto.mjs unpack"
   },
   "devDependencies": {
     "tsx": "4.22.4",

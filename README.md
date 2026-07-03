@@ -2,7 +2,7 @@
   <img src="docs/assets/ditto.svg" alt="ditto.site logo" width="112" />
 </p>
 
-# ditto.site
+# [ditto.site](https://ditto.site)
 
 [![CI](https://github.com/ion-design/ditto.site/actions/workflows/ci.yml/badge.svg)](https://github.com/ion-design/ditto.site/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -15,12 +15,21 @@ Router project by default, or Vite React when requested.
 The compiler is not an LLM page author. It is a capture-to-code pipeline: same
 frozen capture in, byte-stable app out.
 
+> **"Cloning" here means generating a codebase from a live URL — not `git clone`.**
+> You don't need an existing repository, and you don't need the site's source. Point
+> ditto.site at a public URL and it writes you a fresh project from what the page
+> renders in a browser.
+
+Read the public development and evaluation method in
+[docs/METHODOLOGY.md](docs/METHODOLOGY.md). For a map of all the docs, see
+[docs/README.md](docs/README.md).
+
 ## Usage
 
 - REST API: `https://api.ditto.site`
 - MCP server: `https://api.ditto.site/mcp`
 
-Get a hosted key at `https://ditto.site/api-key`, or call the verified-email
+Get a hosted key at `https://www.ditto.site/api-key`, or call the verified-email
 signup flow directly:
 
 ```bash
@@ -31,6 +40,11 @@ curl -sS -X POST "https://api.ditto.site/v1/signup/request" \
 
 The emailed verification link lands on `/api-key?token=...`, which calls
 `POST /v1/signup/verify` and displays the new `dtto_live_...` key once.
+
+> **Keys are secrets.** Put your key in an environment variable (`export
+> DITTO_API_KEY=dtto_live_...`) and reference `$DITTO_API_KEY` in every command —
+> never paste the raw key inline, where it lands in shell history, logs, or a chat.
+> Don't commit it. You can rotate a key anytime from the dashboard.
 
 ### REST API
 
@@ -53,20 +67,52 @@ curl -sS -X POST "$DITTO_API_URL/v1/clones" \
   }'
 ```
 
-The service returns either an inline result or a queued job:
+The service returns either a queued job or an inline result. A finished result
+is a file map — every generated file keyed by its app-relative path:
 
 ```json
-{ "jobId": "job_123", "status": "queued" }
+{
+  "jobId": "job_123",
+  "status": "succeeded",
+  "files": {
+    "package.json": { "type": "text", "content": "{ ... }", "bytes": 812, "sha256": "..." },
+    "src/app/page.tsx": { "type": "text", "content": "export default ...", "bytes": 2048, "sha256": "..." },
+    "public/assets/logo.png": { "type": "binary", "url": ".../files/public/assets/logo.png", "bytes": 5123, "sha256": "..." }
+  }
+}
 ```
 
-Poll and download the generated app:
+**Turn that JSON into a project on disk** with the official unpacker — from a
+checked-out `ditto.site` repo with dependencies installed, pipe the response
+straight in with no temp file:
+
+```bash
+curl -sS -X POST "$DITTO_API_URL/v1/clones" \
+  -H "authorization: Bearer $DITTO_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
+  | npm run --silent unpack -- - ./out
+```
+
+`npm run unpack -- <clone.json|-> <out-dir>` writes the text files inline and
+materializes binary assets (inline base64, or fetched from their `url` using
+`$DITTO_API_URL` / `$DITTO_API_KEY`). The CLI package is repo-local until the
+npm distribution story is ready, so do not use `npx ditto` yet. See
+[`packages/cli`](packages/cli/README.md) for options.
+
+If you got back a queued job (`{ "jobId": "job_123", "status": "queued" }`),
+poll it, then unpack the finished result — or download the whole app as one
+archive:
 
 ```bash
 JOB_ID="job_123"
 
+# poll status, then unpack the finished file map
 curl -sS -H "authorization: Bearer $DITTO_API_KEY" \
-  "$DITTO_API_URL/v1/clones/$JOB_ID"
+  "$DITTO_API_URL/v1/clones/$JOB_ID/result" \
+  | npm run --silent unpack -- - ./out
 
+# ...or grab the whole app as a single archive
 curl -L -H "authorization: Bearer $DITTO_API_KEY" \
   "$DITTO_API_URL/v1/clones/$JOB_ID/bundle?format=tgz" \
   -o ditto-clone.tgz
@@ -136,6 +182,8 @@ src/app/page.tsx, and src/app/ditto.css.
 ### Local CLI
 
 ```bash
+# this git clone gets the ditto.site tool itself — the URL you clone into a
+# codebase comes later, as the argument to `npm run clone`.
 git clone https://github.com/ion-design/ditto.site.git
 cd ditto.site
 
@@ -145,7 +193,17 @@ npx playwright install chromium
 npm run clone -- https://example.com/ --out=./output
 ```
 
-The generated app lands under `output/<site>/app`.
+The generated app lands under `output/<site>/app`. On success the CLI prints a
+copy-paste-safe summary — a single quoted `cd … && npm install && npm run dev`
+line and pointers to the safe-to-edit files (`src/app/content.ts`,
+`src/app/components/`; the app's `AGENTS.md` has the full guide).
+
+To skip the copy-paste entirely and go straight to a running preview:
+
+```bash
+npm run clone -- https://example.com/ --serve        # clone, npm install, npm run dev
+npm run clone -- https://example.com/ --open         # ...and open the browser too
+```
 
 Common local variants:
 
@@ -155,6 +213,10 @@ npm run clone -- https://example.com/ --styling=css
 npm run clone -- https://example.com/ --framework=vite
 npm run validate-site -- runs/site-example.com/<timestamp>
 ```
+
+Without `--out`, runs land under `runs/<site>/<timestamp>/` and a stable
+`runs/<site>/latest` symlink always points at the newest clone, so scripts and
+`cd` targets don't depend on the timestamp.
 
 ### Local REST And MCP Service
 
@@ -222,7 +284,8 @@ observed safely. Unsupported app logic, auth, payments, personalization, and
 arbitrary third-party JavaScript are not replayed.
 
 For the detailed service API, see [docs/SERVICE.md](docs/SERVICE.md). For
-deployment, see [docs/DEPLOY.md](docs/DEPLOY.md).
+deployment, see [docs/DEPLOY.md](docs/DEPLOY.md). For the development method
+behind the compiler, see [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 Hosted deployments should keep `/v1/clones*` and `/mcp` behind API-key auth.
 When `SIGNUP_ENABLED=true` in DB mode, the Resend-backed
@@ -237,11 +300,12 @@ minting is intentional.
 | --- | --- |
 | `compiler/` | deterministic capture, inference, generation, and validation |
 | `packages/core/` | compiler adapter and file-map helpers |
+| `packages/cli/` | `ditto` CLI — unpack a clone result JSON into a project tree |
 | `packages/api/` | Hono REST API and MCP server |
 | `packages/db/` | Drizzle schema, migrations, repository, and queue wrapper |
 | `packages/storage/` | local and S3/R2 artifact storage |
 | `packages/worker/` | queued clone runner and optional verification |
-| `docs/` | service, deployment, release, and responsible-use docs |
+| `docs/` | methodology, service, deployment, release, and responsible-use docs |
 | `examples/` | benchmark results and visual evidence |
 
 ## Responsible Use
