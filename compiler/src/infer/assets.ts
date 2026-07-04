@@ -96,11 +96,10 @@ export function materializeAssets(graph: AssetGraph, sourceDir: string, appPubli
   for (const e of graph.entries) {
     if (e.classification !== "downloaded" || !e.storedFile || !e.localPath) continue;
     if (e.type === "css") continue; // not served by the app
-    // A <video> is rendered as its poster still (streaming sources are dropped in
-    // generation), so the materialized video file is never referenced — skip
-    // copying it to public/ to save disk and build time. Its first-frame poster is
-    // a separate image asset that is still materialized.
-    if (e.type === "video") continue;
+    // Videos ARE materialized: muted autoplay/loop background videos keep their
+    // local src in generation (foreground videos stay poster-only, and their file
+    // rides along unreferenced — the disk cost of not coupling this walk to
+    // per-node emission decisions).
     if (seenPublicPaths?.has(e.localPath)) continue;
     const src = join(storeDir, e.storedFile);
     const from = fileExists(src) ? src : join(cssDir, e.storedFile);

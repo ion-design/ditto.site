@@ -289,7 +289,17 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
   // has no deterministic frame and its request aborts at snapshot time. Drop the
   // streaming src + autoplay so only the poster paints; keep the poster (rewritten
   // to a local still below). <source>/<track> children are dropped in renderNode.
+  // EXCEPTION: a muted autoplay/loop BACKGROUND video whose file was materialized
+  // ships its local src — it's self-contained, often has no obtainable poster
+  // (still-capture refuses when foreground text would bake in), and validation
+  // pauses playback at frame 0 before snapshots so gates stay deterministic.
   const isVideo = node.tag === "video";
+  const keepsVideoSrc = isVideo
+    && node.attrs.src !== undefined
+    && node.attrs.muted !== undefined
+    && (node.attrs.autoplay !== undefined || node.attrs.loop !== undefined)
+    && node.attrs.controls === undefined
+    && assetMap.has(resolveUrl(node.attrs.src, sourceUrl));
   // An <iframe> embeds a third-party, non-deterministic document; reproducing it
   // would break self-containment (rubric Gate 2) and can't be deterministic anyway.
   // Keep the element as a placeholder sized by its captured box, but drop the
@@ -299,7 +309,8 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
   for (const key of attrKeys) {
     let value = node.attrs[key]!;
     if (key === "class" || key === "style" || key === "data-cid-cap") continue;
-    if (isVideo && (key === "src" || key === "autoplay" || key === "loop" || key === "preload")) continue;
+    if (isVideo && key === "preload") continue;
+    if (isVideo && !keepsVideoSrc && (key === "src" || key === "autoplay" || key === "loop")) continue;
     if (isIframe && (key === "src" || key === "srcdoc" || key === "name")) continue;
 
     if (ASSET_ATTRS.has(key)) {
@@ -341,7 +352,9 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
     }
   }
 
-  if (isVideo && !props.some(([k]) => k === "preload")) props.push(["preload", JSON.stringify("none")]);
+  // Poster-only videos never load their (dropped) source; a kept background video
+  // must be allowed to fetch its local file so autoplay has frames.
+  if (isVideo && !keepsVideoSrc && !props.some(([k]) => k === "preload")) props.push(["preload", JSON.stringify("none")]);
 
   if (node.rawHTML && node.tag === "svg") {
     // Strip the Stage-4 capture-id (`data-cid-cap`) the interaction pass stamps on

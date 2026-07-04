@@ -12,6 +12,8 @@ export const UI_HTML = `<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
+  /* id-selector display rules below beat the UA's [hidden]{display:none} — restore it */
+  [hidden] { display: none !important; }
   body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; background: #0b0e14; color: #e6e6e6; }
   header { padding: 14px 20px; border-bottom: 1px solid #1d2330; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; color: #9ecbff; }

@@ -206,6 +206,9 @@ export async function renderApp(opts: {
           // Cancel any remaining running animations (CSS @keyframes / WAAPI) so each element
           // shows its emitted base CSS = the source-captured settled frame the gates expect.
           try { for (const a of (document.getAnimations ? document.getAnimations() : [])) { try { a.cancel(); } catch { /* ignore */ } } } catch { /* ignore */ }
+          // Background videos ship their (local) src now — freeze them at frame 0 so
+          // snapshots stay deterministic, mirroring the animation cancellation above.
+          try { for (const v of Array.from(document.querySelectorAll("video"))) { try { v.pause(); v.currentTime = 0; } catch { /* ignore */ } } } catch { /* ignore */ }
         });
         const snapshot = await page.evaluate(collectPage);
         writeJSONCompact(join(opts.renderedDir, "dom", `dom-${vw}.json`), snapshot);

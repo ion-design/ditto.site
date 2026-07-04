@@ -413,6 +413,21 @@ async function captureVideoStills(page: import("playwright").Page): Promise<Vide
           try { v.pause(); } catch { /* ignore */ }
           try { v.currentTime = 0; } catch { /* ignore */ }
           await sleep(100);
+          // Lazy background videos (preload="none" / range-aborted) sit at
+          // readyState < 2 with no decodable frame — force one in (bounded) so the
+          // canvas readback has pixels. Elementor hero videos land here.
+          if (v.readyState < 2 && (v.currentSrc || v.querySelector("source"))) {
+            try {
+              v.muted = true;
+              v.preload = "auto";
+              v.load();
+              const p = v.play();
+              if (p && typeof p.catch === "function") p.catch(() => { /* autoplay denied */ });
+            } catch { /* ignore */ }
+            for (let t = 0; t < 20 && v.readyState < 2; t++) await sleep(100);
+            try { v.pause(); v.currentTime = 0; } catch { /* ignore */ }
+            await sleep(100);
+          }
           let done = false;
           const w = v.videoWidth, h = v.videoHeight;
           if (w && h && v.readyState >= 2) {
@@ -684,6 +699,11 @@ export async function captureSite(opts: {
         const existing = assetMap.get(url);
         if (existing?.storedAs) return;
         if (status >= 400) return;
+        // A 206 body is a RANGE FRAGMENT (media elements fetch videos in chunks) —
+        // storing it would freeze a truncated file as "downloaded" (cropin's hero
+        // video landed as 27KB of a multi-MB mp4). Leave it unstored; the fallback
+        // downloader fetches the complete file with a plain GET.
+        if (status === 206) return;
         bodyPromises.push(
           (async () => {
             try {
