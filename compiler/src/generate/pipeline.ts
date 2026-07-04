@@ -90,7 +90,7 @@ export function generateAll(opts: {
   const cloneOpts = fileExists(optPath) ? readJSON<{ components?: boolean; humanizeMode?: "tailwind" | "css"; framework?: AppFramework; reflow?: boolean }>(optPath) : {};
   const components = !!cloneOpts.components;
   const humanizeMode = cloneOpts.humanizeMode; // undefined → generateApp default ("tailwind")
-  const gen = generateApp({ ir, assetGraph, fontGraph, appDir, sourceDir, sourceUrl: url, seoInventory, colorVar: palette.varForColor, tokenResolver, primitives, recipeReport, interaction: capture.interaction, rejectedSpecs, components, humanizeMode, framework: cloneOpts.framework, motion: capture.motion, reflow: !!cloneOpts.reflow }, tokensCss);
+  const gen = generateApp({ ir, assetGraph, fontGraph, appDir, sourceDir, sourceUrl: url, seoInventory, colorVar: palette.varForColor, tokenResolver, primitives, recipeReport, interaction: capture.interaction, pseudoStates: capture.pseudoStates, rejectedSpecs, components, humanizeMode, framework: cloneOpts.framework, motion: capture.motion, reflow: !!cloneOpts.reflow }, tokensCss);
   const mat = materializeAssets(assetGraph, sourceDir, join(appDir, "public"));
 
   // Static HTML mirror at /static/ (served from app/public/static/).

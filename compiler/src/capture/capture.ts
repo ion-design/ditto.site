@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { join } from "node:path";
 import { collectPage, type PageSnapshot, type FontFace } from "./walker.js";
 import { tagElements, captureInteractions, type InteractionCapture } from "./interactions.js";
@@ -36,6 +36,30 @@ const DESKTOP_UA =
 
 // Defines esbuild/tsx runtime helpers in the page so serialized evaluate
 // callbacks that reference them don't throw ReferenceError.
+/** Neutralize the two entropy sources page JS can render from, BEFORE any page
+ *  script runs: Math.random becomes a seeded PRNG (mulberry32), and the wall
+ *  clock is shifted so every capture starts at the same epoch — while still
+ *  advancing, so elapsed-time logic (animations, lazy-load timers) behaves.
+ *  Raw string: it must not be transformed by tsx/esbuild. */
+const DETERMINISTIC_ENV_SHIM = `(() => {
+  let s = 0x9e3779b9;
+  Math.random = function() {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const RealDate = Date;
+  const delta = 1767225600000 - RealDate.now(); /* pin start to 2026-01-01T00:00:00Z */
+  class DittoDate extends RealDate {
+    constructor(...args) { args.length ? super(...args) : super(RealDate.now() + delta); }
+    static now() { return RealDate.now() + delta; }
+  }
+  DittoDate.parse = RealDate.parse;
+  DittoDate.UTC = RealDate.UTC;
+  globalThis.Date = DittoDate;
+})();`;
+
 const ESBUILD_SHIM =
   "globalThis.__name = globalThis.__name || ((fn) => fn);" +
   "globalThis.__defProp = globalThis.__defProp || Object.defineProperty;";
@@ -89,6 +113,16 @@ export type CaptureResult = {
   // Stage 5: optional motion capture (WAAPI animations + rotating text). CSS @keyframes
   // motion is reconstructed from the IR, so it isn't re-captured here.
   motion?: MotionCapture;
+  // Fast-path (interactions OFF) hover/focus rules recovered from the source
+  // stylesheets. capId keys match data-cid-cap attrs carried into the IR.
+  pseudoStates?: PseudoStateRule[];
+};
+
+export type PseudoStateRule = {
+  capId: string;
+  pseudo: "hover" | "focus" | "focus-visible" | "focus-within";
+  media?: string;
+  decls: Record<string, string>;
 };
 
 function viewportHeight(width: number): number {
@@ -464,6 +498,9 @@ export async function captureSite(opts: {
   interactions?: boolean; // Stage 4: opt-in interaction capture (hover/focus + patterns)
   motion?: boolean; // Stage 5: opt-in motion capture (WAAPI + rotating text)
   breakpoints?: boolean; // discover the source's real responsive band edges (default on; read-only sweep)
+  deterministicEnv?: boolean; // seed Math.random + pin the clock epoch BEFORE page JS runs (default on),
+                              // so shuffled carousels / random ids / "posted N minutes ago" render the
+                              // same across captures. Relative time still advances (timers behave).
   screenshots?: boolean; // write per-viewport full-page PNGs (default on). ONLY the validator reads these
                          // (generation never touches pixels), and full-page shots of tall pages are the
                          // dominant capture cost — so a production clone that won't be perceptually graded
@@ -600,6 +637,7 @@ export async function captureSite(opts: {
   const perViewport: CaptureResult["perViewport"] = [];
   let interaction: InteractionCapture | undefined;
   let motion: MotionCapture | undefined;
+  let pseudoStates: PseudoStateRule[] = [];
   let discoveredBreakpoints: number[] | undefined;
   const captureSeoResources: SeoResource[] = [];
   const cssTextsForParsing: Array<{ baseUrl: string; text: string }> = [];
@@ -631,6 +669,7 @@ export async function captureSite(opts: {
     // helper does not exist in the browser when we serialize page.evaluate
     // callbacks. Shim it (as a raw string so it isn't itself transformed).
     await page.addInitScript(ESBUILD_SHIM);
+    if (opts.deterministicEnv ?? true) await page.addInitScript(DETERMINISTIC_ENV_SHIM);
     const bodyPromises: Promise<void>[] = [];
 
     page.on("response", (resp) => {
@@ -742,6 +781,21 @@ export async function captureSite(opts: {
       // Stage 2: wait for entrance/scroll animations to settle so geometry isn't
       // sampled mid-transition.
       const quiescent = await waitForQuiescence(page);
+
+      // Fast-path hover/focus recovery: when Stage 4 (live interaction driving) is
+      // OFF, recover state-variant styling from the stylesheets instead — parse
+      // :hover/:focus rules, match their base selectors against the live DOM, and
+      // tag matches (data-cid-cap survives into the IR). Cross-origin sheets are
+      // unreadable via CSSOM, so their intercepted raw text is re-parsed through
+      // constructed stylesheets. Runs once, before any DOM walk.
+      if (!opts.interactions && vw === viewports[0]) {
+        try {
+          pseudoStates = await collectPseudoStates(page, cssTextsForParsing.map((t) => t.text));
+          if (pseudoStates.length) log({ event: "pseudo_states", rules: pseudoStates.length });
+        } catch (e) {
+          log({ event: "pseudo_states_error", error: String(e).slice(0, 160) });
+        }
+      }
 
       // Reset window + all inner scrollable containers to scroll 0 so captured
       // positions match the generated app's default (un-scrolled) render. Inner
@@ -1021,6 +1075,7 @@ export async function captureSite(opts: {
     dismissal: dismissUnion,
     interaction,
     motion,
+    ...(pseudoStates.length ? { pseudoStates } : {}),
   };
 
   if (interaction) writeJSON(join(opts.outDir, "interaction.json"), interaction);
@@ -1039,6 +1094,98 @@ export async function captureSite(opts: {
   log({ event: "evidence_frozen", assetFiles: assetManifest.fileCount, assetHash: assetManifest.hash.slice(0, 12) });
 
   return result;
+}
+
+// Kebab-case mirror of interactions.ts PSEUDO_PROPS — the curated set a
+// :hover/:focus rule realistically changes. Filtering to it keeps recovered
+// rules from dragging layout-shifting junk (display/position) into the clone.
+const PSEUDO_DECL_ALLOW = [
+  "color", "background-color", "background-image", "background-position",
+  "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+  "border-color", "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+  "box-shadow", "opacity", "transform", "filter",
+  "text-decoration-line", "text-decoration-color", "text-decoration",
+  "outline-color", "outline-width", "outline-style", "letter-spacing",
+];
+
+/** Scan every reachable stylesheet for self-targeting :hover/:focus rules, match
+ *  their base selectors against the live DOM, tag matches with data-cid-cap, and
+ *  return the (deduped) rules. Cross-origin sheets can't be read via CSSOM, so
+ *  their intercepted raw text is re-parsed through constructed stylesheets. */
+async function collectPseudoStates(page: Page, crossOriginCssTexts: string[]): Promise<PseudoStateRule[]> {
+  const raw = await page.evaluate(
+    ({ texts, allow }: { texts: string[]; allow: string[] }) => {
+      const out: Array<{ capId: string; pseudo: string; media?: string; decls: Record<string, string> }> = [];
+      const allowSet = new Set(allow);
+      let counter = 0;
+      const idFor = (el: Element): string => {
+        let id = el.getAttribute("data-cid-cap");
+        if (!id) {
+          id = "ps" + counter++;
+          el.setAttribute("data-cid-cap", id);
+        }
+        return id;
+      };
+      const PSEUDO_RE = /^(.*?):(hover|focus-visible|focus-within|focus)$/;
+      const sheets: CSSStyleSheet[] = Array.from(document.styleSheets) as CSSStyleSheet[];
+      for (const t of texts) {
+        try {
+          const s = new CSSStyleSheet();
+          s.replaceSync(t);
+          sheets.push(s);
+        } catch { /* unparseable text */ }
+      }
+      const visit = (rules: CSSRuleList | null | undefined, media: string | undefined): void => {
+        if (!rules) return;
+        for (const r of Array.from(rules)) {
+          if (out.length >= 400) return;
+          const asMedia = r as CSSMediaRule;
+          const asStyle = r as CSSStyleRule;
+          if (asMedia.media && (asMedia as { cssRules?: CSSRuleList }).cssRules) {
+            visit(asMedia.cssRules, asMedia.media.mediaText || media);
+            continue;
+          }
+          if (!asStyle.selectorText && (r as { cssRules?: CSSRuleList }).cssRules) {
+            visit((r as { cssRules?: CSSRuleList }).cssRules, media); // @supports / @layer
+            continue;
+          }
+          if (!asStyle.selectorText || !asStyle.style || !/:(hover|focus)/.test(asStyle.selectorText)) continue;
+          for (const part of asStyle.selectorText.split(",")) {
+            const m = PSEUDO_RE.exec(part.trim());
+            if (!m || !m[1]) continue; // self-targeting only; `.card:hover .overlay` reveals stay Stage 4's job
+            const decls: Record<string, string> = {};
+            for (let i = 0; i < asStyle.style.length; i++) {
+              const prop = asStyle.style.item(i);
+              if (allowSet.has(prop)) decls[prop] = asStyle.style.getPropertyValue(prop);
+            }
+            if (!Object.keys(decls).length) continue;
+            let els: Element[] = [];
+            try {
+              els = Array.from(document.querySelectorAll(m[1])).slice(0, 30);
+            } catch { continue; } // selector syntax the engine rejects
+            for (const el of els) {
+              out.push({ capId: idFor(el), pseudo: m[2]!, ...(media ? { media } : {}), decls });
+            }
+          }
+        }
+      };
+      for (const s of sheets) {
+        try { visit(s.cssRules, undefined); } catch { /* cross-origin CSSOM — covered by texts */ }
+      }
+      return out;
+    },
+    { texts: crossOriginCssTexts, allow: PSEUDO_DECL_ALLOW },
+  );
+  // Same-origin sheets appear both in CSSOM and in the intercepted texts — dedupe.
+  const seen = new Set<string>();
+  const rules: PseudoStateRule[] = [];
+  for (const r of raw) {
+    const key = `${r.capId}|${r.pseudo}|${r.media ?? ""}|${JSON.stringify(r.decls)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rules.push(r as PseudoStateRule);
+  }
+  return rules;
 }
 
 function parseCssForFonts(

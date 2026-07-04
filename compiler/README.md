@@ -82,3 +82,17 @@ and emits deterministic hints to `generated/patterns.json` on every
 | Live Playwright capture | No | Network, A/B tests, consent walls, bot detection. Bounded: navigation has a 60s total budget and auth/bot walls fail fast with a clear error. |
 | Validation | Frozen | Gates re-render the built clone against captured evidence; no live URL is re-fetched. |
 | App preview build (service layer) | No | `next build` embeds build ids; the preview lives at `generated/app/public/app-preview/`, outside every determinism surface. |
+
+## Capture determinism & fast-path state recovery
+
+- **Deterministic page env** (default on; `deterministicEnv: false` to disable):
+  an init script seeds `Math.random` (mulberry32) and pins the wall-clock start
+  to a fixed epoch BEFORE any page JS runs — shuffled carousels, random ids, and
+  "posted N minutes ago" render identically across captures. Relative time still
+  advances, so elapsed-time logic (animations, lazy-load timers) behaves.
+- **Fast-path hover/focus recovery**: when Stage 4 interaction capture is OFF,
+  self-targeting `:hover`/`:focus` rules are recovered from the source
+  stylesheets (cross-origin sheets via their intercepted raw text), matched
+  against the live DOM, and emitted as `[data-cid]:hover` rules in `ditto.css`
+  (`capture.pseudoStates`). Stage 4's live-driven deltas supersede this when
+  interactions are enabled.

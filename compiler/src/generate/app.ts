@@ -5,6 +5,7 @@ import type { IR, IRNode, IRChild, IRTextNode } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import { generateCss, RESET_CSS } from "./css.js";
 import { generateInteractionCss } from "./interactionCss.js";
+import { generatePseudoStateCss } from "./pseudoStates.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, accordionJsx, accordionImportPath, ACCORDION_TSX, type AccordionRuntimeSpec, type RuntimeSpec } from "./interactive.js";
 import { buildMotionSpec, motionWireJsx, dittoMotionImportPath, motionHasContent, DITTO_MOTION_TSX, type MotionSpec } from "./motion.js";
 import { buildMenuSpecs, menusJsx, dropdownMenuImportPath, DROPDOWN_MENU_TSX, type RTMenu } from "./menu.js";
@@ -93,6 +94,7 @@ export type GenerateInput = {
   tokenResolver?: import("../infer/tokens.js").TokenResolver; // typography/spacing token refs (var(--…))
   primitives?: Map<string, string>; // Stage 3.5: cid → recognized primitive type
   interaction?: import("../capture/interactions.js").InteractionCapture; // Stage 4: hover/focus + patterns
+  pseudoStates?: import("../capture/capture.js").PseudoStateRule[]; // fast-path hover/focus recovered from stylesheets (interactions OFF)
   rejectedSpecs?: Set<string>; // Stage 4: pattern keys the gate proved don't reproduce → static
   components?: boolean; // Stage 4.5: extract repeated subtrees into components (opt-in)
   recipeReport?: RecipeReport; // Stage 7.2: high-level recipe hints for section naming/emission
@@ -2391,9 +2393,13 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   // keyframes + interaction CSS (keyed by [data-cid], since nodes have no c<id> class).
   // Tailwind mode folds hover/focus into the className as `hover:`/`focus:` variant utilities
   // (buildTailwind), so ditto.css carries ONLY pseudo-element rules + keyframes — no [data-cid]:hover.
-  const cloneCss = tw
+  // Fast-path hover/focus (stylesheet-recovered) applies in BOTH modes, but only
+  // when Stage 4 didn't run — its live-driven deltas supersede this recovery.
+  const pseudoStateCss = input.interaction ? "" : generatePseudoStateCss(ir, input.pseudoStates);
+  const cloneCss = (tw
     ? tw.pseudoCss
-    : (classMap ? classMap.css : generateCss(ir, assetMap, undefined, input.colorVar, input.tokenResolver)) + generateInteractionCss(ir, input.interaction);
+    : (classMap ? classMap.css : generateCss(ir, assetMap, undefined, input.colorVar, input.tokenResolver)) + generateInteractionCss(ir, input.interaction)
+  ) + pseudoStateCss;
   const sectionOut = sectionFiles(sections, components, svgs);
   const contentTs = contentModule(components, sectionOut.contentDecls);
 
