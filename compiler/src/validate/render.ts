@@ -270,37 +270,47 @@ export type RenderResult = {
 export type FontFaceStatus = { family: string; weight: string; style: string; status: string };
 
 /** Pure decision for the font-load wait: given the current `document.fonts` entries, return the
- *  families that are DECLARED (an @font-face exists for them) but not yet `"loaded"`. A family is
- *  considered pending while ANY of its faces is still `"unloaded"` or `"loading"`; a face that
- *  `"error"`ed is treated as terminal (it will never load, so waiting longer is pointless — it is
- *  not reported as pending). Empty return ⇒ every declared face has reached a terminal state and
- *  the DOM may be measured. The check is state-based (not time-based), so the caller's poll is
- *  deterministic: it ends the instant this returns empty, regardless of wall-clock timing. */
+ *  families that are DECLARED (an @font-face exists for them) and still actively `"loading"`. Only
+ *  `"loading"` is pending: browsers lazy-load faces, so after `document.fonts.ready` a face the
+ *  rendered text actually needs is already fetching (`"loading"`), while a face left `"unloaded"`
+ *  is by definition unreferenced by any rendered text and will never load on its own — waiting on
+ *  it just burns the cap. `"loaded"`/`"error"` are terminal. Empty return ⇒ no face is still
+ *  fetching and the DOM may be measured. The check is state-based (not time-based), so the caller's
+ *  poll is deterministic: it ends the instant this returns empty, regardless of wall-clock timing. */
 export function pendingFontFamilies(faces: FontFaceStatus[]): string[] {
   const pending = new Set<string>();
-  const terminalByFamily = new Map<string, boolean>();
   for (const f of faces) {
     const fam = f.family.replace(/^["']|["']$/g, "");
-    if (f.status === "loaded" || f.status === "error") {
-      if (!terminalByFamily.has(fam)) terminalByFamily.set(fam, true);
-    } else {
-      // "unloaded" | "loading" (or any non-terminal state) ⇒ this family is still pending.
-      pending.add(fam);
-      terminalByFamily.set(fam, false);
-    }
+    // Only a face still actively fetching keeps its family pending; "unloaded" (unreferenced),
+    // "loaded", and "error" are all non-blocking.
+    if (f.status === "loading") pending.add(fam);
   }
   return [...pending].sort();
 }
 
-/** In-page: await `document.fonts.ready`, then poll (bounded) until every declared @font-face has
- *  reached a terminal state (`loaded`/`error`). Returns the still-pending families when the bound
- *  expired, or an empty array once all faces settled. Runs entirely inside the browser context so
- *  it reads the live FontFaceSet. Bounded + state-based ⇒ deterministic (ends on state, never on a
- *  fixed sleep). `capMs` is a hard ceiling so a hung/erroring font request can't stall the render. */
+/** Declared @font-face faces left `"unloaded"` after the wait bound: not fetched because no
+ *  rendered text resolves to them (unreferenced weight/style/unicode-subset siblings). Reported
+ *  per-face (family+weight+style) for an informational-only log — these are benign, never a
+ *  fidelity problem, since the text that IS measured renders in the face that actually loaded. */
+export function unreferencedFontFaces(faces: FontFaceStatus[]): FontFaceStatus[] {
+  return faces
+    .filter((f) => f.status === "unloaded")
+    .map((f) => ({ family: f.family.replace(/^["']|["']$/g, ""), weight: f.weight, style: f.style, status: f.status }))
+    .sort((a, b) => `${a.family} ${a.weight} ${a.style}`.localeCompare(`${b.family} ${b.weight} ${b.style}`));
+}
+
+/** In-page: await `document.fonts.ready`, then poll (bounded) until no declared @font-face is still
+ *  `"loading"`. Browsers lazy-load faces, so once ready has fired the faces the rendered text needs
+ *  are already fetching; the poll only waits on those. Returns `{ pending, unreferenced }`: `pending`
+ *  = families whose face was STILL `"loading"` when the bound expired (a genuinely stuck fetch, kept
+ *  as a warning); `unreferenced` = faces left `"unloaded"` (declared but no rendered text resolves to
+ *  them — benign, surfaced per-face for an informational log only). Runs entirely inside the browser
+ *  context so it reads the live FontFaceSet. Bounded + state-based ⇒ deterministic (ends on state,
+ *  never on a fixed sleep). `capMs` is a hard ceiling so a hung font request can't stall the render. */
 async function awaitFontsLoaded(
   page: import("playwright").Page,
   opts?: { capMs?: number; pollMs?: number },
-): Promise<string[]> {
+): Promise<{ pending: string[]; unreferenced: FontFaceStatus[] }> {
   const capMs = opts?.capMs ?? 3000;
   const pollMs = opts?.pollMs ?? 50;
   try {
@@ -308,36 +318,42 @@ async function awaitFontsLoaded(
       async ({ capMs, pollMs }) => {
         const doc = document as Document;
         const set = doc.fonts as unknown as { ready?: Promise<unknown>; forEach?: (cb: (f: FontFaceStatus) => void) => void } | undefined;
-        if (!set) return [];
+        if (!set) return { pending: [], unreferenced: [] };
         const snapshot = (): { family: string; weight: string; style: string; status: string }[] => {
           const out: { family: string; weight: string; style: string; status: string }[] = [];
           set.forEach?.((f) => out.push({ family: f.family, weight: f.weight, style: f.style, status: f.status }));
           return out;
         };
+        // Only a face still actively fetching is pending; "unloaded" is unreferenced (never fetched).
         const pending = (faces: { family: string; weight: string; style: string; status: string }[]): string[] => {
           const p = new Set<string>();
           for (const f of faces) {
-            const fam = f.family.replace(/^["']|["']$/g, "");
-            if (f.status !== "loaded" && f.status !== "error") p.add(fam);
+            if (f.status === "loading") p.add(f.family.replace(/^["']|["']$/g, ""));
           }
           return [...p].sort();
         };
         // First give the browser's own aggregate signal a chance (bounded — a hung request must not
-        // hold ready forever). Then poll the per-face states until all terminal or the cap expires.
+        // hold ready forever). Then poll the per-face states until none are loading or the cap expires.
         await Promise.race([set.ready ?? Promise.resolve(), new Promise((r) => setTimeout(r, capMs))]);
         const deadline = Date.now() + capMs;
         // eslint-disable-next-line no-constant-condition
         while (true) {
-          const left = pending(snapshot());
-          if (left.length === 0) return [];
-          if (Date.now() >= deadline) return left;
+          const faces = snapshot();
+          const left = pending(faces);
+          const done = left.length === 0 || Date.now() >= deadline;
+          if (done) {
+            const unreferenced = faces
+              .filter((f) => f.status === "unloaded")
+              .map((f) => ({ family: f.family.replace(/^["']|["']$/g, ""), weight: f.weight, style: f.style, status: f.status }));
+            return { pending: left, unreferenced };
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
       },
       { capMs, pollMs },
-    ) as string[];
+    ) as { pending: string[]; unreferenced: FontFaceStatus[] };
   } catch {
-    return []; // a page without a FontFaceSet (or an evaluate fault) never blocks the walk
+    return { pending: [], unreferenced: [] }; // no FontFaceSet (or an evaluate fault) never blocks the walk
   }
 }
 
@@ -430,11 +446,18 @@ export async function renderApp(opts: {
         // fallback face (systematically narrower/wider glyphs → a bogus size delta attributed to the
         // clone). Await document.fonts.ready AND poll (bounded, state-based) until every declared face
         // is terminal, so this holds for both the walk below and the screenshot further down.
-        const pendingFonts = await awaitFontsLoaded(page);
+        const { pending: pendingFonts, unreferenced: unrefFaces } = await awaitFontsLoaded(page);
         if (pendingFonts.length) {
-          const msg = `font-wait: ${pendingFonts.length} @font-face families unloaded after wait bound at ${vw}px: ${pendingFonts.join(", ")}`;
+          const msg = `font-wait: ${pendingFonts.length} @font-face families still loading after wait bound at ${vw}px: ${pendingFonts.join(", ")}`;
           fontWarnings.push(msg);
           console.warn(`[render] ${msg}`);
+        }
+        // Declared-but-unreferenced faces (no rendered text resolves to them) are benign — the
+        // browser never fetched them by design. Report them per-face (family+weight+style) as an
+        // informational log only; they are NOT a fidelity warning and never enter fontWarnings.
+        if (unrefFaces.length) {
+          const detail = unrefFaces.map((f) => `${f.family} ${f.weight} ${f.style}`).join(", ");
+          console.log(`[render] font-info: ${unrefFaces.length} declared-but-unreferenced faces at ${vw}px: ${detail}`);
         }
         // Scroll to settle any lazy effects, then back to top.
         await page.evaluate(async () => {

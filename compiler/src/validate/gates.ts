@@ -222,7 +222,7 @@ export function gate2Assets(assetGraph: AssetGraph, fontGraph: FontGraph, gen: {
   if (zeroByte > 0) issues.push(`${zeroByte} zero-byte downloaded assets`);
   if (skippedNoReason > 0) issues.push(`${skippedNoReason} skipped assets without reason`);
   if (gen.remoteRefs.length > 0) issues.push(`${gen.remoteRefs.length} generated refs point to remote origin`);
-  if (gen.failed404.length > 0) issues.push(`${gen.failed404.length} generated asset refs 404`);
+  if (gen.failed404.length > 0) issues.push(`${gen.failed404.length} generated asset refs missing (HTTP >= 400 or file absent from export)`);
   const fontsResolvedOrFallback = fontGraph.entries.every((f) => f.status === "resolved" || (f.status === "fallback" && f.reason));
   if (!fontsResolvedOrFallback) issues.push("font declarations not resolved/fallback-recorded");
   return {

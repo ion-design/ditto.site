@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { serveStatic, parseRangeHeader, pendingFontFamilies, type FontFaceStatus } from "../src/validate/render.js";
+import { serveStatic, parseRangeHeader, pendingFontFamilies, unreferencedFontFaces, type FontFaceStatus } from "../src/validate/render.js";
 
 // ---- Pure helper: parseRangeHeader ----
 describe("parseRangeHeader", () => {
@@ -55,7 +55,10 @@ describe("parseRangeHeader", () => {
 // ---- Pure helper: pendingFontFamilies (the font-load wait decision) ----
 // The render walk must run after webfonts are APPLIED, else text boxes measure the fallback face
 // (a systematic width delta wrongly attributed to the clone). This helper is the state-based (not
-// time-based) predicate the in-page poll ends on: it returns the DECLARED families not yet terminal.
+// time-based) predicate the in-page poll ends on: it returns the DECLARED families still actively
+// fetching. Browsers lazy-load faces, so after document.fonts.ready a face the rendered text needs
+// is already "loading"; a face left "unloaded" is unreferenced and will never load on its own —
+// waiting on it only burns the cap, so ONLY "loading" is pending.
 describe("pendingFontFamilies", () => {
   const face = (family: string, status: string, weight = "400", style = "normal"): FontFaceStatus => ({ family, weight, style, status });
 
@@ -67,8 +70,8 @@ describe("pendingFontFamilies", () => {
     assert.deepEqual(pendingFontFamilies([face("Avenir", "loaded"), face("Inter", "loaded")]), []);
   });
 
-  it("an unloaded face makes its family pending", () => {
-    assert.deepEqual(pendingFontFamilies([face("Avenir", "unloaded")]), ["Avenir"]);
+  it("an unloaded face is unreferenced (lazy-load) → NOT pending", () => {
+    assert.deepEqual(pendingFontFamilies([face("Avenir", "unloaded")]), []);
   });
 
   it("a loading face makes its family pending", () => {
@@ -79,9 +82,16 @@ describe("pendingFontFamilies", () => {
     assert.deepEqual(pendingFontFamilies([face("Avenir", "error")]), []);
   });
 
-  it("a family with mixed weights is pending if ANY weight is not terminal", () => {
+  it("a family is pending if ANY weight is still loading", () => {
     const faces = [face("Avenir", "loaded", "400"), face("Avenir", "loading", "700")];
     assert.deepEqual(pendingFontFamilies(faces), ["Avenir"]);
+  });
+
+  it("a partially-used family (used face loaded, sibling faces unloaded) is NOT pending", () => {
+    // The real-world false positive this fix removes: a matched face loaded, unreferenced
+    // weight/style siblings stay "unloaded" — the walk may proceed without waiting on them.
+    const faces = [face("Avenir", "loaded", "400"), face("Avenir", "unloaded", "700"), face("Avenir", "unloaded", "400", "italic")];
+    assert.deepEqual(pendingFontFamilies(faces), []);
   });
 
   it("a family whose faces are all terminal (loaded or errored) is not pending", () => {
@@ -89,14 +99,43 @@ describe("pendingFontFamilies", () => {
     assert.deepEqual(pendingFontFamilies(faces), []);
   });
 
-  it("strips surrounding quotes from the reported family name and dedupes+sorts", () => {
-    const faces = [face('"Source Serif"', "unloaded"), face("Avenir", "loading"), face("Avenir", "unloaded")];
+  it("strips surrounding quotes from the reported family name and dedupes+sorts (loading only)", () => {
+    const faces = [face('"Source Serif"', "loading"), face("Avenir", "loading"), face("Avenir", "unloaded")];
     assert.deepEqual(pendingFontFamilies(faces), ["Avenir", "Source Serif"]);
   });
 
-  it("only the unloaded families are returned when some are loaded", () => {
-    const faces = [face("Inter", "loaded"), face("Avenir", "unloaded"), face("JetBrains", "loaded")];
+  it("only the still-loading families are returned when some are loaded/unloaded", () => {
+    const faces = [face("Inter", "loaded"), face("Avenir", "loading"), face("JetBrains", "unloaded")];
     assert.deepEqual(pendingFontFamilies(faces), ["Avenir"]);
+  });
+});
+
+// ---- Pure helper: unreferencedFontFaces (informational-only per-face report) ----
+// Faces left "unloaded" after the wait bound: declared but no rendered text resolves to them.
+// Reported per-face (family+weight+style) for an informational log; benign, never a fidelity issue.
+describe("unreferencedFontFaces", () => {
+  const face = (family: string, status: string, weight = "400", style = "normal"): FontFaceStatus => ({ family, weight, style, status });
+
+  it("returns only the unloaded faces (not loaded/loading/error)", () => {
+    const faces = [face("Avenir", "loaded"), face("Merriweather", "unloaded", "700"), face("Inter", "loading"), face("Gotham", "error")];
+    assert.deepEqual(unreferencedFontFaces(faces), [{ family: "Merriweather", weight: "700", style: "normal", status: "unloaded" }]);
+  });
+
+  it("reports per-face (family+weight+style), not collapsed per-family, and strips quotes + sorts", () => {
+    const faces = [
+      face('"Merriweather"', "unloaded", "700", "normal"),
+      face("Merriweather", "unloaded", "300", "italic"),
+      face("Avenir", "unloaded", "400", "normal"),
+    ];
+    assert.deepEqual(unreferencedFontFaces(faces), [
+      { family: "Avenir", weight: "400", style: "normal", status: "unloaded" },
+      { family: "Merriweather", weight: "300", style: "italic", status: "unloaded" },
+      { family: "Merriweather", weight: "700", style: "normal", status: "unloaded" },
+    ]);
+  });
+
+  it("no unloaded faces → empty", () => {
+    assert.deepEqual(unreferencedFontFaces([face("Avenir", "loaded"), face("Inter", "loading")]), []);
   });
 });
 

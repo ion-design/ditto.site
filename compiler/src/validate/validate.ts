@@ -28,6 +28,21 @@ export function probeWidthsFor(viewports: number[]): number[] {
   const widest = sorted[sorted.length - 1] ?? 1920;
   return [...mids, Math.round(widest * 4 / 3)];
 }
+/** True if the URL of an aborted `/assets/` fetch resolves to a real file under the served export.
+ *  Mirrors `serveStatic`'s path mapping (path segment joined onto the served root, `..` stripped) so
+ *  an aborted srcset candidate whose file is present on disk is not mistaken for a 404. A URL we
+ *  cannot parse, or one whose file is absent, is treated as a genuine miss (returns false). */
+export function servedAssetExists(servedRoot: string, url: string): boolean {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return false;
+  }
+  const rel = decodeURIComponent(pathname).replace(/^(\.\.[/\\])+/, "").replace(/^\/+/, "");
+  return existsSync(join(servedRoot, rel));
+}
+
 import { buildReport, reportToMarkdown, type Report } from "./report.js";
 import { readJSON, writeJSON, writeText, ensureDir, fileExists } from "../util/fsx.js";
 import type { CaptureResult } from "../capture/capture.js";
@@ -136,12 +151,21 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
       await server.close();
     }
   }
-  // Video/audio elements stream and their requests are aborted ("failed") when the
-  // render snapshot is taken before the stream finishes — the file is materialized,
-  // so this is not an asset failure. Only count non-streaming assets.
-  const assetFailed = failedResources.filter(
-    (f) => f.includes("/assets/") && !/\.(mp4|webm|mov|m4v|ogv|ogg|mp3|wav|m3u8)(\?|$)/i.test(f),
-  );
+  // A generated asset ref is only a real failure if the file it points to is genuinely
+  // missing from the served export. Two aborts are NOT failures even though Chromium logs
+  // them as "failed": (a) video/audio streams aborted when the render snapshot is taken
+  // before the stream finishes; (b) responsive-image <source srcset> candidates whose
+  // in-flight low-priority fetch is aborted when the page closes or the candidate is
+  // re-chosen — the image analogue of (a). So count an /assets/ entry only when it is a
+  // real HTTP >= 400 response, OR a "failed " (aborted) entry whose target file is actually
+  // absent from the served out/ dir. Genuine 404s (file missing) still fail.
+  const assetFailed = failedResources.filter((f) => {
+    if (!f.includes("/assets/")) return false;
+    if (/\.(mp4|webm|mov|m4v|ogv|ogg|mp3|wav|m3u8)(\?|$)/i.test(f)) return false; // streaming media (a)
+    if (!f.startsWith("failed ")) return true; // "<status> <url>" — a real >= 400 response, always count
+    // Aborted fetch (b): excuse it if the file exists under the served export, else it is a real miss.
+    return build.outDir ? !servedAssetExists(build.outDir, f.slice("failed ".length)) : true;
+  });
   const artifactsPresent = ["manifest.json", "sections.json", "tokens.json", "assets.json", "fonts.json"].every((f) => fileExists(join(generatedDir, f)));
   const gate0Issues: string[] = [];
   if (!build.ok) gate0Issues.push("build failed: " + build.stderr.split("\n").filter(Boolean).slice(-3).join(" | "));

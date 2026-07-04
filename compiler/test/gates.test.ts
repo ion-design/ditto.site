@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { letterSpacingEquivalent, normHref, countVisibleInCaptureHiddenInClone } from "../src/validate/gates.js";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { letterSpacingEquivalent, normHref, countVisibleInCaptureHiddenInClone, gate2Assets } from "../src/validate/gates.js";
+import { servedAssetExists } from "../src/validate/validate.js";
+import type { AssetGraph } from "../src/infer/assets.js";
+import type { FontGraph } from "../src/infer/fonts.js";
 import type { IR, IRNode } from "../src/normalize/ir.js";
 import type { PageSnapshot } from "../src/capture/walker.js";
 
@@ -130,5 +136,53 @@ describe("countVisibleInCaptureHiddenInClone diagnostic", () => {
     const ir = makeIR([leaf("n4", "Enrollment open!", { 375: true })]);
     const gen = { 375: snap([]) };
     assert.equal(countVisibleInCaptureHiddenInClone(ir, gen, [375]), 0);
+  });
+});
+
+// FIX 3 — an aborted srcset-candidate image fetch (requestfailed, file present on disk) must not be
+// counted as a "404" asset failure. servedAssetExists maps a failed URL to a file under the served
+// export exactly as serveStatic does; the assetFailed filter in validate.ts uses it to excuse
+// aborted fetches whose file exists, while genuine misses (>= 400, or file absent) still fail.
+describe("servedAssetExists (FIX 3 aborted-image excuse)", () => {
+  const root = mkdtempSync(join(tmpdir(), "served-out-"));
+  mkdirSync(join(root, "assets", "cloned", "images"), { recursive: true });
+  writeFileSync(join(root, "assets", "cloned", "images", "present.webp"), "RIFFxxxxWEBP");
+
+  it("resolves a URL to a present file under the served root", () => {
+    assert.equal(servedAssetExists(root, "http://127.0.0.1:5000/assets/cloned/images/present.webp"), true);
+  });
+
+  it("returns false when the file is absent from the served root (a genuine miss)", () => {
+    assert.equal(servedAssetExists(root, "http://127.0.0.1:5000/assets/cloned/images/absent.webp"), false);
+  });
+
+  it("ignores query strings when resolving to disk", () => {
+    assert.equal(servedAssetExists(root, "http://127.0.0.1:5000/assets/cloned/images/present.webp?206w"), true);
+  });
+
+  it("does not escape the served root via .. traversal", () => {
+    assert.equal(servedAssetExists(root, "http://127.0.0.1:5000/../../../etc/passwd"), false);
+  });
+
+  it("an unparseable URL is treated as a genuine miss", () => {
+    assert.equal(servedAssetExists(root, "not-a-url"), false);
+  });
+});
+
+describe("gate2Assets failed-asset message (FIX 3)", () => {
+  const emptyAssets: AssetGraph = { entries: [], byUrl: new Map() };
+  const emptyFonts: FontGraph = { entries: [], css: "" };
+
+  it("passes when no generated asset refs are missing", () => {
+    const r = gate2Assets(emptyAssets, emptyFonts, { remoteRefs: [], failed404: [] });
+    assert.equal(r.pass, true);
+    assert.equal(r.metrics.failed404, 0);
+  });
+
+  it("fails and reports missing refs (not '404') when a genuine miss is passed", () => {
+    const r = gate2Assets(emptyAssets, emptyFonts, { remoteRefs: [], failed404: ["failed http://127.0.0.1:5000/assets/cloned/images/absent.webp"] });
+    assert.equal(r.pass, false);
+    assert.equal(r.metrics.failed404, 1);
+    assert.ok(r.issues.some((i) => i.includes("generated asset refs missing")), `expected 'missing' wording, got: ${r.issues.join(" | ")}`);
   });
 });
