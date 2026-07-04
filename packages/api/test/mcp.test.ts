@@ -52,12 +52,18 @@ test("MCP: list-then-read + bundle contract (never floods context)", async () =>
     // clone_website → jobId + status only (no files).
     const cw = parse(await client.callTool({ name: "clone_website", arguments: { url: "https://example.com/", options: {} } }));
     assert.ok(cw.jobId);
-    assert.equal(cw.status, "succeeded");
-    assert.ok(!("files" in cw));
+    assert.equal(cw.status, "queued");
     const jobId = cw.jobId;
 
-    // status
-    const status = parse(await client.callTool({ name: "get_clone_status", arguments: { jobId } }));
+    let status = parse(await client.callTool({ name: "get_clone_status", arguments: { jobId } }));
+    for (let i = 0; i < 200 && status.status !== "succeeded"; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+      status = parse(await client.callTool({ name: "get_clone_status", arguments: { jobId } }));
+    }
+    assert.equal(status.status, "succeeded");
+
+    // status (re-fetch after completion)
+    status = parse(await client.callTool({ name: "get_clone_status", arguments: { jobId } }));
     assert.equal(status.status, "succeeded");
 
     // get_clone_result → metadata only, NO file contents.

@@ -15,6 +15,13 @@
       "when": 1782790200000,
       "tag": "0001_signup_tokens",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783202414928,
+      "tag": "0002_productive_wallflower",
+      "breakpoints": true
     }
   ]
 }

@@ -34,7 +34,17 @@ const fakeRunJob: RunJob = async (input) => {
   } satisfies CloneJobResult;
 };
 
-test("POST /v1/clones returns the eager file map; binaries by reference; streaming + lifecycle", async () => {
+async function waitForResult(app: ReturnType<typeof createApp>, jobId: string) {
+  for (let i = 0; i < 200; i++) {
+    const view = await (await app.request(`/v1/clones/${jobId}`)).json();
+    if (view.status === "succeeded") return await (await app.request(`/v1/clones/${jobId}/result`)).json();
+    if (view.status === "failed") throw new Error(String(view.error));
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error("timeout waiting for clone");
+}
+
+test("POST /v1/clones enqueues then completes; binaries by reference; streaming + lifecycle", async () => {
   const store = new InMemoryStore(60_000);
   const app = createApp({ backend: new InMemoryBackend({ store, runJob: fakeRunJob }) });
   try {
@@ -43,39 +53,47 @@ test("POST /v1/clones returns the eager file map; binaries by reference; streami
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url: "https://example.com/", options: {} }),
     });
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.ok(body.jobId);
-    assert.equal(body.status, "succeeded");
-    assert.equal(body.kind, "clone");
+    assert.equal(res.status, 202);
+    const queued = await res.json();
+    assert.ok(queued.jobId);
+    assert.equal(queued.status, "queued");
+
+    let body: Record<string, unknown> | undefined;
+    body = await waitForResult(app, queued.jobId);
+    assert.ok(body);
+    assert.equal(body!.status, "succeeded");
+    assert.equal(body!.kind, "clone");
 
     // Text inline.
-    const page = body.files["src/app/page.tsx"];
-    assert.equal(page.type, "text");
-    assert.ok(page.content.includes("Page"));
-    assert.ok(page.sha256);
+    const files = body!.files as Record<string, { type: string; content?: string; sha256?: string; url?: string }>;
+    const page = files["src/app/page.tsx"];
+    assert.ok(page);
+    assert.equal(page!.type, "text");
+    assert.ok(page!.content!.includes("Page"));
+    assert.ok(page!.sha256);
 
     // Binary by reference (URL, not bytes).
-    const bin = body.files["public/assets/cloned/images/a.png"];
-    assert.equal(bin.type, "binary");
-    assert.equal(bin.content, undefined);
-    assert.equal(bin.url, `/v1/clones/${body.jobId}/files/public/assets/cloned/images/a.png`);
+    const bin = files["public/assets/cloned/images/a.png"];
+    assert.ok(bin);
+    assert.equal(bin!.type, "binary");
+    assert.equal(bin!.content, undefined);
+    assert.equal(bin!.url, `/v1/clones/${queued.jobId}/files/public/assets/cloned/images/a.png`);
 
     // Per-file streaming returns the actual bytes.
-    const fileRes = await app.request(bin.url);
+    const fileRes = await app.request(bin!.url!);
     assert.equal(fileRes.status, 200);
     assert.equal(fileRes.headers.get("content-type"), "image/png");
     const bytes = Buffer.from(await fileRes.arrayBuffer());
     assert.equal(bytes.length, 7);
 
     // Cheap metadata overview (no file contents).
-    const meta = await (await app.request(`/v1/clones/${body.jobId}`)).json();
+    const meta = await (await app.request(`/v1/clones/${queued.jobId}`)).json();
     assert.equal(meta.fileCount, 3);
     assert.equal(meta.capture.nodeCount, 42);
     assert.equal(meta.totalBytes > 0, true);
 
     // Full result fetch.
-    const result = await app.request(`/v1/clones/${body.jobId}/result`);
+    const result = await app.request(`/v1/clones/${queued.jobId}/result`);
     assert.equal(result.status, 200);
 
     // List.
@@ -83,9 +101,9 @@ test("POST /v1/clones returns the eager file map; binaries by reference; streami
     assert.equal(list.clones.length, 1);
 
     // Delete purges; subsequent fetch 404s.
-    const del = await app.request(`/v1/clones/${body.jobId}`, { method: "DELETE" });
+    const del = await app.request(`/v1/clones/${queued.jobId}`, { method: "DELETE" });
     assert.equal((await del.json()).deleted, true);
-    assert.equal((await app.request(`/v1/clones/${body.jobId}`)).status, 404);
+    assert.equal((await app.request(`/v1/clones/${queued.jobId}`)).status, 404);
   } finally {
     store.clear();
   }
@@ -118,8 +136,9 @@ test("POST /v1/clones normalizes product options and legacy aliases", async () =
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url: "https://example.com/", options: { mode: "multi", styling: "css", framework: "vite" } }),
     });
-    assert.equal(product.status, 200);
-    const productBody = await product.json();
+    assert.equal(product.status, 202);
+    const productQueued = await product.json();
+    const productBody = await waitForResult(app, productQueued.jobId);
     assert.deepEqual(productBody.options, { mode: "multi", styling: "css", framework: "vite" });
 
     const legacy = await app.request("/v1/clones", {
@@ -127,8 +146,9 @@ test("POST /v1/clones normalizes product options and legacy aliases", async () =
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url: "https://example.com/", options: { multiPage: true, humanizeMode: "css" } }),
     });
-    assert.equal(legacy.status, 200);
-    const legacyBody = await legacy.json();
+    assert.equal(legacy.status, 202);
+    const legacyQueued = await legacy.json();
+    const legacyBody = await waitForResult(app, legacyQueued.jobId);
     assert.deepEqual(legacyBody.options, { mode: "multi", styling: "css", framework: "next" });
   } finally {
     store.clear();
