@@ -410,8 +410,22 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
           hAuto = false;
           hFill = false;
         }
+        let wAuto = Math.abs(wa - r.width) <= 0.5;
+        let wFill = Math.abs(wf - r.width) <= 0.5;
+        // Circular-WIDTH guard (the mirror of the height guard above): an authored `width:24px` inside a
+        // SHRINK-TO-FIT parent (a color-swatch link in a span that shrink-wraps to it) makes BOTH
+        // `width:auto` and `width:100%` reproduce the box — the parent's width still holds while the
+        // child re-measures — so the raw verdict reads wAuto/wFill (drop) and the clone collapses the
+        // child to 0 content width (and the shrink-wrap span to its borders). When this element's own
+        // cascade/inline style declares an explicit definite width, trust it: the width is authored, so
+        // it is neither content-sized (wAuto) nor a parent fill (wFill). Only overrides when a probe
+        // actually reproduced — a genuine explicit width that auto already shrinks stays wAuto:false.
+        if ((wAuto || wFill) && r.width > 2 && authorsExplicitWidth(el, sw)) {
+          wAuto = false;
+          wFill = false;
+        }
         sizing = {
-          wAuto: Math.abs(wa - r.width) <= 0.5, wFill: Math.abs(wf - r.width) <= 0.5, hAuto,
+          wAuto, wFill, hAuto,
           hFill,
           wMin: Math.round(wmin * 100) / 100, wMax: Math.round(wmax * 100) / 100,
         };
@@ -579,6 +593,12 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
   // authored dimension gets dropped downstream. A declared explicit length is ground truth that
   // the height is load-bearing, so we trust the declaration over the reflow verdict.
   const explicitHeightSelectors: string[] = [];
+  // The WIDTH twin of explicitHeightSelectors: selectors that author an explicit definite `width`/
+  // `min-width` (px/rem/em/…, not auto/%/keyword). Consulted by the sizing probe to break a CIRCULAR
+  // width verdict — an authored `width:24px` inside a shrink-to-fit parent reproduces at both auto and
+  // 100% (the parent's width still holds), so the probe alone reads wAuto and the authored width gets
+  // dropped, collapsing the box in the clone.
+  const explicitWidthSelectors: string[] = [];
 
   const absUrl = (u: string): string => {
     try { return new URL(u, document.baseURI).href; } catch { return u; }
@@ -627,6 +647,22 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     return false;
   };
 
+  // The WIDTH twin of authorsExplicitHeight: does this element author an explicit definite width via
+  // its own inline style (`inlineWidth`, already read by the probe) or any matched harvested rule?
+  // `isExplicitHeight` is unit-agnostic (it only rejects auto/%/keywords and matches definite lengths),
+  // so it doubles as the width predicate.
+  const authorsExplicitWidth = (el: Element, inlineWidth: string): boolean => {
+    if (isExplicitHeight(inlineWidth)) return true;
+    try {
+      const inlineMin = (el as HTMLElement).style?.getPropertyValue("min-width") || "";
+      if (isExplicitHeight(inlineMin)) return true;
+    } catch { /* ignore */ }
+    for (const sel of explicitWidthSelectors) {
+      try { if (el.matches(sel)) return true; } catch { /* invalid/unsupported selector */ }
+    }
+    return false;
+  };
+
   const readRules = (rules: CSSRuleList): void => {
     for (const rule of Array.from(rules)) {
       const type = rule.constructor.name;
@@ -657,6 +693,11 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
             isExplicitHeight(r.style.getPropertyValue("min-height")))) {
           explicitHeightSelectors.push(r.selectorText);
         }
+        if (r.selectorText && r.style &&
+          (isExplicitHeight(r.style.getPropertyValue("width")) ||
+            isExplicitHeight(r.style.getPropertyValue("min-width")))) {
+          explicitWidthSelectors.push(r.selectorText);
+        }
       } else if (type === "CSSMediaRule" || type === "CSSSupportsRule") {
         try { readRules((rule as CSSGroupingRule).cssRules); } catch { /* ignore */ }
       } else if (type === "CSSImportRule") {
@@ -673,6 +714,39 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       // Cross-origin sheet — record its href so the capture layer can fetch the
       // raw text out-of-band and parse font-faces/urls from it.
       if (sheet.href) cssUrlSet.add(absUrl(sheet.href));
+    }
+  }
+
+  // Custom elements (web components) carry their styles INSIDE their open shadow root — via
+  // `adoptedStyleSheets` (constructable sheets) and/or `<style>`/`<link>` in the shadow tree
+  // (`shadowRoot.styleSheets`). Those sheets never appear in `document.styleSheets`, so an authored
+  // rule like `color-swatch a { width: 24px }` is invisible to the harvest above and the sizing probe
+  // can't see the explicit width. Walk every open shadow root (composed-tree sweep, matching the
+  // serializer) and read its sheets too — same `readRules` (font-faces, url()s, explicit width/height
+  // selectors). Closed roots return null and are skipped, exactly as elsewhere.
+  const shadowRoots: ShadowRoot[] = [];
+  const collectShadowRoots = (): void => {
+    const stack: Element[] = [];
+    const pushChildren = (parent: Element | Document | ShadowRoot): void => {
+      let c = parent.firstElementChild;
+      while (c) { stack.push(c); c = c.nextElementSibling; }
+    };
+    pushChildren(document);
+    // Depth-first over the composed element tree, descending into every open shadow root.
+    while (stack.length) {
+      const node = stack.pop()!;
+      const sr = (node as HTMLElement).shadowRoot;
+      if (sr) { shadowRoots.push(sr); pushChildren(sr); }
+      pushChildren(node);
+    }
+  };
+  try { collectShadowRoots(); } catch { /* ignore */ }
+  for (const sr of shadowRoots) {
+    const sheets: CSSStyleSheet[] = [];
+    try { sheets.push(...(sr.adoptedStyleSheets || [])); } catch { /* ignore */ }
+    try { sheets.push(...Array.from(sr.styleSheets || [])); } catch { /* ignore */ }
+    for (const sheet of sheets) {
+      try { readRules(sheet.cssRules); } catch { if ((sheet as CSSStyleSheet).href) cssUrlSet.add(absUrl((sheet as CSSStyleSheet).href!)); }
     }
   }
 

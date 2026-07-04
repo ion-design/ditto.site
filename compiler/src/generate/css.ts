@@ -1469,6 +1469,18 @@ function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewport
     const flexGridItem = /(?:^|-)(?:flex|grid)$/.test(pdisp);
     const blockLevel = /^(block|flow-root|list-item|flex|grid|inline-block)$/.test(cs.display || "");
     if (!flexGridItem && !blockLevel) return null;
+    // A GRID item's `%` width resolves against its GRID AREA (its track span), NOT the grid
+    // container's content box. When the grid has more than one column track, the parent-content-box
+    // ratio computed below is against the wrong containing block — the browser would apply that % to
+    // the ~1-column track, collapsing the item (24.5% of 1240px emitted where % hits a 302px track →
+    // 74px column). We have no direct track-width evidence, so bail for a multi-column grid item and
+    // let it fall to its authored width (auto / source-intent). Single-column grids are safe: the one
+    // track spans the full content box, so the ratio base is correct.
+    const isGridItem = /(?:^|-)grid$/.test(pdisp);
+    if (isGridItem) {
+      const cols = parseTracks(pcs.gridTemplateColumns);
+      if (!cols || cols.length > 1) return null;
+    }
     const container = pb.width - pf(pcs.paddingLeft) - pf(pcs.paddingRight) - pf(pcs.borderLeftWidth) - pf(pcs.borderRightWidth);
     if (container <= 0) return null;
     const ratio = nb.width / container;
@@ -2034,6 +2046,31 @@ function flexRowHasSlack(container: IRNode, viewports: number[]): boolean {
   return checked >= 1;
 }
 
+/** Does an in-flow element CHILD derive its HEIGHT from its parent's box (fill it) at this viewport?
+ *  Two ways:
+ *   • the sizing probe measured `height:100%` reproduces and `height:auto` does NOT (hFill && !hAuto);
+ *   • the child is an UN-PROBED replaced element that soaks up the parent box height — a `<picture>`
+ *     (the probe skips it — walker's probe excludes replaced tags) or an object-fit:cover img/video —
+ *     whose border-box height ≈ the parent's CONTENT-box height. Such a child's extent equals the
+ *     parent's height only BECAUSE it fills it (object-fit:cover paints to any box, `<picture>` sizes
+ *     its inner img to the box), so it is NOT content evidence and must not explain away the parent's
+ *     authored height. Without this a `<picture h-full>` reads as real content, the authored parent
+ *     height is dropped, and the inner img re-derives from its selected source's natural aspect.
+ *  `parentContentH` is the parent's content-box height (border-box minus padding/border, top+bottom). */
+function childDerivesHeightFromParent(child: IRNode, vp: number, parentContentH: number): boolean {
+  const csz = child.sizingByVp?.[vp];
+  if (csz && csz.hFill === true && csz.hAuto === false) return true;
+  const ccs = child.computedByVp[vp]; const cb = child.bboxByVp[vp];
+  if (!ccs || !cb) return false;
+  const isPicture = child.tag === "picture";
+  const isCoverReplaced = REPLACED.has(child.tag) && /cover/.test(ccs.objectFit || "");
+  if (!isPicture && !isCoverReplaced) return false;
+  if (!(parentContentH > 0)) return false;
+  // Border-box height fills the parent content box (≤2px slop). An intrinsically-shorter media that
+  // merely SITS in a taller box (natural-aspect logo) fails this and is treated as real content.
+  return Math.abs(cb.height - parentContentH) <= Math.max(2, 0.01 * parentContentH);
+}
+
 /** Whether a node's height can FLOW (drop the baked px) — true when, at every sampled width, its
  *  border-box height is either content-driven (== the extent of its in-flow children + padding) or
  *  cross-axis STRETCH (a flex-row / grid item filling its container's content height). Both
@@ -2090,6 +2127,7 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
     // header). Dropping the height then lets the fill child re-derive from its aspect ratio and inflate
     // (a 240px hero → 720px @16/9). Do NOT flow such a box's height.
     let allInflowFill = true;
+    const nodeContentH = nb.height - pf(cs.paddingTop) - pf(cs.paddingBottom) - pf(cs.borderTopWidth) - pf(cs.borderBottomWidth);
     for (const c of node.children) {
       if (isTextChild(c)) continue;
       const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
@@ -2097,8 +2135,7 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
       if (ccs.position === "absolute" || ccs.position === "fixed") continue;
       if ((ccs.float || "none") !== "none") continue;
       hasChild = true;
-      const csz = c.sizingByVp?.[vp];
-      if (!(csz && csz.hFill === true && csz.hAuto === false)) allInflowFill = false;
+      if (!childDerivesHeightFromParent(c, vp, nodeContentH)) allInflowFill = false;
       bottom = Math.max(bottom, cb.y + cb.height);
       bottomMargin = Math.max(bottomMargin, cb.y + cb.height + Math.max(0, pf(ccs.marginBottom)));
     }
@@ -2215,10 +2252,11 @@ function absoluteHeightFill(node: IRNode, parentNode: IRNode | undefined, viewpo
  *  aren't probed (the probe skips them), so this never fires on img/svg. */
 function heightProbeFills(node: IRNode, viewports: number[]): boolean {
   if (process.env.NO_HFILL) return false; // diagnostic toggle
-  let painted = 0;
+  let painted = 0; let paintedTotal = 0;
   for (const vp of viewports) {
     const cs = node.computedByVp[vp];
     if (!cs || !node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    paintedTotal++;
     const pos = cs.position || "static";
     if (pos !== "static" && pos !== "relative") return false;
     const s = node.sizingByVp?.[vp];
@@ -2226,7 +2264,11 @@ function heightProbeFills(node: IRNode, viewports: number[]): boolean {
     if (!s.hFill || s.hAuto) return false;         // must fill at 100% AND not be content-sized
     painted++;
   }
-  return painted >= 2;
+  // Normally require ≥2 painted viewports so the fill verdict is corroborated across widths. But a
+  // responsive-only variant (a `max-md:`-scoped node) is PAINTED at only one captured viewport — its
+  // single unanimous probe reading is the COMPLETE evidence set, not a lone sample, so accept it.
+  // The parent still confers a definite height (its own band-baked height), so 100% resolves safely.
+  return painted >= 2 || (painted === 1 && paintedTotal === 1);
 }
 
 /** Does this node confer a DEFINITE height to its children (so their height:100% resolves)? True when:
@@ -2399,6 +2441,17 @@ function declsForViewport(
   // collapsing is preserved.
   let explicitHeight = false;
   const nb = node.bboxByVp[vp];
+  // Probe ground truth, emission twin of the heightFlows keep (see the hAuto/hFill guard there):
+  // the sizing probe proved height:auto did NOT reproduce this box (hAuto:false) AND it is not a
+  // fill child of its own parent (hFill:false), so the captured px is AUTHORED and load-bearing.
+  // heightFlows refuses to FLOW such a box, but the emission gate below still needs a matching keep
+  // or the height is dropped when the fill-child evidence (the "taller than content" / all-inflow-fill
+  // tests) can't fire — an inline `<a>` child probes hAuto:true and content extent equals the box, so
+  // neither structural test detects the authored height. Trust the node's own probe.
+  {
+    const osz = node.sizingByVp?.[vp];
+    if (!noCollapse && !isLeaf && cs.height && cs.height !== "auto" && osz && osz.hAuto === false && osz.hFill === false) explicitHeight = true;
+  }
   if (!noCollapse && !isLeaf && cs.height && cs.height !== "auto" && nb) {
     const top = nb.y + (parseFloat(cs.paddingTop || "0") || 0) + (parseFloat(cs.borderTopWidth || "0") || 0);
     let contentBottom = top;       // includes trailing margins (for taller detection)
@@ -2409,6 +2462,7 @@ function declsForViewport(
     // height only BECAUSE they fill it — it is not content-derived evidence, so it must
     // not be allowed to "explain away" an authored height below.
     let allInflowFill = true;
+    const nodeContentH = nb.height - (parseFloat(cs.paddingTop || "0") || 0) - (parseFloat(cs.paddingBottom || "0") || 0) - (parseFloat(cs.borderTopWidth || "0") || 0) - (parseFloat(cs.borderBottomWidth || "0") || 0);
     for (const c of node.children) {
       if (isTextChild(c)) continue;
       const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
@@ -2419,10 +2473,10 @@ function declsForViewport(
       if (ccs.position === "absolute" || ccs.position === "fixed") continue;
       if ((ccs.float || "none") !== "none") continue;
       inflowCount++;
-      const csz = c.sizingByVp?.[vp];
-      // A fill child: the probe measured height:100% reproduces AND auto does not (hFill && !hAuto).
-      // No probe data (older captures) ⇒ treat as real content (conservative: leave allInflowFill off).
-      if (!(csz && csz.hFill === true && csz.hAuto === false)) allInflowFill = false;
+      // A fill child derives its height from this box: probe hFill && !hAuto, OR an un-probed
+      // <picture>/object-fit:cover replaced child whose border-box == this box's content height.
+      // No probe data on a plain block child ⇒ treat as real content (leave allInflowFill off).
+      if (!childDerivesHeightFromParent(c, vp, nodeContentH)) allInflowFill = false;
       contentBottom = Math.max(contentBottom, cb.y + cb.height + (parseFloat(ccs.marginBottom || "0") || 0));
       borderBottom = Math.max(borderBottom, cb.y + cb.height);
     }
@@ -2563,6 +2617,14 @@ function declsForViewport(
     // emitted once below so it never bands per-viewport-px.
     if (prop === "gridTemplateColumns" && gridCols !== undefined) continue;
     // grid-template-rows likewise replaced by the fluid (1fr) template when one was inferred.
+    // NEVER drop a `subgrid` template: it is a STRUCTURAL keyword (the row tracks are inherited from
+    // the parent grid so both stacked layers share row sizing), not a frozen per-viewport px regime.
+    // `dropGridRows` exists to strip baked px row heights in reflow mode, but computed
+    // getComputedStyle reports the keyword literally ("subgrid [] …") — dropping it collapses the
+    // empty layer's row-1 to 0 and its media overlaps the text layer. Emit it (tailwind maps it to
+    // `grid-rows-subgrid`); the fluidGridRows path already refuses to touch subgrid nodes, so gridRows
+    // is undefined here and this keyword flows straight through.
+    if (prop === "gridTemplateRows" && /\bsubgrid\b/.test(value || "")) { out.set("grid-template-rows", "subgrid"); continue; }
     if (prop === "gridTemplateRows" && (gridRows !== undefined || dropGridRows)) continue;
     // fill-to-cap sets max-width to the recovered cap (above); don't let the source value re-emit it.
     if (prop === "maxWidth" && widthPlan.kind === "fillcap") continue;
@@ -2633,6 +2695,9 @@ function declsForViewport(
   // Centered max-width container: emit auto side margins so the browser centers
   // it at every width. getComputedStyle sometimes reports 0 for resolved auto
   // margins at wide viewports, so replaying px would left-align the clone.
+  // The fill-inset guard lives in the centering DECISION (centeredAtVp): a full-width block merely
+  // inset by a fixed gutter is no longer flagged centred, so its literal px margins are kept and it
+  // never bleeds full-bleed from a `margin:auto` that resolves to 0.
   if (isCentered) {
     out.set("margin-left", "auto");
     out.set("margin-right", "auto");
@@ -2744,6 +2809,31 @@ function marginsVaryAcrossVps(node: IRNode): boolean {
   return ms.length >= 2 && Math.max(...ms) - Math.min(...ms) > 1;
 }
 
+/** Does the box's WIDTH grow in near-lockstep with its container across viewports? Then it is a
+ *  full-width block INSET by a fixed gutter (an `mx-4 md:mx-8` section — box == container − 2·gutter),
+ *  NOT a centred content box (whose width stays roughly constant while the container grows and the
+ *  side margins absorb the widening slack). The two are indistinguishable at a SINGLE width (both show
+ *  equal side gaps), and the sizing probe reads BOTH as `wAuto:true` (auto reproduces the inset width).
+ *  The discriminator is the trajectory: a centred 600px box in a 375→1280 container barely widens
+ *  (Δbox ≪ Δcontainer), while a gutter-inset section tracks the container (Δbox ≈ Δcontainer). Used to
+ *  keep auto-margin centring OFF a width-dropped fill-inset block — where `margin:auto` resolves to 0
+ *  and blows it full-bleed — while still centring genuinely content-constrained blocks. */
+function widthTracksContainerFill(node: IRNode, parentNode: IRNode, viewports: number[]): boolean {
+  const bw: number[] = []; const cw: number[] = [];
+  for (const vp of viewports) {
+    const nb = node.bboxByVp[vp]; const pb = parentNode.bboxByVp[vp]; const pcs = parentNode.computedByVp[vp];
+    if (!nb || !pb || !node.visibleByVp[vp]) continue;
+    const content = pb.width - pf(pcs?.paddingLeft) - pf(pcs?.paddingRight) - pf(pcs?.borderLeftWidth) - pf(pcs?.borderRightWidth);
+    if (!(content > 0)) continue;
+    bw.push(nb.width); cw.push(content);
+  }
+  if (bw.length < 2) return false;
+  const dBox = Math.max(...bw) - Math.min(...bw);
+  const dCon = Math.max(...cw) - Math.min(...cw);
+  if (dCon <= 8) return false;                 // container barely varies → trajectory says nothing
+  return dBox / dCon > 0.5;                     // box widens ≥ half as fast as the container → tracks it
+}
+
 function centeredAtVp(node: IRNode, parentNode: IRNode, vp: number): boolean {
   const cs = node.computedByVp[vp];
   const nb = node.bboxByVp[vp];
@@ -2783,8 +2873,16 @@ function centeredAtVp(node: IRNode, parentNode: IRNode, vp: number): boolean {
   // px side margins, blowing a padded pill/section out to full-bleed. Equal literal margins are the
   // geometric TWIN of centering slack (both split the free space symmetrically), so this probe read
   // is the only reliable discriminator between them; when the box fills, keep the literal margins.
+  // A box the probe reads as a container-FILL (`width:100%` reproduces it) has no free space for auto
+  // margins to absorb. So does a full-width block merely INSET by a fixed gutter (`mx-4 md:mx-8`): the
+  // probe reads it `wAuto:true, wFill:false` (auto reproduces the inset width) and its symmetric
+  // margins vary per breakpoint — so it slips past `!fillsAtVp` and looks centred at any single width,
+  // yet its width TRACKS the container. Emitting `margin:auto` on it (after its width is dropped to
+  // auto) resolves the margins to 0 and blows it full-bleed. `widthTracksContainerFill` catches that
+  // trajectory; a genuinely centred content box (constant width, ballooning margins) does not track.
   const fillsAtVp = node.sizingByVp?.[vp]?.wFill === true;
-  if (ml > 0.5 && Math.abs(ml - mr) < 1 && nb.width < pb.width - 4 && marginsVaryAcrossVps(node) && !fillsAtVp) return true;
+  const gutterInset = widthTracksContainerFill(node, parentNode, Object.keys(node.computedByVp).map(Number));
+  if (ml > 0.5 && Math.abs(ml - mr) < 1 && nb.width < pb.width - 4 && marginsVaryAcrossVps(node) && !fillsAtVp && !gutterInset) return true;
   if (parentFlexGrid) return false;
   // Signal 2: bbox-centered within the parent content box with ~0 reported margins.
   if (Math.abs(ml) > 0.5 || Math.abs(mr) > 0.5) return false; // margins already explain position
@@ -3437,16 +3535,38 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
             if ((node.computedByVp[baseVp]?.display || "") !== "none") {
               nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
             }
+            continue;
           } else if (shownAtBase) {
-            // Hidden by an ancestor (or zero-size / opacity:0) but visible at base: geometry
-            // overrides are breakpoint noise — the ancestor's own hide (or the reveal replay,
-            // for scroll-reveal opacity) covers it. Emit only the hide the node itself carries.
-            const hide = new Map<string, string>();
-            if (pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
-            if (/^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
-            if (hide.size) nr.bands.push({ media: b.media, decls: hide });
+            // The node is not painted here yet was not hidden by its own display:none / an
+            // ancestor's visibility (handled above). It can be (a) off-viewport / clipped — the
+            // walker marks a box invisible when `bbox.x >= vpW` — while still IN FLOW and
+            // OCCUPYING real layout space, or (b) genuinely suppressed (opacity:0 / visibility:hidden,
+            // typically a scroll-reveal or ancestor state that is breakpoint noise).
+            //
+            // Case (a) is load-bearing: an off-screen-right carousel slide is a display:block flex
+            // item that still sets its flex track's cross-size. The base rule bakes CANONICAL
+            // (desktop) geometry — a frozen desktop slide width/aspect inflates the mobile track
+            // (an off-screen `w-[285px]` slide dragging a 375px carousel to 532px). Same policy as
+            // the ownHidden / ancestor-hidden occupying-box paths above: fall through to the normal
+            // per-viewport delta so it sits at THIS width's measured geometry, not the baked canonical.
+            const bb = node.bboxByVp[b.vp];
+            const suppressed = pf(vpCs.opacity) === 0 || /^(hidden|collapse)$/.test(vpCs.visibility || "");
+            const inFlowHere = (vpCs.position || "static") === "static" || (vpCs.position || "static") === "relative";
+            if (!suppressed && inFlowHere && bb && (bb.width > 0 || bb.height > 0)) {
+              // Occupying, in-flow, merely off-viewport/clipped — fall through to the per-viewport delta.
+            } else {
+              // Suppressed (opacity:0 / visibility:hidden) but visible at base: geometry overrides are
+              // breakpoint noise — the ancestor's own hide (or the reveal replay, for scroll-reveal
+              // opacity) covers it. Emit only the hide the node itself carries.
+              const hide = new Map<string, string>();
+              if (pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
+              if (/^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
+              if (hide.size) nr.bands.push({ media: b.media, decls: hide });
+              continue;
+            }
+          } else {
+            continue;
           }
-          continue;
         }
       }
       const centeredVp = stableCenter || (layoutParent ? centeredAtVp(node, layoutParent, b.vp) : false);

@@ -318,6 +318,84 @@ describe("walker sizing probe: circular authored-height guard", () => {
   });
 });
 
+// T4 — symmetric circular-WIDTH guard: an authored `width:24px` inside a SHRINK-TO-FIT parent makes
+// both width:auto and width:100% reproduce the box (the parent's width still holds), so the raw probe
+// reads wAuto/wFill and the width is dropped — collapsing the swatch in the clone. When the element
+// authors an explicit definite width (cascade or inline), the probe must trust that and clear both.
+describe("walker sizing probe: circular authored-width guard (T4)", () => {
+  let browser: Browser;
+  let page: Page;
+  before(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  });
+  after(async () => {
+    await browser.close();
+  });
+
+  const capture = async (html: string) => {
+    await page.setContent(html);
+    await page.evaluate("globalThis.__name = globalThis.__name || ((fn) => fn);");
+    return page.evaluate(collectPage);
+  };
+
+  it("keeps an explicit px width inside a shrink-wrap parent (cascade rule)", async () => {
+    // The wrapper is an inline-block that shrink-wraps to the swatch; width:auto on the swatch still
+    // reads 24px because the parent width holds → the raw verdict would be wAuto:true (dropped).
+    const snap = await capture(`
+      <style>
+        .wrapper { display: inline-block; border: 1px solid #000; }
+        .swatch { width: 24px; height: 24px; display: block; background: red; }
+      </style>
+      <span class="wrapper"><a class="swatch"></a></span>`);
+    const swatch = findByClass(snap.root, "swatch")!;
+    assert.ok(swatch.sizing, "swatch was probed");
+    assert.equal(swatch.sizing!.wAuto, false, "explicit 24px width is not content-sized (auto)");
+    assert.equal(swatch.sizing!.wFill, false, "explicit 24px width is authored, not a parent fill");
+  });
+
+  it("keeps an explicit width authored via inline style", async () => {
+    const snap = await capture(`
+      <span style="display:inline-block;border:1px solid #000;">
+        <a class="swatch2" style="width:24px;height:24px;display:block;background:blue;"></a>
+      </span>`);
+    const swatch = findByClass(snap.root, "swatch2")!;
+    assert.ok(swatch.sizing, "swatch was probed");
+    assert.equal(swatch.sizing!.wAuto, false, "inline explicit width is kept (not auto)");
+    assert.equal(swatch.sizing!.wFill, false, "inline explicit width is not a fill");
+  });
+
+  it("still detects a genuinely content-sized (auto) width as wAuto", async () => {
+    // No authored width: an inline-block sizing to its text must stay droppable (wAuto:true).
+    const snap = await capture(`
+      <div style="display:block;"><span class="cw" style="display:inline-block;">hello content</span></div>`);
+    const cw = findByClass(snap.root, "cw")!;
+    assert.ok(cw.sizing, "cw was probed");
+    assert.equal(cw.sizing!.wAuto, true, "content-sized width is still auto");
+  });
+
+  it("harvests an explicit-width rule from a custom element's SHADOW ROOT stylesheet", async () => {
+    // The width:24px rule lives inside the custom element's shadow root (a <style> in the shadow tree),
+    // never in document.styleSheets. Without walking shadow-root sheets the harvest misses it and the
+    // circular-width guard can't fire for the swatch link. Verify the shadow swatch keeps its width.
+    const snap = await capture(`
+      <script>
+        customElements.define('color-swatch', class extends HTMLElement {
+          constructor() {
+            super();
+            const r = this.attachShadow({ mode: 'open' });
+            r.innerHTML = '<style>.wrap{display:inline-block;border:1px solid #000}.pin{width:24px;height:24px;display:block;background:green}</style><span class="wrap"><a class="pin"></a></span>';
+          }
+        });
+      </script>
+      <color-swatch></color-swatch>`);
+    const pin = findByClass(snap.root, "pin")!;
+    assert.ok(pin.sizing, "shadow swatch was probed");
+    assert.equal(pin.sizing!.wAuto, false, "shadow-root explicit 24px width is kept (not auto)");
+    assert.equal(pin.sizing!.wFill, false, "shadow-root explicit width is not a fill");
+  });
+});
+
 describe("walker text-wrap capture", () => {
   let browser: Browser;
   let page: Page;

@@ -864,3 +864,194 @@ describe("generateCss circular carousel slide with a block-level fill child (FIX
     assert.ok(/width:220px/.test(slide), `the library-sized slide must keep its 220px width, got: ${slide}`);
   });
 });
+
+// ===========================================================================
+// Emission-geometry fix wave (T1/T2/T3/T5, C1 css side, C2)
+// ===========================================================================
+
+// T5 — a FULL-WIDTH block merely inset by a fixed gutter (`mx-4 md:mx-8`: box == container − 2·gutter,
+// width TRACKS the container) must NOT be auto-centred. Its symmetric margins vary per breakpoint and
+// the probe reads wAuto (auto reproduces the inset width), so it slips past the fill guard — but
+// emitting margin:auto on a width-dropped block resolves the margins to 0 and blows it full-bleed.
+describe("generateCss auto-margin gutter-inset guard (T5)", () => {
+  const auto = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false });
+  it("keeps literal px margins on a full-width gutter-inset block (width tracks the container)", () => {
+    // mx-4 (16px) mobile, mx-8 (32px) desktop: box width == container − 2·gutter at every width, so it
+    // TRACKS the container (343→704→1216). Not a centred content box.
+    const child = xNode("n1", "div", {
+      375: { cs: { display: "block", marginLeft: "16px", marginRight: "16px", width: "343px" }, bbox: { x: 16, y: 0, width: 343, height: 40 }, sizing: auto() },
+      768: { cs: { display: "block", marginLeft: "32px", marginRight: "32px", width: "704px" }, bbox: { x: 32, y: 0, width: 704, height: 40 }, sizing: auto() },
+      1280: { cs: { display: "block", marginLeft: "32px", marginRight: "32px", width: "1216px" }, bbox: { x: 32, y: 0, width: 1216, height: 40 }, sizing: auto() },
+    });
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 768, height: 40 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 1280, height: 40 } },
+    }, [child]);
+    const css = generateCss(xIr(parent), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/margin-left:auto/.test(all), `a gutter-inset full-width block must not be auto-centred, got: ${all}`);
+    assert.ok(/margin-left:16px|margin-left:32px/.test(all), `it must keep its literal px margins, got: ${all}`);
+  });
+});
+
+// T3 — an authored height whose OWN probe says hAuto:false && hFill:false is load-bearing. The
+// structural "taller than content" tests can't fire when an inline child's extent equals the box, so
+// emission must trust the node's own probe (the twin of the heightFlows keep) and emit the height.
+describe("generateCss authored-height kept via own probe (T3)", () => {
+  it("emits the height when the node's own probe is hAuto:false, hFill:false", () => {
+    const explicit = (): RawSizing => ({ wAuto: false, wFill: false, hAuto: false, hFill: false });
+    // Wrapper's only in-flow child is an inline <a> whose box equals the wrapper (content extent ==
+    // box height), so neither the taller-than-content nor overflow test can fire.
+    const link = xNode("n2", "a", {
+      375: { cs: { display: "inline", position: "static" }, bbox: { x: 0, y: 0, width: 220, height: 300 } },
+      768: { cs: { display: "inline", position: "static" }, bbox: { x: 0, y: 0, width: 220, height: 300 } },
+      1280: { cs: { display: "inline", position: "static" }, bbox: { x: 0, y: 0, width: 220, height: 300 } },
+    }, [{ text: "shop" } as IRChild]);
+    const wrapper = xNode("n1", "div", {
+      375: { cs: { display: "block", position: "static", height: "300px" }, bbox: { x: 0, y: 0, width: 220, height: 300 }, sizing: explicit() },
+      768: { cs: { display: "block", position: "static", height: "300px" }, bbox: { x: 0, y: 0, width: 220, height: 300 }, sizing: explicit() },
+      1280: { cs: { display: "block", position: "static", height: "300px" }, bbox: { x: 0, y: 0, width: 220, height: 300 }, sizing: explicit() },
+    }, [link]);
+    const parent = xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 300 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 300 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 300 } },
+    }, [wrapper]);
+    const css = generateCss(xIr(parent), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/height:300px/.test(all), `authored height must survive on own-probe evidence, got: ${all}`);
+  });
+});
+
+// C1 (css side) — a computed `grid-template-rows: subgrid` is a STRUCTURAL keyword, not a baked px
+// regime. It must NEVER be dropped by the reflow-mode dropGridRows path (which strips px row tracks).
+describe("collectNodeRules never drops a subgrid rows template (C1)", () => {
+  function gridFixture() {
+    const layer = xNode("n2", "a", {
+      375: { cs: { display: "grid", position: "static", gridTemplateRows: "subgrid" }, bbox: { x: 0, y: 0, width: 375, height: 400 } },
+      768: { cs: { display: "grid", position: "static", gridTemplateRows: "subgrid" }, bbox: { x: 0, y: 0, width: 768, height: 400 } },
+      1280: { cs: { display: "grid", position: "static", gridTemplateRows: "subgrid" }, bbox: { x: 0, y: 0, width: 1280, height: 400 } },
+    });
+    const outer = xNode("n1", "div", {
+      375: { cs: { display: "grid", position: "static", gridTemplateRows: "139px 717px" }, bbox: { x: 0, y: 0, width: 375, height: 856 } },
+      768: { cs: { display: "grid", position: "static", gridTemplateRows: "139px 717px" }, bbox: { x: 0, y: 0, width: 768, height: 856 } },
+      1280: { cs: { display: "grid", position: "static", gridTemplateRows: "340px 340px" }, bbox: { x: 0, y: 0, width: 1280, height: 680 } },
+    }, [layer]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 856 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 856 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 680 } },
+    }, [outer]);
+  }
+
+  it("emits grid-template-rows:subgrid even in reflow mode", () => {
+    const rules = collectNodeRules(xIr(gridFixture()), new Map(), undefined, undefined, undefined, true);
+    const nr = rules.get("n2");
+    assert.ok(nr, "subgrid layer rule must exist");
+    const all = [nr!.base.get("grid-template-rows"), ...nr!.bands.map((b) => b.decls.get("grid-template-rows"))].filter(Boolean).join(";");
+    assert.ok(/subgrid/.test(all), `subgrid keyword must survive reflow dropGridRows, got: ${all}`);
+  });
+});
+
+// C2 — a grid ITEM's `%` width resolves against its GRID AREA (track), not the grid container's
+// content box. For a multi-column grid the parent-content-box ratio is the wrong base, so the fluid
+// per-band percent path must BAIL (the item falls to auto/fixed) rather than emit a collapsing %.
+describe("generateCss grid-item percent width bails to track (C2)", () => {
+  function gridItemFixture() {
+    // 4-column grid: each track ~302px. The item's width == its track (varies with the container), so
+    // fluidPercentByVp would compute ~24.5% of the 1240px content box — wrong (browser applies it to
+    // the 302px track → 74px). Must not emit a percent width.
+    const item = xNode("n2", "div", {
+      375: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 343, height: 108 } },
+      768: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 176, height: 108 } },
+      1280: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 302, height: 108 } },
+    }, [{ text: "changelog card" } as IRChild]);
+    const grid = xNode("n1", "div", {
+      375: { cs: { display: "grid", position: "static", gridTemplateColumns: "343px" }, bbox: { x: 0, y: 0, width: 375, height: 108 } },
+      768: { cs: { display: "grid", position: "static", gridTemplateColumns: "176px 176px 176px" }, bbox: { x: 0, y: 0, width: 768, height: 108 } },
+      1280: { cs: { display: "grid", position: "static", gridTemplateColumns: "302px 302px 302px 302px" }, bbox: { x: 0, y: 0, width: 1240, height: 108 } },
+    }, [item]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 108 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 108 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 108 } },
+    }, [grid]);
+  }
+
+  it("does not emit a container-content-box percent width for a multi-column grid item", () => {
+    const css = generateCss(xIr(gridItemFixture()), new Map());
+    const all = allRulesX(css, "n2");
+    assert.ok(!/width:24\.5%|width:24%/.test(all), `grid item must not resolve % against the wrong containing block, got: ${all}`);
+  });
+});
+
+// T1 — an off-screen-right (invisible-by-vp) in-flow flex slide still OCCUPIES layout and sets its
+// track's cross-size. The base rule bakes canonical (desktop) geometry; without a per-viewport delta
+// the frozen desktop width inflates the mobile track. The band must carry the slide's measured
+// per-viewport geometry, not just a hide.
+describe("collectNodeRules off-screen in-flow slide per-viewport geometry (T1)", () => {
+  function carousel() {
+    // Slide is visible at 1280 (285px desktop) but off-screen-right at 375 (invisible-by-vp, measured
+    // 220px). It is in-flow (static), display:block, non-zero bbox at 375 — occupying.
+    const slide = xNode("n2", "li", {
+      375: { cs: { display: "block", position: "static", flexShrink: "0", width: "220px", opacity: "1" }, bbox: { x: 400, y: 0, width: 220, height: 300 }, visible: false },
+      768: { cs: { display: "block", position: "static", flexShrink: "0", width: "220px", opacity: "1" }, bbox: { x: 500, y: 0, width: 220, height: 300 }, visible: false },
+      1280: { cs: { display: "block", position: "static", flexShrink: "0", width: "285px", opacity: "1" }, bbox: { x: 0, y: 0, width: 285, height: 400 }, visible: true },
+    }, [{ text: "slide" } as IRChild]);
+    const track = xNode("n1", "ul", {
+      375: { cs: { display: "flex", position: "static" }, bbox: { x: 0, y: 0, width: 375, height: 300 } },
+      768: { cs: { display: "flex", position: "static" }, bbox: { x: 0, y: 0, width: 768, height: 300 } },
+      1280: { cs: { display: "flex", position: "static" }, bbox: { x: 0, y: 0, width: 1280, height: 400 } },
+    }, [slide]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 300 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 300 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 400 } },
+    }, [track]);
+  }
+
+  it("emits a per-viewport width delta for the off-screen slide (not just a hide)", () => {
+    const rules = collectNodeRules(xIr(carousel()), new Map());
+    const nr = rules.get("n2");
+    assert.ok(nr, "slide rule must exist");
+    // The narrow band must carry the measured 220px width, overriding the baked 285px desktop base.
+    const narrowBand = nr!.bands.find((b) => /max-width/.test(b.media) && b.decls.has("width"));
+    assert.ok(narrowBand, `off-screen slide must get a per-viewport width delta, got bands: ${JSON.stringify(nr!.bands.map((b) => ({ m: b.media, w: b.decls.get("width") })))}`);
+    assert.equal(narrowBand!.decls.get("width"), "220px", "the band carries the measured narrow-vp width");
+  });
+});
+
+// T2 — an authored parent height whose only in-flow child is an UN-PROBED <picture>/object-fit:cover
+// replaced element that FILLS the box (border-box == parent content box) must be treated as a
+// height-deriving fill child (so the authored height is kept, not dropped as content-derived).
+describe("collectNodeRules picture fill child keeps authored height (T2)", () => {
+  function heroFixture() {
+    const explicitH = (): RawSizing => ({ wAuto: false, wFill: true, hAuto: false, hFill: false });
+    // <picture> is a replaced tag the probe skips → no sizing; its border-box == the wrapper content
+    // box at every vp. Height varies across vps so the flow path would otherwise try to drop it.
+    const picture = xNode("n2", "picture", {
+      375: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 375, height: 560 } },
+      768: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 768, height: 500 } },
+      1280: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 1280, height: 480 } },
+    });
+    const wrapper = xNode("n1", "div", {
+      375: { cs: { display: "block", position: "static", height: "560px" }, bbox: { x: 0, y: 0, width: 375, height: 560 }, sizing: explicitH() },
+      768: { cs: { display: "block", position: "static", height: "500px" }, bbox: { x: 0, y: 0, width: 768, height: 500 }, sizing: explicitH() },
+      1280: { cs: { display: "block", position: "static", height: "480px" }, bbox: { x: 0, y: 0, width: 1280, height: 480 }, sizing: explicitH() },
+    }, [picture]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 560 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 500 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 480 } },
+    }, [wrapper]);
+  }
+
+  it("keeps the wrapper's authored height when a <picture> child fills it", () => {
+    const rules = collectNodeRules(xIr(heroFixture()), new Map());
+    const nr = rules.get("n1");
+    assert.ok(nr, "wrapper rule must exist");
+    const all = [nr!.base.get("height"), ...nr!.bands.map((b) => b.decls.get("height"))].filter(Boolean).join(";");
+    assert.ok(/560px|500px|480px/.test(all), `authored height must survive with a picture fill child, got: ${all}`);
+  });
+});

@@ -1000,7 +1000,28 @@ function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewpor
   const css: string[] = [];
   const bands = computeBands(viewports, canonical);
   for (const [axis, byVp] of perAxis) {
-    if (!viewports.every((vp) => byVp.has(vp))) continue; // avoid partial custom-class inference for now
+    if (!viewports.every((vp) => byVp.has(vp))) {
+      // Partial-coverage escape hatch for SUBGRID. `grid-rows-subgrid`/`grid-cols-subgrid` is a
+      // structural keyword authored as a variant-only utility (`max-lg:grid-rows-subgrid`, with the
+      // axis resolving to explicit tracks at ≥lg), so the map covers only a subset of viewports and
+      // the full-coverage bail below would throw it away. Subgrid is safe to band partially: emit it
+      // exactly at the covered viewports as banded variants (and as the base only when canonical is
+      // covered). Adding the axis lets the redundant computed-derived subgrid bands drop in favour of
+      // this authored intent. Other partial axes still bail (partial fluid inference is unsafe).
+      const subgridOnly = (axis === "grid-rows" || axis === "grid-cols") &&
+        [...byVp.values()].every((u) => /-subgrid$/.test(u));
+      if (!subgridOnly) continue;
+      if (!sourceAxisCompatible(node, parent, axis, byVp, viewports)) continue;
+      axes.add(axis);
+      const canon = byVp.get(canonical);
+      if (canon) utilities.push(canon);
+      for (const b of bands) {
+        if (!b.media) continue;
+        const v = byVp.get(b.vp);
+        if (v && v !== canon) utilities.push(prefixFor(b.media) + v);
+      }
+      continue;
+    }
     if (!sourceAxisCompatible(node, parent, axis, byVp, viewports)) continue;
     const base = byVp.get(canonical)!;
     axes.add(axis);
@@ -1204,7 +1225,11 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
     // one-off — emit it as an inline `style={{…}}` (exact, no Tailwind-escape mangling) so the node
     // needs no `[data-cid]` ditto.css rule and the shipped data-cid is stripped. If the prop IS
     // banded, it must stay in ditto.css: an inline style would out-specify the @media override.
-    const bandedRawProps = new Set<string>(bandRaws.flatMap((b) => [...b.raw.keys()]));
+    // Count EVERY band-touched prop (raw or not), not just the raw ones: a band that RESETS the prop
+    // to a non-raw value (e.g. `max-lg:bg-[none]` turning a gradient off on mobile) becomes a utility
+    // rather than a raw decl, so a raw-only set misses it — and inlining the base gradient then
+    // out-specifies the `@media` reset, painting the gradient where the source turned it off.
+    const bandedRawProps = new Set<string>(nr.bands.flatMap((b) => [...b.decls.keys()]));
     const inlineStyle = new Map<string, string>();
     for (const [p, v] of [...baseRaw]) {
       if (!bandedRawProps.has(p)) { inlineStyle.set(p, tokenizeColors(p, v)); baseRaw.delete(p); }
