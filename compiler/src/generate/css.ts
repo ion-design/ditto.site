@@ -1559,7 +1559,7 @@ function fillsToCapWidth(node: IRNode, parentNode: IRNode | undefined, viewports
  *  margins (those make the width load-bearing). */
 function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): Record<number, string> | null {
   if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return null;
-  type S = { vp: number; ratio: number; container: number; w: number; flexRow: boolean };
+  type S = { vp: number; ratio: number; container: number; w: number; flexRow: boolean; wMin?: number; wMax?: number };
   const samples: S[] = [];
   for (const vp of viewports) {
     const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp];
@@ -1592,7 +1592,8 @@ function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewport
     const ratio = nb.width / container;
     if (!(ratio > 0.04 && ratio < 1.02)) return null;                   // not a clean fraction of the container
     const flexRow = /(?:^|-)flex$/.test(pdisp) && /^(row|row-reverse)$/.test(pcs.flexDirection || "row");
-    samples.push({ vp, ratio, container, w: nb.width, flexRow });
+    const sz = node.sizingByVp?.[vp];
+    samples.push({ vp, ratio, container, w: nb.width, flexRow, wMin: sz?.wMin, wMax: sz?.wMax });
   }
   if (samples.length < 2) return null;
   const ws = samples.map((s) => s.w);
@@ -1618,7 +1619,21 @@ function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewport
   // Each sample is a clean fraction that reproduces its captured px. Snap to 0.5% and verify.
   const out: Record<number, string> = {};
   for (const s of samples) {
-    const pct = Math.round(s.ratio * 200) / 2;                          // nearest 0.5%
+    // Default: nearest 0.5% (no geometry churn for ordinary boxes). But a CONTENT-FIT box — one sitting
+    // at its own max-content width (a nowrap pill: captured w ≈ wMax, and genuinely wrappable so wMin <
+    // wMax) — has NO slack: rounding the % DOWN emits a width below its intrinsic content, and the clone
+    // wraps it onto a second line (task #26: a 71.70% pill → 71.5% → 245.24px < 245.94px content → wrap,
+    // +23.5px section). For such a node snap UP (ceil to the 0.5% step) only when the nearest-rounded px
+    // falls below wMax by more than 0.25px, so the emitted width never lands short of the content it must
+    // hold. All other nodes keep round-to-nearest.
+    const nearest = Math.round(s.ratio * 200) / 2;
+    let pct = nearest;
+    const wMax = s.wMax, wMin = s.wMin;
+    const contentFit = wMax != null && wMin != null && wMin < wMax - 2 &&
+      Math.abs(s.w - wMax) <= Math.max(1.5, 0.01 * wMax);
+    if (contentFit && (nearest / 100) * s.container < wMax! - 0.25) {
+      pct = Math.ceil(s.ratio * 200) / 2;                               // snap UP to clear intrinsic content width
+    }
     if (Math.abs((pct / 100) * s.container - s.w) > Math.max(1.5, 0.01 * s.w)) return null;
     out[s.vp] = `${pct}%`;
   }

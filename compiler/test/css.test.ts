@@ -775,6 +775,79 @@ describe("generateCss content-sized flex row (probe veto for wrapping text)", ()
   });
 });
 
+describe("generateCss fluid percent snap-up for content-fit nowrap pill (task #26)", () => {
+  // A nowrap flex pill, sole child of a flex COLUMN, that paints at its own max-content width
+  // (bbox.width == wMax) at every viewport — a load-bearing % width that, rounded to the nearest
+  // 0.5%, lands BELOW the intrinsic content and wraps to a second line. Real evidence: a footer
+  // pill 245.94px in a 343px column at 375 (71.70% → 71.5% → 245.24px < 245.94 → wrap).
+  // Numbers below are the captured run's (375 / 768 / 1280).
+  // Per-vp pill widths mirror the real run: at 768 the column is narrower than the pill's content, so
+  // the pill shrinks to fill it (221.33 == container); at 375/1280 it sits at its max-content (245.94).
+  // A CONSTANT max-content across vps keeps contentSizedColumnItem from firing (its widths don't vary),
+  // so the width falls through to the fluid-percent (percentVp) path — exactly the real code path.
+  const wMax = 245.94;
+  function pillIn(colWidths: [number, number, number], wMinOrWMax: { wMin: number; wMax: number }) {
+    const pillW: Record<number, number> = { 375: 245.94, 768: 221.33, 1280: 245.94 };
+    const sz = (): RawSizing => ({ wAuto: false, wFill: false, hAuto: true, hFill: true, ...wMinOrWMax });
+    const pill = xNode("n1", "a", {
+      375: { cs: { display: "flex", whiteSpace: "nowrap" }, bbox: { x: 0, y: 0, width: pillW[375]!, height: 40 }, sizing: sz() },
+      768: { cs: { display: "flex", whiteSpace: "nowrap" }, bbox: { x: 0, y: 0, width: pillW[768]!, height: 40 }, sizing: sz() },
+      1280: { cs: { display: "flex", whiteSpace: "nowrap" }, bbox: { x: 0, y: 0, width: pillW[1280]!, height: 40 }, sizing: sz() },
+    }, [{ text: "Certified B Corporation" }]);
+    return xNode("n0", "body", {
+      375: { cs: { display: "flex", flexDirection: "column" }, bbox: { x: 0, y: 0, width: colWidths[0], height: 40 } },
+      768: { cs: { display: "flex", flexDirection: "column" }, bbox: { x: 0, y: 0, width: colWidths[1], height: 40 } },
+      1280: { cs: { display: "flex", flexDirection: "column" }, bbox: { x: 0, y: 0, width: colWidths[2], height: 40 } },
+    }, [pill]);
+  }
+
+  /** Collect every emitted `width:N%` for `id` across the base rule and all @media bands. */
+  function emittedPercents(css: string, id: string) {
+    const bodies: string[] = [];
+    // base rule
+    const base = css.match(new RegExp(`\\.c${id}\\{([^}]*)\\}`));
+    if (base) bodies.push(base[1]!);
+    // banded rules
+    for (const m of css.matchAll(/@media ([^{]+) \{\n([\s\S]*?)\n\}/g)) {
+      const r = m[2]!.match(new RegExp(`\\.c${id}\\{([^}]*)\\}`));
+      if (r) bodies.push(r[1]!);
+    }
+    const pcts: number[] = [];
+    for (const b of bodies) {
+      const w = b.match(/width:([\d.]+)%/);
+      if (w) pcts.push(parseFloat(w[1]!));
+    }
+    return { pcts, bodies };
+  }
+
+  it("snaps the percent UP so the emitted width never lands below the pill's content (no wrap)", () => {
+    // 245.94 in 343 → 71.70% (nearest 71.5% = 245.24 < wMax); in 392 → 62.74% (nearest 62.5% = 245.0 < wMax).
+    const css = generateCss(xIr(pillIn([343, 221.33, 392], { wMin: 189.72, wMax })), new Map());
+    const { pcts } = emittedPercents(css, "n1");
+    assert.ok(pcts.length > 0, `pill should carry a fluid width:%, got none`);
+    // Every emitted % must clear the content width against the vp where it applies. The two content-
+    // fit viewports are 343 (71.70% band) and 392 (62.74% band); resolve each candidate % and require
+    // at least the 343-container % ≥ 245.94.
+    const at343 = pcts.filter((p) => Math.abs((p / 100) * 343 - 245.94) <= 3);
+    assert.ok(at343.some((p) => (p / 100) * 343 >= 245.94 - 0.01),
+      `375 pill % must resolve ≥ 245.94px in a 343px column, got pcts=${pcts.join(",")} → ${at343.map((p) => ((p / 100) * 343).toFixed(2)).join(",")}px`);
+    // Nearest-rounding would have emitted 71.5% (= 245.24). Assert the fix bumped it up to 72%.
+    assert.ok(pcts.includes(72) || pcts.some((p) => (p / 100) * 343 >= 245.94),
+      `expected snap-UP to 72% (246.96px), got ${pcts.join(",")}`);
+  });
+
+  it("keeps round-to-NEAREST for an ordinary box comfortably inside its container (no churn)", () => {
+    // Same geometry but NOT content-fit: bbox 245.94 sits well below wMax (400), so there is slack —
+    // wrapping can't happen, and the default nearest rounding (71.5%) must be preserved.
+    const rootPill = pillIn([343, 221.33, 392], { wMin: 100, wMax: 400 });
+    const css2 = generateCss(xIr(rootPill), new Map());
+    const { pcts } = emittedPercents(css2, "n1");
+    // 71.70% and 62.74% both round to nearest (71.5%, 63.0%... actually 62.74→62.5) — assert 71.5 present.
+    assert.ok(pcts.includes(71.5), `an ordinary box must keep nearest rounding (71.5%), got ${pcts.join(",")}`);
+    assert.ok(!pcts.includes(72), `an ordinary box must NOT be bumped up to 72%, got ${pcts.join(",")}`);
+  });
+});
+
 // Defect C (generate side) — a CSS marquee (infinite `@keyframes` animation) gated to a breakpoint
 // (Webflow's `max-lg` logo/text tracks) is `animation:none` at the base but runs at the narrow band.
 // The per-band transform delta at the animated width is a FROZEN mid-scroll phase; it must be
