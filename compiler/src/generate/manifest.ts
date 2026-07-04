@@ -4,6 +4,7 @@ import type { Tokens } from "../infer/tokens.js";
 import type { AssetGraph } from "../infer/assets.js";
 import type { FontGraph } from "../infer/fonts.js";
 import type { CaptureResult } from "../capture/capture.js";
+import type { PatternHints } from "../knowledge/patternIndex.js";
 
 export const COMPILER_VERSION = "0.1.0";
 export const SCHEMA_VERSION = 1;
@@ -16,8 +17,9 @@ export function buildManifest(args: {
   fontGraph: FontGraph;
   capture: CaptureResult;
   componentCount: number;
+  patternHints?: PatternHints;
 }): Record<string, unknown> {
-  const { ir, sections, tokens, assetGraph, fontGraph, capture, componentCount } = args;
+  const { ir, sections, tokens, assetGraph, fontGraph, capture, componentCount, patternHints } = args;
 
   const byType: Record<string, number> = {};
   let downloaded = 0, skipped = 0;
@@ -56,6 +58,23 @@ export function buildManifest(args: {
       fallback: fontGraph.entries.filter((f) => f.status === "fallback").length,
     },
     components: { count: componentCount },
+    // Frozen-catalog pattern evidence (hint-only, additive): library/platform fingerprints
+    // detected in the IR, with the node cids that carried each signature (bounded pre-order
+    // sample). Deterministic — matches are id-sorted and cids are pre-order, so the same
+    // catalog + IR yields byte-identical evidence. Generated docs read this to say e.g.
+    // "Swiper carousel detected". Omitted when no hints were computed.
+    ...(patternHints
+      ? {
+          patterns: {
+            catalogVersion: patternHints.catalogVersion,
+            catalogHash: patternHints.catalogHash,
+            flags: patternHints.flags,
+            platforms: patternHints.platforms,
+            simpleStatic: patternHints.simpleStatic,
+            matches: patternHints.matches.map((m) => ({ id: m.id, kind: m.kind, count: m.count, cids: m.cids })),
+          },
+        }
+      : {}),
     // Fidelity note: containers whose children were a DIFFERENT SET at some band viewport(s)
     // (content-identity drift — the source deterministically served other content there). The
     // clone shows the canonical-viewport children at those widths (faithful-at-canonical) instead

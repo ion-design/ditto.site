@@ -13,6 +13,7 @@ import { buildCodeQualityReport, codeQualityReportToMarkdown, type CodeQualityRe
 import { interactionRejectedSet } from "./interactive.js";
 import { buildManifest } from "./manifest.js";
 import { buildSeoInventory, seoInventoryToMarkdown, type SeoInventory } from "./seo.js";
+import { resolvePatternHints, type PatternHints } from "../knowledge/patternIndex.js";
 import { writeJSON, writeText, readJSON, fileExists } from "../util/fsx.js";
 import type { CaptureResult } from "../capture/capture.js";
 
@@ -24,6 +25,7 @@ export type GenerateAllResult = {
   fontGraph: FontGraph;
   recipeReport: RecipeReport;
   interactionRecipeReport: InteractionRecipeReport;
+  patternHints: PatternHints;
   seoInventory: SeoInventory;
   codeQuality: CodeQualityReport;
   manifest: Record<string, unknown>;
@@ -59,6 +61,10 @@ export function generateAll(opts: {
 
   const sections = detectSections(ir);
   const tokens = extractTokens(ir);
+  // Pattern hints: frozen-catalog signature scan over the IR (deterministic; the
+  // pin is asserted here and throws on catalog/lock drift). Fed as ADDITIVE evidence
+  // into recipe recognition — never overrides captured geometry.
+  const patternHints = resolvePatternHints(ir);
   const assetGraph = buildAssetGraph(capture);
   const fontGraph = buildFontGraph(capture.fontFaces, assetGraph, url);
   const seoInventory = buildSeoInventory(ir, assetGraph, capture);
@@ -69,7 +75,7 @@ export function generateAll(opts: {
   const tokensCss = (palette.css ? palette.css + "\n" : "") + tokensToCss(tokens, true);
   const tokenResolver = buildTokenResolver(tokens);
   const primitives = recognizePrimitives(ir);
-  const recipeReport = buildRecipeReport(ir, sections, primitives);
+  const recipeReport = buildRecipeReport(ir, sections, primitives, patternHints);
   const interactionRecipeReport = buildInteractionRecipeReport(ir, sections, capture.interaction);
   // Patterns the interaction gate previously rejected (don't reproduce) → left static.
   const rejPath = join(sourceDir, "interaction-rejected.json");
@@ -95,6 +101,7 @@ export function generateAll(opts: {
   writeJSON(join(outDir, "fonts.json"), fontGraph.entries);
   const inventory = inventoryOf(ir, primitives);
   writeJSON(join(outDir, "components.json"), inventory);
+  writeJSON(join(outDir, "patterns.json"), patternHints);
   writeJSON(join(outDir, "recipes.json"), recipeReport);
   writeText(join(outDir, "recipes.md"), recipeReportToMarkdown(recipeReport));
   writeJSON(join(outDir, "interaction-recipes.json"), interactionRecipeReport);
@@ -104,8 +111,8 @@ export function generateAll(opts: {
   const codeQuality = buildCodeQualityReport(appDir, recipeReport);
   writeJSON(join(outDir, "code-quality.json"), codeQuality);
   writeText(join(outDir, "code-quality.md"), codeQualityReportToMarkdown(codeQuality));
-  const manifest = buildManifest({ ir, sections, tokens, assetGraph, fontGraph, capture, componentCount: inventory.count });
+  const manifest = buildManifest({ ir, sections, tokens, assetGraph, fontGraph, capture, componentCount: inventory.count, patternHints });
   writeJSON(join(outDir, "manifest.json"), manifest);
 
-  return { ir, sections, tokens, assetGraph, fontGraph, recipeReport, interactionRecipeReport, seoInventory, codeQuality, manifest, assetsCopied: mat.copied, assetsMissing: mat.missing };
+  return { ir, sections, tokens, assetGraph, fontGraph, recipeReport, interactionRecipeReport, patternHints, seoInventory, codeQuality, manifest, assetsCopied: mat.copied, assetsMissing: mat.missing };
 }
