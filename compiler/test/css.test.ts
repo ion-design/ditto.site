@@ -233,3 +233,60 @@ describe("generateCss hidden-node banded geometry", () => {
     assert.ok(!mobile.includes("left:10px"), `ancestor-hidden child must not emit geometry, got: ${mobile}`);
   });
 });
+
+// Fix 1 — mobile nav chip-strip overlap. A horizontally-scrollable flex strip (overflow-x:auto
+// flex <ul>) holds nowrap chips; the base viewport can report `min-width:0px` on those flex-item
+// chips (e.g. a mobile-only strip collapsed to 0 at desktop). Emitting `min-w-0` lets the chips
+// compress below their content width instead of overflowing, collapsing the scroll strip so the
+// nowrap chip text collides ("Pizza OvenSpiral Mixe…"). The emitter must suppress `min-w-0` for a
+// nowrap flex item inside an overflow-x:auto/scroll flex parent.
+describe("generateCss scroll-strip chip min-width", () => {
+  it("suppresses min-w-0 on a nowrap chip inside an overflow-x:auto flex strip", () => {
+    const chip = node("n2", "li", computed({ display: "list-item", minWidth: "0px", whiteSpace: "nowrap" }));
+    const ul = node("n1", "ul", computed({ display: "flex", overflowX: "auto", columnGap: "8px" }), [chip]);
+    const root = node("n0", "body", computed(), [ul]);
+    const css = generateCss(irWith(root), new Map());
+    assert.ok(!baseRule(css, "n2").includes("min-width"), `chip must not carry min-width:0 in a scroll strip, got: ${baseRule(css, "n2")}`);
+  });
+
+  it("still emits min-w-0 for a nowrap flex item whose parent does NOT scroll horizontally", () => {
+    // A truncation/ellipsis flex child (parent overflow-x:visible) legitimately needs min-w-0 to
+    // shrink below content — the fix is scoped to overflow-x:auto/scroll parents, so this is kept.
+    const item = node("n2", "div", computed({ minWidth: "0px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }));
+    const row = node("n1", "div", computed({ display: "flex" }), [item]);
+    const root = node("n0", "body", computed(), [row]);
+    const css = generateCss(irWith(root), new Map());
+    assert.ok(baseRule(css, "n2").includes("min-width:0"), `non-scrolling flex row keeps min-w-0, got: ${baseRule(css, "n2")}`);
+  });
+});
+
+// Fix 3 — scroll-linked text-fill frozen at end state. A scroll/view-timeline animation reports
+// its resolved `animation-duration` as `auto`. The clone has no scroll timeline, so emitting the
+// animation-* props makes it jump straight to its END keyframe (fill-mode:both + a 0s time-based
+// duration), freezing e.g. a text-fill 100% filled at rest. The emitter must suppress the
+// animation-* longhands when animation-duration is `auto`, leaving the captured at-rest statics.
+describe("generateCss scroll-timeline animation suppression", () => {
+  it("drops animation-* props for an animation-duration:auto (scroll-timeline) node", () => {
+    const em = node("n1", "em", computed({
+      animationName: "fillAnimation", animationDuration: "auto",
+      animationTimingFunction: "linear", animationFillMode: "both",
+      backgroundClip: "text",
+    }));
+    const root = node("n0", "body", computed(), [em]);
+    const css = generateCss(irWith(root), new Map());
+    const rule = baseRule(css, "n1");
+    assert.ok(!rule.includes("animation-name"), `scroll-timeline node must not emit animation-name, got: ${rule}`);
+    assert.ok(!rule.includes("animation-duration"), `scroll-timeline node must not emit animation-duration, got: ${rule}`);
+  });
+
+  it("still emits animation-* for a normal time-based (finite duration) animation", () => {
+    const el = node("n1", "div", computed({
+      animationName: "fadeInUp", animationDuration: "1.25s",
+      animationTimingFunction: "ease", animationFillMode: "both",
+    }));
+    const root = node("n0", "body", computed(), [el]);
+    const css = generateCss(irWith(root), new Map());
+    const rule = baseRule(css, "n1");
+    assert.ok(rule.includes("animation-name:fadeInUp"), `time-based reveal keeps its animation, got: ${rule}`);
+  });
+});

@@ -243,6 +243,67 @@ export async function neutralizePreReveal(page: Page): Promise<number> {
   }
 }
 
+/** Cancel scroll/view-timeline-driven CSS animations so the snapshot records the AT-REST
+ *  (unscrolled) computed style rather than a frozen mid/end-timeline value.
+ *
+ *  A scroll-linked text-fill (e.g. `animation-timeline: view(); animation-fill-mode: both`)
+ *  progresses with scroll position, not time. The dwell-scroll pass runs the page to the
+ *  bottom, and `fill-mode: both` HOLDS the animation's end keyframe even after we restore
+ *  scroll to 0 — because the element's view-timeline range has already been exited. The DOM
+ *  walk then reads the FROZEN end value (e.g. `background-position: 100%`, fully filled),
+ *  baking the end state into the clone when the live at-rest state is the start (0%).
+ *
+ *  Fix: before the snapshot, cancel every running CSS animation whose timeline is NOT the
+ *  default (document) timeline — i.e. a ScrollTimeline / ViewTimeline, or (fallback) an
+ *  animation whose resolved effect duration is not finite. Canceling drops the animation's
+ *  fill so getComputedStyle reports the underlying (unanimated) property values.
+ *
+ *  Scoped to scroll/view timelines only: time-based entrance animations (reveals) use the
+ *  default document timeline with a finite duration and are left untouched. */
+export function neutralizeScrollTimelineAnimationsInPage(): number {
+  let n = 0;
+  try {
+    const docTimeline = (document as unknown as { timeline?: unknown }).timeline;
+    const anims = (document as unknown as { getAnimations?: () => Animation[] }).getAnimations?.() ?? [];
+    for (const a of anims) {
+      try {
+        const tl = a.timeline as unknown;
+        // Default (document) timeline → time-based; leave it. Anything else (scroll/view
+        // timeline) or a null timeline with a non-finite effect duration → scroll-linked.
+        const isDefaultTimeline = tl === docTimeline;
+        const ctorName: string = (tl ? (tl as { constructor?: { name?: string } }).constructor?.name : "") || "";
+        const isScrollLinked =
+          !isDefaultTimeline && /Scroll|View/.test(ctorName);
+        // Fallback: resolved effect duration is not a finite number (scroll-timeline
+        // animations report `auto`/non-finite computed duration, e.g. `animation-duration:auto`).
+        let nonFiniteDuration = false;
+        try {
+          const timing = (a.effect as unknown as { getComputedTiming?: () => { duration?: number | string } })?.getComputedTiming?.();
+          const dur = timing?.duration;
+          nonFiniteDuration = typeof dur === "number" ? !isFinite(dur) : dur === "auto";
+        } catch { /* ignore */ }
+        if (isScrollLinked || (!isDefaultTimeline && nonFiniteDuration)) {
+          a.cancel();
+          n++;
+        }
+      } catch { /* per-animation errors are non-fatal */ }
+    }
+  } catch { /* getAnimations unsupported — no-op */ }
+  return n;
+}
+
+/** Node-side wrapper: bounded + never fatal. */
+export async function neutralizeScrollTimelineAnimations(page: Page): Promise<number> {
+  try {
+    return await Promise.race([
+      page.evaluate(neutralizeScrollTimelineAnimationsInPage),
+      new Promise<number>((res) => setTimeout(() => res(0), 5000)),
+    ]);
+  } catch {
+    return 0;
+  }
+}
+
 // ---- Carousel settling (runs in the page) ----
 
 export type CarouselSettleResult = { roots: number; normalized: number; neutralizedAnims: number };

@@ -116,6 +116,36 @@ export type MotionSpec = { waapi: RTWaapi[]; rotators: RTRotator[]; reveals: RTR
 
 const byCid = (cid: string): HTMLElement | null => document.querySelector('[data-cid="' + cid + '"]');
 
+// Reveal-replay pacing caps. On the live site an entrance stagger plays ONCE, on first load,
+// while the whole group is already in view. Our replay re-hides each element and replays its
+// entrance on scroll-into-view, preserving the captured per-element delay AND duration. A grid
+// of tiles then either staggers over a long window (captured delays) or each tile plays a long
+// (e.g. 1.25s) entrance as it scrolls in — so a fast scroll / full-page screenshot catches most
+// tiles mid-entrance, unpainted. Cap the replayed delay AND duration so each tile paints promptly
+// after it enters the viewport, keeping relative order. (The validator settles via
+// __dittoMotionStop and is unaffected — this only bounds the live, un-stopped replay.)
+const REVEAL_MAX_DELAY_MS = 300;
+const REVEAL_MAX_DURATION_MS = 600;
+const parseTimeMs = (raw: string | undefined): number => {
+  if (!raw) return 0;
+  const first = String(raw).split(",")[0]!.trim();
+  const m = /^(-?[0-9.]+)(ms|s)?$/.exec(first);
+  if (!m) return 0;
+  let ms = parseFloat(m[1]!);
+  if (m[2] !== "ms") ms *= 1000;
+  return isFinite(ms) ? ms : 0;
+};
+const clampDelay = (raw: string | undefined): string => {
+  const ms = parseTimeMs(raw);
+  if (ms <= 0) return "0s";
+  return Math.min(ms, REVEAL_MAX_DELAY_MS) + "ms";
+};
+const clampDuration = (raw: string | undefined): string => {
+  const ms = parseTimeMs(raw);
+  if (ms <= 0) return raw && String(raw).trim() ? String(raw) : "1s";
+  return Math.min(ms, REVEAL_MAX_DURATION_MS) + "ms";
+};
+
 /** Replays captured motion the stylesheet can't express: WAAPI animations (re-issued via
  *  element.animate), rotating text (interval-cycled), and scroll-triggered reveals (start
  *  hidden, transition in when scrolled into view). Starts on mount. Installs
@@ -133,6 +163,7 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
     const revealed: Array<(animate: boolean) => void> = [];
     let io: IntersectionObserver | null = null;
     let forceTimer: ReturnType<typeof setTimeout> | null = null;
+    const settleTimers: ReturnType<typeof setTimeout>[] = [];
 
     for (const w of spec.waapi) {
       const el = byCid(w.cid);
@@ -190,12 +221,14 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
         if (rv.visibility === "hidden") el.style.visibility = "visible";
         if (rv.animationName) {
           if (animate) {
-            // restart the entrance from t=0: none -> name starts a fresh animation
+            // restart the entrance from t=0: none -> name starts a fresh animation. Cap the
+            // delay + duration so the tile paints promptly after entering view (a long captured
+            // stagger/entrance would otherwise leave it blank through a fast scroll / screenshot).
             el.style.animationName = "none";
             void el.offsetWidth;
             el.style.animationName = rv.animationName;
-            el.style.animationDuration = rv.animationDuration || "1s";
-            el.style.animationDelay = rv.animationDelay || "0s";
+            el.style.animationDuration = clampDuration(rv.animationDuration);
+            el.style.animationDelay = clampDelay(rv.animationDelay);
             el.style.animationTimingFunction = rv.animationTiming || "ease";
             el.style.animationFillMode = "both";
             el.style.animationIterationCount = "1";
@@ -220,11 +253,22 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
         shows.set(el, fn);
         revealed.push(fn);
       }
+      // Per-element settle: a bounded time after a tile is animated in, force it to its settled
+      // frame (animate=false) so it can't be caught mid-entrance by a fast scroll / screenshot,
+      // regardless of when it entered view. The clamped delay+duration keep this window short.
+      const settleAfter = REVEAL_MAX_DELAY_MS + REVEAL_MAX_DURATION_MS + 100;
       io = new IntersectionObserver((entries) => {
-        for (const e of entries) if (e.isIntersecting) { const f = shows.get(e.target); if (f) { f(true); io!.unobserve(e.target); } }
+        for (const e of entries) if (e.isIntersecting) {
+          const f = shows.get(e.target); if (!f) continue;
+          f(true); io!.unobserve(e.target);
+          settleTimers.push(setTimeout(() => f(false), settleAfter));
+        }
       }, { rootMargin: "0px 0px -8% 0px" });
       for (const el of shows.keys()) io.observe(el);
-      forceTimer = setTimeout(() => { for (const f of revealed) f(true); }, 4000);
+      // Global failsafe: settle EVERYTHING (animate=false) so any element the observer never fired
+      // for (never scrolled into view, or a missed callback) is painted, not left hidden. Per-mount
+      // is sufficient because it jumps straight to the settled frame with no residual delay.
+      forceTimer = setTimeout(() => { for (const f of revealed) f(false); }, 4000);
     }
 
     const stopAll = () => {
@@ -234,6 +278,7 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
       for (const a of anims) { try { a.cancel(); } catch { /* ignore */ } }
       if (io) io.disconnect();
       if (forceTimer) clearTimeout(forceTimer);
+      for (const t of settleTimers) clearTimeout(t);
       for (const f of revealed) f(false); // reveal everything, settled → base CSS graded frame
     };
     // Measurement hook: restore the fully-settled/revealed base for grading.
@@ -242,6 +287,7 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
       for (const id of intervals) clearInterval(id);
       if (io) io.disconnect();
       if (forceTimer) clearTimeout(forceTimer);
+      for (const t of settleTimers) clearTimeout(t);
       try { delete (window as any).__dittoMotionStop; } catch { /* ignore */ }
     };
   }, [spec]);

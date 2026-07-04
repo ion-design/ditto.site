@@ -132,4 +132,25 @@ describe("scroll-reveal settling + replay capture (integration)", () => {
     // Validator settle path reveals WITHOUT replaying (no mid-entrance graded frames).
     assert.match(DITTO_MOTION_TSX, /f\(false\)/);
   });
+
+  // Fix 2 — reveal-replay stagger must not leave tiles unpainted. A long captured entrance
+  // delay/duration replayed on scroll-into-view means a fast scroll / full-page screenshot
+  // catches most tiles mid-entrance. The replay caps the delay + duration and force-settles
+  // each tile shortly after it enters view, so tiles paint promptly and none stay hidden.
+  it("caps the replayed entrance delay and duration", () => {
+    // The animate path uses the clamp helpers rather than the raw captured values.
+    assert.match(DITTO_MOTION_TSX, /el\.style\.animationDuration = clampDuration\(rv\.animationDuration\)/);
+    assert.match(DITTO_MOTION_TSX, /el\.style\.animationDelay = clampDelay\(rv\.animationDelay\)/);
+    // Caps are bounded (delay <= 300ms, duration <= 600ms).
+    assert.match(DITTO_MOTION_TSX, /REVEAL_MAX_DELAY_MS = 300/);
+    assert.match(DITTO_MOTION_TSX, /REVEAL_MAX_DURATION_MS = 600/);
+  });
+
+  it("force-settles each revealed tile per-element and settles everything at the failsafe", () => {
+    // Per-element settle timer jumps a tile to its settled frame a bounded time after it animates
+    // in (so it can't be caught mid-entrance regardless of WHEN it scrolled into view).
+    assert.match(DITTO_MOTION_TSX, /settleTimers\.push\(setTimeout\(\(\) => f\(false\), settleAfter\)\)/);
+    // Global failsafe settles (animate=false) rather than re-animating — nothing stays hidden.
+    assert.match(DITTO_MOTION_TSX, /forceTimer = setTimeout\(\(\) => \{ for \(const f of revealed\) f\(false\); \}, 4000\)/);
+  });
 });

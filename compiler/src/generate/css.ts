@@ -2229,6 +2229,18 @@ function declsForViewport(
   const ov = cs.overflowY || cs.overflow || "visible";
   const parentDisp = parentComputed?.display || "";
   const isFlexGridItem = /flex|grid/.test(parentDisp);
+  // A chip in a horizontally-scrollable flex strip (an overflow-x:auto/scroll flex parent) relies on
+  // the CSS default `min-width:auto` to stay at its content width so the strip scrolls. The base
+  // viewport can report `min-width:0px` on such an item (e.g. a mobile-only strip collapsed to 0 at
+  // desktop), which would emit `min-w-0` and let the item shrink below its content — collapsing the
+  // strip and colliding its nowrap text. Suppress `min-w-0` for a nowrap flex item whose flex parent
+  // scrolls horizontally. This is scoped away from legitimate `min-w-0` truncation (overflow:hidden +
+  // ellipsis on the item itself, whose parent does NOT scroll-x), so it is safe.
+  const parentOverflowX = parentComputed ? (parentComputed.overflowX || parentComputed.overflow || "visible") : "visible";
+  const inScrollXFlexStrip =
+    /flex/.test(parentDisp) &&
+    /^(auto|scroll)$/.test(parentOverflowX) &&
+    (cs.whiteSpace || "normal") === "nowrap";
   const isLeaf = !hasElementChild(node);
   const hasText = node.children.some((c) => isTextChild(c) && c.text.trim() !== "");
   const isTextLeaf = isLeaf && hasText && !REPLACED.has(tag) && tag !== "canvas" && !tag.includes("-");
@@ -2417,7 +2429,16 @@ function declsForViewport(
   }
 
   const hasTransform = cs.transform && cs.transform !== "none";
-  const hasAnimation = cs.animationName && cs.animationName !== "none";
+  // A scroll/view-timeline-driven animation reports its resolved `animation-duration` as
+  // `auto` (the duration is derived from the timeline range, not a time). The clone has no
+  // scroll timeline, so emitting such an animation makes it jump straight to its END keyframe
+  // (`fill-mode:both` + a 0s time-based duration), freezing the element at the fully-progressed
+  // state (e.g. a scroll-linked text-fill stuck 100% filled). We do NOT replay scroll-linked
+  // animations; the goal is the correct AT-REST render. So suppress the animation-* props for
+  // an animation whose duration is `auto`, and let the captured static properties (now recorded
+  // at-rest, scroll reset + timeline animations canceled before the snapshot) stand.
+  const isScrollTimelineAnim = (cs.animationDuration || "").split(",").some((d) => d.trim() === "auto");
+  const hasAnimation = cs.animationName && cs.animationName !== "none" && !isScrollTimelineAnim;
 
   for (const { prop, def } of GENERIC) {
     const value = cs[prop];
@@ -2453,7 +2474,7 @@ function declsForViewport(
       if (!/^(ul|ol|li|menu)$/.test(tag)) continue;
       // list reset is none; emit whatever the source uses (incl. none).
     } else if (prop === "minWidth") {
-      if (value === "auto" || (value === "0px" && !isFlexGridItem)) continue;
+      if (value === "auto" || (value === "0px" && !isFlexGridItem) || (value === "0px" && inScrollXFlexStrip)) continue;
     } else if (def === "__never__") {
       // always emit (display/color/fontFamily/fontSize handled below for inherit)
     } else if (isDefault(def, value)) {

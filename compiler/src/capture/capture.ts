@@ -5,7 +5,7 @@ import { tagElements, captureInteractions, type InteractionCapture } from "./int
 import { captureMotion, probeReveals, type MotionCapture } from "./motion.js";
 import {
   promoteLazyMedia, settleCarousels, settleScrollReveals, neutralizePreReveal,
-  forceRevealForShot, restoreRevealForShot,
+  forceRevealForShot, restoreRevealForShot, neutralizeScrollTimelineAnimations,
 } from "./stabilize.js";
 import {
   enumerateFramesInPage, planForFrameUrl, graftFrameIntoSnapshot, frameHasRenderableContent,
@@ -964,6 +964,14 @@ export async function captureSite(opts: {
         await page.evaluate(() => window.scrollTo(0, 0));
         await page.waitForTimeout(80);
       }
+
+      // Scroll-linked animations (animation-timeline: scroll()/view()) are held at their
+      // end keyframe by `fill-mode:both` after the dwell-scroll pass, even with scroll reset
+      // to 0 — so the walk would bake the frozen END state (e.g. a text-fill stuck at 100%).
+      // Cancel them here so the snapshot records the genuine AT-REST (unscrolled, 0%) values.
+      // Time-based reveals use the default document timeline and are untouched.
+      const scrollAnimsCanceled = await neutralizeScrollTimelineAnimations(page);
+      if (scrollAnimsCanceled) log({ event: "scroll_timeline_anims_canceled", viewport: vw, count: scrollAnimsCanceled });
 
       // Bound the in-page DOM walk: page.evaluate has no default timeout, so a
       // pathologically large/animated DOM (e.g. asana.com) could hang forever.

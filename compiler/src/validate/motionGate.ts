@@ -64,14 +64,26 @@ export function cssReplayedByReveal(
   return !!revealAnim && names.includes(revealAnim);
 }
 
-/** CSS-animated nodes expected from the IR (computed animation-name ≠ none). */
+/** A node's animation is scroll/view-timeline-driven when its computed animation-duration is
+ *  `auto` (the duration is resolved from the timeline range, not a time). The generator does NOT
+ *  emit such animations — replaying a scroll-linked animation is out of scope; the clone reproduces
+ *  the correct AT-REST state instead — so these are excluded from the static-CSS expectation rather
+ *  than failing `emitted=false`. Distinct from time-based reveals (finite duration, default timeline). */
+export function isScrollTimelineAnim(cs: IRNode["computedByVp"][number] | undefined): boolean {
+  const dur = cs?.animationDuration;
+  return !!dur && dur.split(",").some((d) => d.trim() === "auto");
+}
+
+/** CSS-animated nodes expected from the IR (computed animation-name ≠ none). Scroll/view-timeline
+ *  animations (animation-duration:auto) are excluded — the clone renders their at-rest state, not
+ *  a replay, so there is no static decl to expect. */
 export function collectExpectedCss(ir: IR): ExpectedCss[] {
   const vp = ir.doc.canonicalViewport;
   const out: ExpectedCss[] = [];
   const walk = (n: IRNode): void => {
     const cs = n.computedByVp[vp];
     const an = cs?.animationName;
-    if (an && an !== "none") {
+    if (an && an !== "none" && !isScrollTimelineAnim(cs)) {
       const names = an.split(",").map((x) => x.trim()).filter((x) => x && x !== "none");
       if (names.length) out.push({ cid: n.id, names, infinite: /infinite/.test(cs!.animationIterationCount ?? "") });
     }

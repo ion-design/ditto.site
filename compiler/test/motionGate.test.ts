@@ -9,7 +9,7 @@ import { missingHarnessDeps } from "../src/validate/render.js";
 
 // Minimal IRNode factory — collectExpectedCss only reads id, computedByVp[vp].animation*,
 // and children, so we build just those fields and cast.
-function node(id: string, anim: { animationName?: string; animationIterationCount?: string } | null, children: IRNode[] = []): IRNode {
+function node(id: string, anim: { animationName?: string; animationIterationCount?: string; animationDuration?: string } | null, children: IRNode[] = []): IRNode {
   return {
     id,
     tag: "div",
@@ -42,6 +42,20 @@ describe("motion gate — CSS entrance / reveal-replay accounting", () => {
     const fade = got.find((e) => e.cid === "n464")!;
     assert.equal(fade.infinite, false);
     assert.deepEqual(fade.names, ["fadeInUp"]);
+  });
+
+  it("collectExpectedCss EXCLUDES a scroll/view-timeline animation (animation-duration:auto)", () => {
+    // Fix 3: the ooni text-fill em (animation-timeline:view → computed animation-duration:auto)
+    // is intentionally NOT emitted (we render the at-rest state, not a scroll replay). It must be
+    // excluded from the static-CSS expectation, not counted as an owed-but-missing animation.
+    const tree = ir(
+      node("n0", null, [
+        node("n358", { animationName: "fillAnimation", animationDuration: "auto", animationIterationCount: "1" }),
+        node("n4", { animationName: "spin", animationDuration: "1s", animationIterationCount: "infinite" }),
+      ]),
+    );
+    const got = collectExpectedCss(tree);
+    assert.deepEqual(got.map((e) => e.cid), ["n4"], "scroll-timeline node n358 must be excluded");
   });
 
   it("cssReplayedByReveal excludes a captured entrance the clone replays via a reveal", () => {
