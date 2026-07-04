@@ -2539,7 +2539,10 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const mode = input.humanizeMode ?? "tailwind";
   // Tailwind mode (default): translate each node's exact decls to utility classes.
   // CSS mode: dedup into shared semantic CSS classes. Both fidelity-neutral.
-  const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow }) : undefined;
+  // Lottie mount boxes are pinned to their captured height (replaced-like) so the runtime player's
+  // aspect-sized svg fills a definite box instead of inflating. The spec item cid IS the mount cid.
+  const lottieMounts = new Set(lottieSpec.items.map((it) => it.cid));
+  const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow, lottieMounts }) : undefined;
   const classMap = humanize && mode === "css" ? buildClassMap(ir, assetMap, input.colorVar, input.primitives, input.tokenResolver) : undefined;
   const cleanRecipeClass = recipeResponsiveClassCleaner(ir, input.recipeReport, { tailwind: !!tw });
   const classOf = tw ? (cid: string) => cleanRecipeClass(cid, tw.classOf.get(cid)) : classMap ? (cid: string) => classMap.classOf.get(cid) : undefined;

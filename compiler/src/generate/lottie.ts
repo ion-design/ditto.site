@@ -154,10 +154,23 @@ export default function DittoLottie({ spec }: { spec: LottieSpec }) {
             rendererSettings: { preserveAspectRatio: "xMidYMid meet" },
           });
           // Swap only once the animation is genuinely ready: reveal the live render and remove
-          // every original child (the placeholder) so the two never stack.
+          // every original child (the placeholder) so the two never stack. Before discarding the
+          // placeholder, forward its data-cid onto the runtime-rendered svg/canvas so the media
+          // node stays addressable by cid after the swap (it would otherwise mount without one).
           const reveal = () => {
             mount.style.opacity = "1";
+            // The captured placeholder is an svg/canvas (or wraps one) carrying its own data-cid.
+            let placeholderCid: string | null = null;
+            for (const child of Array.from(el.childNodes)) {
+              if (child === mount || placeholderCid !== null || !(child instanceof Element)) continue;
+              const media = child.matches("svg, canvas") ? child : child.querySelector("svg, canvas");
+              placeholderCid = (media ?? child).getAttribute("data-cid");
+            }
             for (const child of Array.from(el.childNodes)) if (child !== mount) el.removeChild(child);
+            if (placeholderCid) {
+              const rendered = mount.querySelector("svg, canvas");
+              if (rendered) rendered.setAttribute("data-cid", placeholderCid);
+            }
             mount.style.position = "";
             mount.style.inset = "";
           };

@@ -867,6 +867,24 @@ function aspectHeightLaw(node: IRNode, viewports: number[]): Record<number, stri
   return out;
 }
 
+/** A lottie mount box: the container the runtime player re-mounts its svg/canvas into. The player
+ * sizes that svg by the animation's aspect at the container's width, so without a pinned height the
+ * mount inflates to the aspect height (overlapping neighbours). Treat it as replaced-like — pin the
+ * captured per-viewport border-box height (the source-constrained size) so the aspect-fit svg fills
+ * a definite box. Per viewport, like img/video height emission. */
+function lottieMountHeight(node: IRNode, viewports: number[]): Record<number, string> | null {
+  const out: Record<number, string> = {};
+  let any = false;
+  for (const vp of viewports) {
+    const nb = node.bboxByVp[vp];
+    if (!nb || !node.visibleByVp[vp] || (node.computedByVp[vp]?.display || "") === "none") continue;
+    if (!(nb.height > 0)) continue;
+    out[vp] = fmtPx(nb.height);
+    any = true;
+  }
+  return any ? out : null;
+}
+
 function mediaHeightGeometry(node: IRNode, viewports: number[]): Pick<GeometryPlan, "heightByVp" | "aspectByVp"> {
   const heightByVp = viewportHeightLaw(node, viewports);
   if (heightByVp) return { heightByVp };
@@ -1980,6 +1998,24 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
     if (pos !== "static" && pos !== "relative") return false;
     if ((cs.overflowY || cs.overflow || "visible") !== "visible") return false;
     if ((cs.display || "") === "none") continue;
+    // The sizing probe proved this height AUTHORED-EXPLICIT: height:auto did NOT reproduce the box
+    // (hAuto:false) and the box is not a fill child of its own parent (hFill:false). The measured
+    // px is then load-bearing — dropping it collapses the box. This overrides the structural flow
+    // reasoning below, which can read the height as content-driven via a CIRCULAR pair (two nested
+    // authored-height boxes each "explaining" the other's extent) and drop both. Bail so the
+    // authored height survives. (heightProbeDrops, OR'd with this at the call site, also refuses to
+    // drop an hAuto:false box — so the two signals agree and the authored px is kept.)
+    const sz = node.sizingByVp?.[vp];
+    if (sz && sz.hAuto === false && sz.hFill === false) return false;
+    // A flex COLUMN that DISTRIBUTES free space (justify-content space-between/around/evenly, or the
+    // packed alignments that pin the last child away from the top): the box height is LOAD-BEARING —
+    // it sets the free space the children spread through. The content-extent check below would read
+    // the last child reaching the box bottom as "content-sized", but that extent only equals the box
+    // bottom BECAUSE the distribution pushed it there. Dropping the height collapses the gaps.
+    if (/flex/.test(cs.display || "") && /column/.test(cs.flexDirection || "row") &&
+        /^(space-between|space-around|space-evenly|center|flex-end|end)$/.test(cs.justifyContent || "")) {
+      return false;
+    }
     // A flex COLUMN whose in-flow child fills it via flex-grow: the box's height is LOAD-BEARING,
     // not content-derived. The content-extent check below would read the box as content-sized — but
     // that extent IS the grown child, which only reaches the box bottom BECAUSE the box has this
@@ -3015,7 +3051,7 @@ export function keyframesCss(ir: IR, assetMap: Map<string, string>, includeNode?
  *  per-node CSS emitter (generateCss) and the semantic class-map emitter (classMap.ts).
  *  `includeNode` scopes which nodes are emitted (multi-route shared layout) while still
  *  recursing so inheritance diffing against parents stays correct. */
-export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeNode?: (id: string) => boolean, colorVar?: (value: string) => string | null, tokenResolver?: TokenResolver, reflow = false): Map<string, NodeRule> {
+export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeNode?: (id: string) => boolean, colorVar?: (value: string) => string | null, tokenResolver?: TokenResolver, reflow = false, lottieMounts?: ReadonlySet<string>): Map<string, NodeRule> {
   const bands = computeBands(ir.doc.viewports, ir.doc.canonicalViewport);
   const baseVp = ir.doc.canonicalViewport;
   const rules = new Map<string, NodeRule>();
@@ -3194,7 +3230,10 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // Large one-row media grids need a definite height/aspect law before the single `1fr` row is
     // safe. Multi-row grids are handled by the older equal-track detector.
     const singleRowsByVp = !isContents ? singleFluidGridRow(node, sampleVps) : null;
-    const mediaGeometry = singleRowsByVp ? mediaHeightGeometry(node, sampleVps) : {};
+    // A lottie mount pins its captured height (replaced-like); it wins over the flow/media laws so the
+    // runtime player's aspect-sized svg fills a definite box instead of inflating past its neighbours.
+    const lottieHeight = !isContents && lottieMounts?.has(node.id) ? lottieMountHeight(node, sampleVps) : null;
+    const mediaGeometry = lottieHeight ? { heightByVp: lottieHeight } : singleRowsByVp ? mediaHeightGeometry(node, sampleVps) : {};
     const leftClampByVp = !isContents ? centeredInsetClamp(node, cbAncestor, sampleVps, "x") : null;
     const topClampByVp = !isContents ? centeredInsetClamp(node, cbAncestor, sampleVps, "y") : null;
     const geometry: GeometryPlan = (mediaGeometry.heightByVp || mediaGeometry.aspectByVp || leftClampByVp || topClampByVp)

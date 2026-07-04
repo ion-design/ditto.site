@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { IR, IRNode, IRChild, StyleMap, BBox } from "../src/normalize/ir.js";
 import type { RawSizing } from "../src/capture/walker.js";
-import { generateCss } from "../src/generate/css.js";
+import { generateCss, collectNodeRules } from "../src/generate/css.js";
 
 const VPS = [375, 1280];
 const CANONICAL = 1280;
@@ -482,5 +482,138 @@ describe("generateCss cross-band transform identity", () => {
     const root = xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 40 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 40 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 40 } } }, [el]);
     const css = generateCss(xIr(root), new Map());
     assert.ok(!allRulesX(css, "n1").includes("transform:none"), `an always-identity node needs no explicit transform, got: ${allRulesX(css, "n1")}`);
+  });
+});
+
+// BUG 1 — heightFlows must consult the sizing probe. A circular parent/child pair of authored-height
+// boxes (two nested viewport-height containers whose only children are absolutely positioned) used to
+// "explain each other away": the outer read content-driven (its content IS the inner box) and the
+// inner read stretched (it equals the outer's content height) — both dropped, collapsing a hero to
+// 0px. The probe now proves each height authored-explicit (hAuto:false, hFill:false); heightFlows
+// bails so both survive.
+describe("generateCss circular authored-height (probe bail)", () => {
+  const authored = (): RawSizing => ({ wAuto: false, wFill: false, hAuto: false, hFill: false });
+  function hero(hByVp: Record<number, number>) {
+    // an absolutely-positioned decoration inside the inner box (contributes no in-flow content height)
+    const abs = xNode("n3", "div", {
+      375: { cs: { position: "absolute" }, bbox: { x: 0, y: 0, width: 375, height: hByVp[375]! } },
+      768: { cs: { position: "absolute" }, bbox: { x: 0, y: 0, width: 768, height: hByVp[768]! } },
+      1280: { cs: { position: "absolute" }, bbox: { x: 0, y: 0, width: 1280, height: hByVp[1280]! } },
+    });
+    const inner = xNode("n2", "div", {
+      375: { cs: { display: "flex", height: `${hByVp[375]}px` }, bbox: { x: 0, y: 0, width: 375, height: hByVp[375]! }, sizing: authored() },
+      768: { cs: { display: "flex", height: `${hByVp[768]}px` }, bbox: { x: 0, y: 0, width: 768, height: hByVp[768]! }, sizing: authored() },
+      1280: { cs: { display: "flex", height: `${hByVp[1280]}px` }, bbox: { x: 0, y: 0, width: 1280, height: hByVp[1280]! }, sizing: authored() },
+    }, [abs]);
+    const outer = xNode("n1", "div", {
+      375: { cs: { display: "flex", height: `${hByVp[375]}px` }, bbox: { x: 0, y: 0, width: 375, height: hByVp[375]! }, sizing: authored() },
+      768: { cs: { display: "flex", height: `${hByVp[768]}px` }, bbox: { x: 0, y: 0, width: 768, height: hByVp[768]! }, sizing: authored() },
+      1280: { cs: { display: "flex", height: `${hByVp[1280]}px` }, bbox: { x: 0, y: 0, width: 1280, height: hByVp[1280]! }, sizing: authored() },
+    }, [inner]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: hByVp[375]! } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: hByVp[768]! } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: hByVp[1280]! } },
+    }, [outer]);
+  }
+
+  it("keeps both heights when the probe proves them authored-explicit", () => {
+    const css = generateCss(xIr(hero({ 375: 771, 768: 900, 1280: 800 })), new Map());
+    const outer = allRulesX(css, "n1");
+    const inner = allRulesX(css, "n2");
+    assert.ok(/height:800px/.test(outer), `outer must keep its canonical authored height, got: ${outer}`);
+    assert.ok(/height:800px/.test(inner), `inner must keep its canonical authored height, got: ${inner}`);
+  });
+
+  it("still flows a genuinely content-sized varying height (probe hAuto:true)", () => {
+    // Same shape but the probe says auto reproduces the box — the varying height is real content, safe
+    // to drop. Give it an in-flow text child so it reads content-driven.
+    const auto = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false });
+    const mk = (h: number, w: number): XPerVp => ({ cs: { display: "block", height: `${h}px` }, bbox: { x: 0, y: 0, width: w, height: h }, sizing: auto() });
+    const inner = xNode("n2", "div", { 375: mk(200, 375), 768: mk(260, 768), 1280: mk(320, 1280) }, [{ text: "flowing content" } as IRChild]);
+    // pad the box so height == content is plausible per contentDriven's text branch
+    const root = xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 200 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 260 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 320 } } }, [inner]);
+    const css = generateCss(xIr(root), new Map());
+    assert.ok(!/height:320px/.test(allRulesX(css, "n2")), `a probe-auto content height should still flow, got: ${allRulesX(css, "n2")}`);
+  });
+});
+
+// BUG 2 — a space-distributing flex column (justify-content: space-between/around/evenly, or a packed
+// center/flex-end) sets the free space its children spread through, so the last child reaching the box
+// bottom is NOT content evidence. heightFlows used to read that as content-driven and drop the box's
+// authored height, collapsing the distributed gaps.
+describe("generateCss space-distributing flex column keeps its height", () => {
+  // hAuto:true (auto reproduces the box at capture, because distribution places the last child at the
+  // bottom) — so the sizing probe does NOT forbid the drop. Wrappable text inside makes heightProbeDrops
+  // abstain, isolating heightFlows' space-distribution disqualification as the sole arbiter.
+  const auto = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false });
+  const textChild = { text: "a line of distributed content" } as IRChild;
+  function distributed(justify: string) {
+    // two content-sized blocks; the last sits at the box bottom because the column distributes space
+    const top = xNode("n2", "div", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 768, height: 40 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 1280, height: 40 } },
+    }, [textChild]);
+    const bottomH = (h: number): XPerVp => ({ cs: { display: "block" }, bbox: { x: 0, y: h - 40, width: 375, height: 40 } });
+    const bot = xNode("n3", "div", { 375: bottomH(360), 768: bottomH(500), 1280: bottomH(600) }, [textChild]);
+    const col = xNode("n1", "div", {
+      375: { cs: { display: "flex", flexDirection: "column", justifyContent: justify, height: "360px" }, bbox: { x: 0, y: 0, width: 375, height: 360 }, sizing: auto() },
+      768: { cs: { display: "flex", flexDirection: "column", justifyContent: justify, height: "500px" }, bbox: { x: 0, y: 0, width: 768, height: 500 }, sizing: auto() },
+      1280: { cs: { display: "flex", flexDirection: "column", justifyContent: justify, height: "600px" }, bbox: { x: 0, y: 0, width: 1280, height: 600 }, sizing: auto() },
+    }, [top, bot]);
+    return xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 360 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 500 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 600 } } }, [col]);
+  }
+
+  for (const j of ["space-between", "space-around", "space-evenly"]) {
+    it(`keeps the authored height under justify-content:${j}`, () => {
+      const css = generateCss(xIr(distributed(j)), new Map());
+      assert.ok(/height:600px/.test(allRulesX(css, "n1")), `${j} column must keep its distributing height, got: ${allRulesX(css, "n1")}`);
+    });
+  }
+
+  it("still flows a flex-start column whose height truly equals its content", () => {
+    // justify-content:flex-start (default) — the last child at the bottom IS content-driven, so the
+    // varying height flows (drops) as before.
+    const css = generateCss(xIr(distributed("flex-start")), new Map());
+    assert.ok(!/height:600px/.test(allRulesX(css, "n1")), `a packed-top column should still flow, got: ${allRulesX(css, "n1")}`);
+  });
+});
+
+// BUG 3 — a lottie mount pins its captured per-viewport height so the runtime player's aspect-sized
+// svg fills a definite box instead of inflating past its neighbours. Threaded via collectNodeRules'
+// lottieMounts set (populated from the lottie spec item cids).
+describe("collectNodeRules lottie mount height pin", () => {
+  const auto = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false });
+  function mountFixture() {
+    // the mount is a flex box; its only child is a content-sized placeholder svg — without the pin the
+    // box height flows/collapses and the runtime svg inflates by aspect.
+    const svg = xNode("n2", "svg", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 375, height: 94 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 768, height: 195 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 1280, height: 227 } },
+    });
+    const mount = xNode("n1", "div", {
+      375: { cs: { display: "flex", height: "94px" }, bbox: { x: 0, y: 0, width: 375, height: 94 }, sizing: auto() },
+      768: { cs: { display: "flex", height: "195px" }, bbox: { x: 0, y: 0, width: 768, height: 195 }, sizing: auto() },
+      1280: { cs: { display: "flex", height: "227px" }, bbox: { x: 0, y: 0, width: 1280, height: 227 }, sizing: auto() },
+    }, [svg]);
+    return xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 94 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 195 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 227 } } }, [mount]);
+  }
+
+  it("pins the captured height on a mount node", () => {
+    const rules = collectNodeRules(xIr(mountFixture()), new Map(), undefined, undefined, undefined, false, new Set(["n1"]));
+    const nr = rules.get("n1");
+    assert.ok(nr, "mount rule must exist");
+    const all = [nr!.base.get("height"), ...nr!.bands.map((b) => b.decls.get("height"))].filter(Boolean).join(";");
+    assert.ok(/227px/.test(all), `canonical mount height must be pinned, got: ${all}`);
+    assert.ok(/94px/.test(all), `narrow-band mount height must be pinned, got: ${all}`);
+  });
+
+  it("leaves a non-mount box unpinned (flows its varying content height)", () => {
+    const rules = collectNodeRules(xIr(mountFixture()), new Map(), undefined, undefined, undefined, false, new Set());
+    const nr = rules.get("n1")!;
+    const all = [nr.base.get("height"), ...nr.bands.map((b) => b.decls.get("height"))].filter(Boolean).join(";");
+    assert.ok(!/227px/.test(all), `without the mount flag the varying height should flow, got: ${all}`);
   });
 });

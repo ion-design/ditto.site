@@ -36,6 +36,20 @@ describe("DittoLottie placeholder retention", () => {
   it("handles a failed load without leaving a broken mount stacked over the placeholder", () => {
     assert.match(DITTO_LOTTIE_TSX, /data_failed/);
   });
+
+  // The player creates its <svg>/<canvas> at runtime WITHOUT a data-cid, so the DOM/media gate can't
+  // map it back to the captured node. The reveal must forward the discarded placeholder's data-cid
+  // onto the runtime-rendered element (validation-agnostic; no gate special-casing).
+  it("forwards the placeholder's data-cid onto the runtime-rendered svg/canvas before the swap", () => {
+    // reads the placeholder cid, then reassigns it to the rendered svg/canvas inside the mount
+    assert.match(DITTO_LOTTIE_TSX, /getAttribute\(\s*["']data-cid["']\s*\)/);
+    assert.match(DITTO_LOTTIE_TSX, /mount\.querySelector\(\s*["']svg,\s*canvas["']\s*\)/);
+    assert.match(DITTO_LOTTIE_TSX, /setAttribute\(\s*["']data-cid["']\s*,/);
+    // the cid capture must precede its removal so the placeholder is still in the DOM when read
+    const readIdx = DITTO_LOTTIE_TSX.indexOf('getAttribute("data-cid")');
+    const removeIdx = DITTO_LOTTIE_TSX.indexOf("removeChild");
+    assert.ok(readIdx >= 0 && removeIdx >= 0 && readIdx < removeIdx, "must read the placeholder cid before removing it");
+  });
 });
 
 describe("identity-transform canonicalization (isIdentityTransform)", () => {
