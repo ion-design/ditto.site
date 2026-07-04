@@ -226,6 +226,35 @@ export function canonicalizeTransforms(computedByVp: Record<number, StyleMap>): 
   }
 }
 
+/** True when an INFINITE CSS animation is active at this viewport. Such an animation perpetually
+ *  drives its animated properties (opacity/transform), so the captured value is a frozen phase of
+ *  the loop, not authored design. */
+function hasInfiniteAnimation(cs: StyleMap | undefined): boolean {
+  if (!cs || (cs.animationName || "none") === "none") return false;
+  return /infinite/.test(cs.animationIterationCount || "1");
+}
+
+/**
+ * Neutralize the transform of a node that carries an INFINITE animation at ANY captured viewport.
+ * The capture shutter froze the marquee/spinner mid-loop, and — critically — a CSS animation gated
+ * to a breakpoint (Webflow's `max-lg` logo/big-text tracks) reads `animation:none` at the widths
+ * where it does NOT run, yet the browser still reports the last frozen `translateX` there. Banding
+ * those frozen values bakes a mid-scroll offset that shifts content offscreen-left AT REST (rows
+ * starting mid-glyph). The runtime `@keyframes` owns the transform and starts at translateX(0), so
+ * the faithful at-rest value is `none` at every width; generation's `animOwnedProps` then keeps the
+ * base holding while the animation drives it live. Only fires when a genuine infinite animation is
+ * present at some viewport — a statically-offset design element (no animation) is untouched.
+ * Deterministic, in place; only touches the `transform` slot.
+ */
+export function neutralizeAnimatedTransforms(computedByVp: Record<number, StyleMap>): void {
+  const vps = Object.keys(computedByVp).map(Number);
+  if (!vps.some((vp) => hasInfiniteAnimation(computedByVp[vp]))) return;
+  for (const vp of vps) {
+    const cs = computedByVp[vp];
+    if (cs && cs.transform && cs.transform !== "none") cs.transform = "none";
+  }
+}
+
 /** Full identity signature (tag + id + class). */
 function sigFull(n: RawNode): string {
   return `${n.tag}#${n.attrs?.id ?? ""}.${(n.attrs?.class ?? "").trim()}`;
@@ -370,6 +399,10 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     // the generator's per-band delta treats them uniformly and a scroll/composite-noise transform
     // at one width can't leak across bands.
     canonicalizeTransforms(computedByVp);
+    // Drop transforms frozen mid-loop by an infinite animation (marquees/spinners) at every viewport —
+    // including the breakpoints where the animation is gated off but the browser still reports the last
+    // frozen offset. Prevents a baked mid-scroll translateX from clipping content offscreen at rest.
+    neutralizeAnimatedTransforms(computedByVp);
 
     const node: IRNode = {
       id: nextId(),

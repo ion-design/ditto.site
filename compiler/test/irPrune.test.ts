@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RawNode, RawChild } from "../src/capture/walker.js";
-import { buildIR, isTextChild, type IRNode } from "../src/normalize/ir.js";
+import { buildIR, isTextChild, neutralizeAnimatedTransforms, type IRNode } from "../src/normalize/ir.js";
 
 const VPS = [375, 1280];
 
@@ -114,5 +114,43 @@ describe("IR drops font-metric probe nodes (fix 4)", () => {
     assert.deepEqual(kept, ["h1"], "probe div is dropped, the real heading survives");
     // Its text must not leak into the tree either.
     assert.equal(findByTag(root, "div"), null);
+  });
+});
+
+// Defect C (normalize side) — an infinite CSS animation gated to a breakpoint (a Webflow `max-lg`
+// marquee) is `animation:none` at the widths it does not run, but the browser still reports the last
+// FROZEN translateX there. `neutralizeAnimatedTransforms` zeroes the transform at EVERY viewport
+// once a genuine infinite animation is present at some width, so no frozen mid-scroll offset (the
+// base residue or the animated phases) is banded and clips the strip offscreen at rest.
+describe("neutralizeAnimatedTransforms (Defect C)", () => {
+  it("zeroes the transform at every viewport when an infinite animation runs at some width", () => {
+    const byVp = {
+      375: { animationName: "track", animationIterationCount: "infinite", transform: "matrix(1, 0, 0, 1, -284.025, 0)" } as any,
+      768: { animationName: "track", animationIterationCount: "infinite", transform: "matrix(1, 0, 0, 1, -280.982, 0)" } as any,
+      1280: { animationName: "none", animationIterationCount: "1", transform: "matrix(1, 0, 0, 1, -9.94731, 0)" } as any,
+    };
+    neutralizeAnimatedTransforms(byVp as any);
+    assert.equal(byVp[375].transform, "none");
+    assert.equal(byVp[768].transform, "none");
+    assert.equal(byVp[1280].transform, "none", "the non-animated base residue is neutralized too");
+  });
+
+  it("leaves a static transform untouched when NO viewport carries an infinite animation", () => {
+    const byVp = {
+      375: { animationName: "none", animationIterationCount: "1", transform: "matrix(1, 0, 0, 1, -40, 0)" } as any,
+      1280: { animationName: "none", animationIterationCount: "1", transform: "matrix(1, 0, 0, 1, -40, 0)" } as any,
+    };
+    neutralizeAnimatedTransforms(byVp as any);
+    assert.equal(byVp[375].transform, "matrix(1, 0, 0, 1, -40, 0)", "a deliberate static offset is preserved");
+    assert.equal(byVp[1280].transform, "matrix(1, 0, 0, 1, -40, 0)");
+  });
+
+  it("does not fire for a FINITE animation (a one-shot entrance, not a perpetual marquee)", () => {
+    const byVp = {
+      375: { animationName: "slideIn", animationIterationCount: "1", transform: "matrix(1, 0, 0, 1, -100, 0)" } as any,
+      1280: { animationName: "slideIn", animationIterationCount: "1", transform: "matrix(1, 0, 0, 1, -100, 0)" } as any,
+    };
+    neutralizeAnimatedTransforms(byVp as any);
+    assert.equal(byVp[375].transform, "matrix(1, 0, 0, 1, -100, 0)", "finite animations own a settled end state, not a perpetual phase");
   });
 });

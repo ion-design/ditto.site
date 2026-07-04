@@ -1540,6 +1540,18 @@ function contentSizedFlexRow(container: IRNode, viewports: number[]): Set<string
   for (const vp of viewports) for (const it of items) {
     const cs = it.computedByVp[vp]; if (cs && pf(cs.flexGrow) > 0) return null;
   }
+  // The sizing probe is ground truth: if it proved `width:auto` does NOT reproduce an item's width at
+  // any painted viewport (`wAuto:false`), that item is load-bearing and cannot be dropped. Because this
+  // rule is all-or-nothing per line (dropping a subset shifts siblings via justify-content), one such
+  // item vetoes the whole line. This catches a wrapping-text item — e.g. a paragraph in a
+  // `justify-content:flex-end` row paints at its balanced-wrap width (below max-content), but
+  // `width:auto` on the block child fills the line to max-content — which the geometric slack test
+  // alone (no shrink fired) would wrongly convert to auto.
+  for (const it of items) {
+    for (const vp of viewports) {
+      if (it.sizingByVp?.[vp]?.wAuto === false) return null;
+    }
+  }
   // At every width: the visible items + gaps + margins must not overflow the container (slack ≥ 0).
   for (const vp of viewports) {
     const pcs = container.computedByVp[vp]; const pb = container.bboxByVp[vp];
@@ -1923,6 +1935,12 @@ function contentSizedFlexItemAuto(node: IRNode, parentNode: IRNode | undefined, 
     const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp];
     const nb = node.bboxByVp[vp]; const pb = parentNode.bboxByVp[vp];
     if (!cs || !pcs || !nb || !pb || !node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    // The sizing probe is ground truth: if it proved `width:auto` does NOT reproduce the captured
+    // width at any painted viewport (`wAuto:false`), the geometric "never shrank ⇒ at content size"
+    // read below is wrong — e.g. a wrapping paragraph in a `justify-content:flex-end` row paints at
+    // its balanced-wrap width (below max-content), but `width:auto` on the block child fills the line
+    // to max-content and left-aligns it. Honor the probe over the heuristic.
+    if (node.sizingByVp?.[vp]?.wAuto === false) return false;
     if (!/^(flex|inline-flex)$/.test(pcs.display || "")) return false;
     const dir = pcs.flexDirection || "row";
     if (dir !== "row" && dir !== "row-reverse") return false;        // width = main axis only for rows
@@ -2218,11 +2236,22 @@ function confersDefiniteHeight(node: IRNode, parentNode: IRNode | undefined, got
  *  change. transform-origin follows transform (skipped when no transform varies). */
 const ANIM_OWNED = new Set(["opacity", "transform"]);
 const EMPTY_SET = new Set<string>();
-function animOwnedProps(node: IRNode, baseVp: number): Set<string> {
-  const cs = node.computedByVp[baseVp];
-  if (!cs || (cs.animationName || "none") === "none") return EMPTY_SET;
-  if (!/infinite/.test(cs.animationIterationCount || "1")) return EMPTY_SET;
-  return ANIM_OWNED;
+/** True when an INFINITE CSS animation is active on the node at this viewport (so it perpetually
+ *  drives opacity/transform — the captured value is a frozen animation phase, not design). */
+function hasInfiniteAnim(cs: StyleMap | undefined): boolean {
+  if (!cs || (cs.animationName || "none") === "none") return false;
+  return /infinite/.test(cs.animationIterationCount || "1");
+}
+/** Properties an infinite animation owns (so their per-viewport captured values are frozen phase
+ *  noise to suppress). Sampled across ALL emitted viewports, not just the base: a CSS marquee that
+ *  runs only below a breakpoint (Webflow's `max-lg` logo/text tracks) is `animation:none` at the
+ *  base (desktop) width but still freezes a random `translateX` at the mobile/tablet bands — banding
+ *  those bakes a mid-scroll offset that shifts content offscreen at rest. When the animation owns the
+ *  transform at ANY width, the frozen per-band deltas are dropped everywhere and the base value holds
+ *  (the runtime `@keyframes` starts at translateX(0), so the strip renders aligned until it animates). */
+function animOwnedProps(node: IRNode, viewports: number[]): Set<string> {
+  for (const vp of viewports) if (hasInfiniteAnim(node.computedByVp[vp])) return ANIM_OWNED;
+  return EMPTY_SET;
 }
 
 
@@ -3292,7 +3321,10 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       dropInsets.delete("bottom");
       dropInsets.delete("left");
     }
-    const animOwned = animOwnedProps(node, baseVp); // opacity/transform driven by an infinite animation
+    // opacity/transform driven by an infinite animation at the base OR any emitted band (a marquee
+    // gated to a breakpoint owns the transform only where it runs, but freezes a mid-scroll offset
+    // at the OTHER bands — suppress those frozen deltas at every width).
+    const animOwned = animOwnedProps(node, [baseVp, ...bands.map((b) => b.vp)]);
     const baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform), tokenResolver);
     const nr: NodeRule = { base: baseDecls, bands: [] };
 

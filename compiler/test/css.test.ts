@@ -617,3 +617,82 @@ describe("collectNodeRules lottie mount height pin", () => {
     assert.ok(!/227px/.test(all), `without the mount flag the varying height should flow, got: ${all}`);
   });
 });
+
+// Defect E — a content-sized flex ROW's items are dropped to `width:auto` only when NO shrink fired
+// (positive slack ⇒ items at content size). But a WRAPPING text leaf paints at its balanced-wrap
+// width, which is BELOW its max-content: `width:auto` on the block child fills the line to
+// max-content and left-aligns it, so the narrow right-pushed paragraph blows out to full-width. The
+// sizing probe already read `wAuto:false` (auto does NOT reproduce the width); it must veto the
+// whole line (the rule is all-or-nothing — dropping a subset shifts siblings via justify-content).
+describe("generateCss content-sized flex row (probe veto for wrapping text)", () => {
+  // One <p> child, sole item of a `flex; justify-content:flex-end` row, `flex:0 1 auto`, that paints
+  // narrower than the container at every width (wraps below max-content) with positive slack.
+  function missionRow(pSizing: RawSizing) {
+    const p = xNode("n1", "p", {
+      375: { cs: { display: "block", flexGrow: "0", flexShrink: "1", flexBasis: "auto", width: "276px" }, bbox: { x: 69, y: 0, width: 276, height: 80 }, sizing: pSizing },
+      768: { cs: { display: "block", flexGrow: "0", flexShrink: "1", flexBasis: "auto", width: "529.922px" }, bbox: { x: 176, y: 0, width: 529.92, height: 60 }, sizing: pSizing },
+      1280: { cs: { display: "block", flexGrow: "0", flexShrink: "1", flexBasis: "auto", width: "774.141px" }, bbox: { x: 455, y: 0, width: 774.14, height: 40 }, sizing: pSizing },
+    }, [{ text: "Our UX staffing and recruiting teams place the best talent from around the world." }]);
+    return xNode("n0", "body", {
+      375: { cs: { display: "flex", flexDirection: "row", justifyContent: "flex-end" }, bbox: { x: 0, y: 0, width: 375, height: 80 } },
+      768: { cs: { display: "flex", flexDirection: "row", justifyContent: "flex-end" }, bbox: { x: 0, y: 0, width: 706.56, height: 60 } },
+      1280: { cs: { display: "flex", flexDirection: "row", justifyContent: "flex-end" }, bbox: { x: 0, y: 0, width: 1228.81, height: 40 } },
+    }, [p]);
+  }
+
+  it("keeps a width on a wrapping paragraph the probe proved is not auto-reproducible", () => {
+    // Probe ground truth: width:auto does NOT reproduce (wAuto:false) — the painted width is the
+    // balanced-wrap width, below max-content (wMax).
+    const notAuto = (): RawSizing => ({ wAuto: false, wFill: false, hAuto: true, hFill: false, wMin: 95.88, wMax: 706.56 });
+    const css = generateCss(xIr(missionRow(notAuto())), new Map());
+    const all = allRulesX(css, "n1");
+    // It must NOT be emitted as content-auto (which drops width entirely and fills the line). The
+    // width plan falls to a real width — a fluid percentage or baked px — so the narrow column survives.
+    assert.ok(/width:/.test(all), `wrapping paragraph must keep a width, not collapse to auto, got: ${all}`);
+    assert.ok(!/width:auto/.test(all), `probe said wAuto:false — must not emit width:auto, got: ${all}`);
+  });
+
+  it("still drops width:auto on a genuinely content-sized row item the probe confirms", () => {
+    // Probe agrees width:auto reproduces (wAuto:true) — a toolbar/menu item whose width is its
+    // content. The content-sized-flex-row law should still fire and emit auto (no baked px band).
+    const isAuto = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false, wMin: 95.88, wMax: 706.56 });
+    const css = generateCss(xIr(missionRow(isAuto())), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/width:\d/.test(all), `content-sized item must drop its baked px width, got: ${all}`);
+  });
+});
+
+// Defect C (generate side) — a CSS marquee (infinite `@keyframes` animation) gated to a breakpoint
+// (Webflow's `max-lg` logo/text tracks) is `animation:none` at the base but runs at the narrow band.
+// The per-band transform delta at the animated width is a FROZEN mid-scroll phase; it must be
+// suppressed so the base holds and the runtime keyframes drive the transform (from translateX(0)).
+// (The upstream normalize pass zeroes the base residue — see neutralizeAnimatedTransforms; here the
+// base is already `none`, and this test covers the band-delta suppression.)
+describe("generateCss breakpoint-gated marquee transform band suppression (Defect C)", () => {
+  function logoStrip() {
+    const strip = xNode("n1", "div", {
+      375: { cs: { display: "grid", animationName: "track", animationIterationCount: "infinite", animationDuration: "35s", transform: "matrix(1, 0, 0, 1, -284.025, 0)" }, bbox: { x: 0, y: 0, width: 345, height: 100 } },
+      768: { cs: { display: "grid", animationName: "track", animationIterationCount: "infinite", animationDuration: "35s", transform: "matrix(1, 0, 0, 1, -280.982, 0)" }, bbox: { x: 0, y: 0, width: 706, height: 100 } },
+      1280: { cs: { display: "grid", animationName: "none", animationIterationCount: "1", transform: "none" }, bbox: { x: 0, y: 0, width: 1228, height: 145 } },
+    });
+    return xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 100 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 100 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 145 } } }, [strip]);
+  }
+
+  it("does not bake the frozen mid-scroll translateX at the animated band", () => {
+    const css = generateCss(xIr(logoStrip()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/matrix\(1, ?0, ?0, ?1, ?-\d/.test(all), `frozen marquee translateX must not be emitted at any band, got: ${all}`);
+  });
+
+  it("keeps a per-band transform of a NON-animated element", () => {
+    // A non-animated element whose transform genuinely varies per band keeps it (no animation owns it).
+    const el = xNode("n1", "div", {
+      375: { cs: { transform: "matrix(1, 0, 0, 1, -40, 0)" }, bbox: { x: -40, y: 0, width: 345, height: 100 } },
+      768: { cs: { transform: "none" }, bbox: { x: 0, y: 0, width: 706, height: 100 } },
+      1280: { cs: { transform: "none" }, bbox: { x: 0, y: 0, width: 1228, height: 100 } },
+    });
+    const root = xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 100 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 100 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 100 } } }, [el]);
+    const css = generateCss(xIr(root), new Map());
+    assert.ok(/matrix\(1, ?0, ?0, ?1, ?-40/.test(allRulesX(css, "n1")), `a non-animated per-band offset must be kept, got: ${allRulesX(css, "n1")}`);
+  });
+});
