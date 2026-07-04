@@ -163,6 +163,54 @@ describe("graftFrameIntoSnapshot", () => {
     graftFrameIntoSnapshot(host, { idx: 0, contentX: 40, contentY: 30 }, frame);
     assert.ok(host.keyframes.includes("@keyframes spin { to { transform: rotate(360deg); } }"));
   });
+
+  // A frame's `position: fixed` chrome pins to the FRAME viewport, not the page's. Grafted
+  // as plain DOM, `fixed` would resolve against the main page viewport and escape the
+  // iframe's clip box — the observed regression: a gallery embed's
+  // `fixed inset-0 z-[-1]` dark backdrop painted the whole clone dark. It must be demoted
+  // to `absolute` so the host box contains and clips it.
+  it("demotes frame `position: fixed` to `absolute` so it stays inside the iframe box", () => {
+    const backdrop = raw("div", { class: "backdrop" }, [], {
+      computed: { display: "block", position: "fixed" },
+      bbox: { x: 0, y: 0, width: 320, height: 160 },
+    });
+    const frame = pageSnap(raw("body", {}, [backdrop]), "https://frame.test/embed");
+    const host = mkHost();
+    graftFrameIntoSnapshot(host, { idx: 0, contentX: 40, contentY: 30 }, frame);
+    const wrapper = findFrameNode(host.root, 0)!.children[0] as RawNode;
+    const grafted = wrapper.children[0] as RawNode;
+    assert.equal(grafted.computed.position, "absolute");
+  });
+
+  it("demotes frame `position: sticky` to `relative` (no sticking to the page scroll)", () => {
+    const bar = raw("div", { class: "sticky-bar" }, [], {
+      computed: { display: "block", position: "sticky" },
+      bbox: { x: 0, y: 0, width: 320, height: 40 },
+    });
+    const frame = pageSnap(raw("body", {}, [bar]), "https://frame.test/embed");
+    const host = mkHost();
+    graftFrameIntoSnapshot(host, { idx: 0, contentX: 40, contentY: 30 }, frame);
+    const wrapper = findFrameNode(host.root, 0)!.children[0] as RawNode;
+    const grafted = wrapper.children[0] as RawNode;
+    assert.equal(grafted.computed.position, "relative");
+  });
+
+  it("promotes a `static` host to `relative` so demoted absolutes anchor to the frame box", () => {
+    const host = mkHost(); // iframe host computed.position defaults to "static"
+    graftFrameIntoSnapshot(host, { idx: 0, contentX: 40, contentY: 30 }, mkFrame());
+    assert.equal(findFrameNode(host.root, 0)!.computed.position, "relative");
+  });
+
+  it("leaves an already-positioned host's position untouched", () => {
+    const host = pageSnap(raw("body", {}, [
+      raw("iframe", { "data-ditto-frame": "0", src: "https://frame.test/embed" }, [], {
+        computed: { display: "block", position: "absolute" },
+        bbox: { x: 40, y: 30, width: 320, height: 160 },
+      }),
+    ]));
+    graftFrameIntoSnapshot(host, { idx: 0, contentX: 40, contentY: 30 }, mkFrame());
+    assert.equal(findFrameNode(host.root, 0)!.computed.position, "absolute");
+  });
 });
 
 // ---- Cross-origin integration: capture → snapshot graft → IR → generated tag ----

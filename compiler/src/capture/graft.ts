@@ -171,6 +171,21 @@ export function graftFrameIntoSnapshot(
       x: Math.round((n.bbox.x + frame.contentX) * 100) / 100,
       y: Math.round((n.bbox.y + frame.contentY) * 100) / 100,
     };
+    // Rebase viewport-relative positioning into the frame's box. Inside a real iframe,
+    // `position: fixed` pins to the FRAME's viewport (its content box) and `sticky` scrolls
+    // against the FRAME's scroll container. Grafted in as plain <div> children, those
+    // containing blocks no longer exist, so `fixed` would resolve against the MAIN page
+    // viewport — escaping the iframe's clip box (fixed ignores `overflow:hidden` ancestors)
+    // and painting frame chrome (e.g. a `fixed inset-0 z-[-1]` dark backdrop) across the
+    // whole clone. Demote to box-relative positioning: `fixed`→`absolute` (contained and
+    // clipped by the host div, whose bboxes are already rebased to page coords) and
+    // `sticky`→`relative` (stays in flow instead of sticking to the page scroll). The host
+    // is made a containing block below so these absolutes anchor to the frame box.
+    if (n.computed) {
+      const pos = n.computed.position;
+      if (pos === "fixed") n.computed = { ...n.computed, position: "absolute" };
+      else if (pos === "sticky") n.computed = { ...n.computed, position: "relative" };
+    }
     const a = n.attrs ?? {};
     delete a["data-cid-cap"]; // capture-ids belong to the main document only
     if (a.id) a.id = prefix + a.id;
@@ -190,8 +205,13 @@ export function graftFrameIntoSnapshot(
 
   host.children = [wrapper];
   // A real frame viewport clips its document; the replacement <div> must too, at every
-  // captured viewport (each per-viewport snapshot is grafted independently).
+  // captured viewport (each per-viewport snapshot is grafted independently). It must also
+  // be a containing block: `visit` demoted the frame's `position: fixed` chrome (which was
+  // pinned to the frame viewport) to `absolute`, and those absolutes must anchor to — and
+  // be clipped by — this box, not some positioned ancestor further up the page. A `static`
+  // host wouldn't establish that containing block, so promote it to `relative`.
   host.computed = { ...host.computed, overflow: "hidden", overflowX: "hidden", overflowY: "hidden" };
+  if ((host.computed.position || "static") === "static") host.computed.position = "relative";
   // An iframe is a REPLACED element: `display:inline` (the default) still honors its
   // width/height. The <div> that replaces it at generation is not — inline would collapse
   // the box — so translate to the behavior-equivalent inline-block.
