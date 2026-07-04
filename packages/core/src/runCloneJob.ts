@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, cpSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { constants as fsConstants, mkdtempSync, rmSync, cpSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -54,7 +54,9 @@ function persistCapture(srcDir: string | undefined, dest: string): void {
   if (!srcDir || !existsSync(join(srcDir, "capture", "capture-result.json"))) return;
   mkdirSync(dirname(dest), { recursive: true });
   rmSync(dest, { recursive: true, force: true });
-  cpSync(srcDir, dest, { recursive: true });
+  // Copy-on-write clone where the filesystem supports it (heavy captures are
+  // >100MB); COPYFILE_FICLONE falls back to a plain copy elsewhere.
+  cpSync(srcDir, dest, { recursive: true, mode: fsConstants.COPYFILE_FICLONE });
 }
 
 /** Whether a cached capture can substitute for a fresh one under these options.
@@ -111,11 +113,12 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
     let routes: RouteInfo[] | undefined;
     let sanity: CaptureSanity;
     let captureReused = false;
-    // The compiler emits `captured` when the live phase ends; timestamping it splits
-    // the capture/generate wall-clock that used to be lumped into captureMs.
+    // The compiler emits `capture_done` when ALL capture work ends (asset fallback,
+    // SEO fetches, evidence freeze included — captureSite's per-viewport `captured`
+    // events fire earlier); timestamping it splits captureMs/generateMs truthfully.
     let capturedTs: number | undefined;
     const timedLog = (e: Record<string, unknown>) => {
-      if (e.event === "captured" && capturedTs === undefined) capturedTs = Date.now();
+      if (e.event === "capture_done" && capturedTs === undefined) capturedTs = Date.now();
       log(e);
     };
     // Persistent entry-capture cache (the single→multi speed path), keyed by URL.
@@ -179,6 +182,9 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
         humanizeMode: options.styling,
         framework: options.framework,
         screenshots: captureValidationArtifacts,
+        // The band-edge sweep costs ~4s and its output has no consumer for a
+        // single-viewport clone — skip it on that fast path.
+        breakpoints: (options.viewports?.length ?? 4) > 1,
         reuseSource,
         log: timedLog,
       });

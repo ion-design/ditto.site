@@ -878,6 +878,43 @@ export async function captureSite(opts: {
       log({ event: "captured", viewport: vw, nodes: snapshot.doc.nodeCount, scrollHeight: snapshot.doc.scrollHeight });
     }
 
+    // Conditional-asset sweep: harvest lazy refs the scroll pass never fired
+    // (data-src / data-bg aliases, srcset variants, loading=lazy images). They are
+    // only RECORDED here — the fallback downloader below fetches whatever the
+    // network listener didn't store, so this is purely additive discovery. Gate 2b's
+    // `untracked` metric measures exactly this gap.
+    try {
+      const lazyRefs = await page.evaluate(() => {
+        const urls = new Set<string>();
+        const push = (v: string | null | undefined) => {
+          if (!v || v.startsWith("data:")) return;
+          try { urls.add(new URL(v, location.href).href) } catch { /* ignore */ }
+        };
+        const LAZY_ATTRS = ["data-src", "data-lazy-src", "data-original", "data-bg", "data-background", "data-background-image"];
+        for (const el of Array.from(document.querySelectorAll(LAZY_ATTRS.map((a) => `[${a}]`).join(",")))) {
+          for (const a of LAZY_ATTRS) push(el.getAttribute(a));
+        }
+        for (const el of Array.from(document.querySelectorAll("img[srcset], source[srcset], [data-srcset]"))) {
+          const ss = el.getAttribute("srcset") ?? el.getAttribute("data-srcset") ?? "";
+          for (const part of ss.split(",")) push(part.trim().split(/\s+/)[0]);
+        }
+        for (const img of Array.from(document.querySelectorAll<HTMLImageElement>("img[loading=lazy]"))) push(img.currentSrc || img.src);
+        return [...urls].sort();
+      });
+      let swept = 0;
+      for (const url of lazyRefs) {
+        if (swept >= 100) break; // bound pathological pages; fallback fetch is 30s/asset
+        if (!/^https?:\/\//i.test(url) || assetMap.has(url)) continue;
+        const t = classifyAsset(url, null);
+        if (!t || !["image", "svg", "video", "font", "lottie"].includes(t)) continue;
+        recordAsset(url, t, null, null, "lazy-sweep");
+        swept++;
+      }
+      if (swept) log({ event: "lazy_sweep", recorded: swept, seen: lazyRefs.length });
+    } catch (e) {
+      log({ event: "lazy_sweep_error", error: String(e).slice(0, 160) });
+    }
+
     // Browser-as-oracle: discover the source's real responsive band edges by sweeping the viewport
     // and binary-searching each width where the discrete (media-query-toggled) layout signature
     // changes. Read-only and bounded; runs once here — overlays are dismissed and the DOM settled, so

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S npx tsx
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { captureSite, REQUIRED_VIEWPORTS, SAMPLE_VIEWPORTS, type CaptureResult } from "./capture/capture.js";
 import { fileURLToPath } from "node:url";
 import { generateAll } from "./generate/pipeline.js";
@@ -26,6 +26,8 @@ export type CloneOptions = {
                     // ON by default at the CLI (--no-reflow to disable); persisted per-run in clone-options.json.
   screenshots?: boolean; // capture per-viewport screenshots (default on); --no-screenshots skips them for a
                          // faster production clone (validation-only artifact — generation ignores pixels).
+  breakpoints?: boolean; // discover real responsive band edges via a viewport sweep (default on; evidence-only
+                         // today — single-viewport service clones skip it to save ~4s).
   log?: (event: Record<string, unknown>) => void;
 };
 
@@ -437,9 +439,12 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
     // For simplicity the IR is built from reuseSource and other artifacts written into runDir.
     copySourceRef(opts.reuseSource, sourceDir);
   } else {
-    capture = await captureSite({ url: opts.url, outDir: sourceDir, viewports: captureViewports, interactions: opts.interactions, motion: opts.motion, screenshots: opts.screenshots, log: logBoth });
+    capture = await captureSite({ url: opts.url, outDir: sourceDir, viewports: captureViewports, interactions: opts.interactions, motion: opts.motion, screenshots: opts.screenshots, breakpoints: opts.breakpoints, log: logBoth });
   }
-  logBoth({ event: "captured", reused: !!opts.reuseSource });
+  // NOTE: distinct from captureSite's per-viewport `captured` events — this marks
+  // the END of all capture work (incl. asset fallback + SEO fetches + evidence
+  // freeze) and is what the service layer splits captureMs/generateMs on.
+  logBoth({ event: "capture_done", reused: !!opts.reuseSource });
 
   // Stage 4.5: persist the component-extraction choice in the source dir so every
   // generateAll for this run (deliverable + determinism/prune regens, possibly in a
@@ -476,10 +481,12 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
 }
 
 function copySourceRef(from: string, to: string): void {
-  // Symlink-free copy of the whole source dir for self-contained runs.
+  // Symlink-free copy of the whole source dir for self-contained runs. FICLONE
+  // makes it a copy-on-write clone on APFS/btrfs/XFS (heavy captures are >100MB)
+  // and silently falls back to a plain copy elsewhere.
   if (resolve(from) === resolve(to)) return;
   ensureDir(to);
-  cpSync(from, to, { recursive: true });
+  cpSync(from, to, { recursive: true, mode: fsConstants.COPYFILE_FICLONE });
 }
 
 /** Latest prior run's source/ dir for a URL (for --reuse: regenerate, skip capture). */
