@@ -762,6 +762,57 @@ function sourceFluidLengthSuffix(suffix: string): boolean {
   return /(%|vw|vh|svw|lvw|dvw|svh|lvh|dvh|fr|min-content|max-content|fit-content)/.test(inner);
 }
 
+// A FIXED, definite authored length suffix on a `w-`/`h-` utility: an arbitrary `[<px|rem|em|…>]`, the
+// `px` token (1px), or a numeric spacing-scale token (`24`, `2.5` → fixed rem). Unlike
+// sourceFluidLengthSuffix these do NOT re-derive from the container, so the source-intent pass must
+// re-emit them as the CAPTURED computed px (the clone's root font-size may differ from the source's, so
+// echoing `h-[4rem]` verbatim would mis-size), and only where geometry corroborates the resolved box.
+function sourceFixedLengthSuffix(suffix: string): boolean {
+  const inner = sourceArbitraryInner(suffix);
+  if (inner !== null) {
+    const v = inner.trim().toLowerCase();
+    if (/^var\(/.test(v)) return false;                                  // handled by the var-length path
+    if (/%|vw|vh|vmin|vmax|svw|lvw|dvw|svh|lvh|dvh|\bfr\b|min-content|max-content|fit-content/.test(v)) return false;
+    return /(?:^|[\s(*/+-])[\d.]+(?:px|rem|em|cm|mm|in|pt|pc|ex|ch|q)\b/.test(v);
+  }
+  if (suffix === "px") return true;
+  return /^\d+(?:\.\d+)?$/.test(suffix);
+}
+
+// A `w-`/`h-` utility carrying a fixed authored length (as recognised by sourceFixedLengthSuffix).
+function isFixedLengthUtil(util: string): boolean {
+  const m = /^([wh])-(.+)$/.exec(util);
+  return !!m && sourceFixedLengthSuffix(m[2]!);
+}
+
+// The captured computed px on this axis is definite and matches the measured bbox — i.e. the authored
+// fixed length resolved to the box the capture recorded. Geometry corroboration for a fixed w/h util.
+function fixedLengthResolvesToBox(node: IRNode, axis: "w" | "h", vp: number): boolean {
+  const cs = node.computedByVp[vp]; const b = node.bboxByVp[vp];
+  if (!cs || !b) return false;
+  const val = axis === "h" ? cs.height : cs.width;
+  const ext = axis === "h" ? b.height : b.width;
+  if (!val || val === "auto" || !/px$/.test(val)) return false;
+  if (!(ext > 0)) return false;
+  return Math.abs(pf(val) - ext) <= Math.max(1.5, 0.01 * ext);
+}
+
+// Rewrite a fixed-length `w-`/`h-` source utility to the node's CAPTURED computed px at a viewport,
+// preserving any variant prefix. `h-[4rem]` → `h-[60px]` (the source resolved 4rem against a 15px root;
+// the clone's root may differ, so bake the measured px). Returns the utility unchanged when it is not a
+// fixed-length util or the computed px is unavailable.
+function fixedLengthUtilAsPx(util: string, node: IRNode, vp: number): string {
+  const m = VARIANT_PREFIX.exec(util);
+  const prefix = m ? m[1]! : "";
+  const core = m ? m[2]! : util;
+  const sm = /^([wh])-(.+)$/.exec(core);
+  if (!sm || !sourceFixedLengthSuffix(sm[2]!)) return util;
+  const val = sm[1] === "h" ? node.computedByVp[vp]?.height : node.computedByVp[vp]?.width;
+  if (!val || !/px$/.test(val)) return util;
+  const px = Math.round(pf(val) * 100) / 100;
+  return `${prefix}${sm[1]}-[${px}px]`;
+}
+
 function sourceAspectUtility(core: string): string | null {
   let m = /^aspect-(\d+)\/(\d+)-box$/.exec(core);
   if (m) return m[1] === m[2] ? "aspect-square" : `aspect-[${m[1]}/${m[2]}]`;
@@ -793,7 +844,7 @@ function sourceAxisForCore(core0: string): { axis: SourceAxis; utility: string }
   const maxH = /^max-h-(.+)$/.exec(core);
   if (maxH && sourceFluidLengthSuffix(maxH[1]!)) return { axis: "max-h", utility: core };
   const size = /^([wh])-(.+)$/.exec(core);
-  if (size && sourceFluidLengthSuffix(size[2]!)) return { axis: size[1] as SourceAxis, utility: core };
+  if (size && (sourceFluidLengthSuffix(size[2]!) || sourceFixedLengthSuffix(size[2]!))) return { axis: size[1] as SourceAxis, utility: core };
   return null;
 }
 
@@ -957,6 +1008,12 @@ function sourceAxisCompatible(node: IRNode, parent: IRNode | undefined, axis: So
       if (axis === "h" && v === "h-full") return !!s?.hFill;
       if (axis === "h" && v === "h-auto") return !!s?.hAuto;
       if (axis === "h" && v && sourceVarName(v)) return /px$/.test(node.computedByVp[vp]?.height || "");
+      // A FIXED authored length (`h-[4rem]`, `w-24`, `h-px`) — the source-intent pass will re-emit it as
+      // the captured computed px. Compatible when that px is definite and equals the measured bbox extent
+      // at this viewport (the authored length actually resolved to the captured box). This recovers a
+      // banded authored fixed height/width the sizing probe dropped through the fill↔content cycle
+      // (h-full) or the content/fill drop (auto), without depending on the clone's root font-size.
+      if (v && isFixedLengthUtil(v)) return fixedLengthResolvesToBox(node, axis, vp);
       return false;
     });
   }
@@ -1023,13 +1080,18 @@ function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewpor
       continue;
     }
     if (!sourceAxisCompatible(node, parent, axis, byVp, viewports)) continue;
-    const base = byVp.get(canonical)!;
+    // A fixed-length w/h axis re-emits the CAPTURED computed px per band (root-font-size independent),
+    // not the source rem token; every other axis keeps its authored utility verbatim.
+    const asEmit = (vp: number): string =>
+      (axis === "w" || axis === "h") && isFixedLengthUtil(byVp.get(vp)!)
+        ? fixedLengthUtilAsPx(byVp.get(vp)!, node, vp) : byVp.get(vp)!;
+    const base = asEmit(canonical);
     axes.add(axis);
     if (axis === "aspect") axes.add("grid-rows");
     utilities.push(base);
     for (const b of bands) {
       if (!b.media) continue;
-      const v = byVp.get(b.vp)!;
+      const v = asEmit(b.vp);
       if (v !== base) utilities.push(prefixFor(b.media) + v);
     }
     css.push(...sourceIntentVarCss(node, axis, byVp, viewports, canonical));

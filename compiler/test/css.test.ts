@@ -985,6 +985,100 @@ describe("generateCss own-probe height trust never bakes a page-height wrapper (
   });
 });
 
+// FIX 1 — a banded AUTHORED fixed height (`h-[4rem] sm:h-[4.5rem] md:h-[6.25rem]`) on a grid/flex item
+// whose fill child reproduces the box height (the fill↔content cycle: hFill:true) must NOT collapse to
+// `height:100%`. The source authors a definite per-band height, geometry corroborates it (computed px ==
+// bbox at every vp), so the baked per-band px must survive instead of the probe's circular fill verdict.
+describe("generateCss authored banded fixed height survives the fill cycle (FIX 1)", () => {
+  const cycle = (): RawSizing => ({ wAuto: false, wFill: true, hAuto: false, hFill: true });
+  function tile(): IRNode {
+    // Inner filler: height:100% child (the fill side of the cycle).
+    const inner = xNode("n2", "span", Object.fromEntries(XVPS.map((vp) => [vp, {
+      cs: { display: "block", position: "static", height: "100%" },
+      bbox: { x: 0, y: 0, width: 100, height: vp === 375 ? 60 : vp === 768 ? 93.75 : 100 },
+    }])));
+    const t = xNode("n1", "div", {
+      375: { cs: { display: "flex", position: "static", height: "60px" }, bbox: { x: 0, y: 0, width: 100, height: 60 }, sizing: cycle() },
+      768: { cs: { display: "flex", position: "static", height: "93.75px" }, bbox: { x: 0, y: 0, width: 100, height: 93.75 }, sizing: cycle() },
+      1280: { cs: { display: "flex", position: "static", height: "100px" }, bbox: { x: 0, y: 0, width: 100, height: 100 }, sizing: cycle() },
+    }, [inner]);
+    t.srcClass = "px-2 flex h-[4rem] w-full items-center justify-center sm:h-[4.5rem] md:h-[6.25rem]";
+    // Grid parent that confers a definite height at every band, so isHeightFill/heightProbeFills would
+    // otherwise drop the tile to h-full.
+    return xNode("n0", "div", {
+      375: { cs: { display: "grid", position: "static", height: "60px" }, bbox: { x: 0, y: 0, width: 375, height: 60 } },
+      768: { cs: { display: "grid", position: "static", height: "93.75px" }, bbox: { x: 0, y: 0, width: 768, height: 93.75 } },
+      1280: { cs: { display: "grid", position: "static", height: "100px" }, bbox: { x: 0, y: 0, width: 1280, height: 100 } },
+    }, [t]);
+  }
+
+  it("keeps the baked per-band px height and never emits height:100%", () => {
+    const css = generateCss(xIr(tile()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/height:100%/.test(all), `authored fixed-height tile must not collapse to h-full, got: ${all}`);
+    assert.ok(/height:60px/.test(all), `375 band height (60px) must survive, got: ${all}`);
+    assert.ok(/height:93\.75px/.test(all), `768 band height (93.75px) must survive, got: ${all}`);
+    assert.ok(/height:100px/.test(all), `desktop band height (100px) must survive, got: ${all}`);
+  });
+});
+
+// FIX 3 — a testimonial-avatar wrapper authors a fixed square (`h-[2.5rem] w-[2.5rem] shrink-0`) whose
+// img child fills it, so the sizing probe reads hAuto/wAuto:true and would drop BOTH dimensions, letting
+// the box collapse to the img's intrinsic size. With geometry corroboration (computed px == bbox at
+// every vp), the authored fixed width AND height must be emitted.
+describe("generateCss authored fixed avatar size survives the content drop (FIX 3)", () => {
+  const drop = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false });
+  function avatar(): IRNode {
+    const img = xNode("n2", "img", Object.fromEntries(XVPS.map((vp) => [vp, {
+      cs: { display: "block", position: "static", height: "100%", width: "100%" },
+      bbox: { x: 0, y: 0, width: vp === 1280 ? 40 : 37.5, height: vp === 1280 ? 40 : 37.5 },
+    }])));
+    const a = xNode("n1", "div", {
+      375: { cs: { display: "block", position: "static", height: "37.5px", width: "37.5px" }, bbox: { x: 0, y: 0, width: 37.5, height: 37.5 }, sizing: drop() },
+      768: { cs: { display: "block", position: "static", height: "37.5px", width: "37.5px" }, bbox: { x: 0, y: 0, width: 37.5, height: 37.5 }, sizing: drop() },
+      1280: { cs: { display: "block", position: "static", height: "40px", width: "40px" }, bbox: { x: 0, y: 0, width: 40, height: 40 }, sizing: drop() },
+    }, [img]);
+    a.srcClass = "avatar-border-container h-[2.5rem] w-[2.5rem] shrink-0";
+    return xNode("n0", "div", Object.fromEntries(XVPS.map((vp) => [vp, { cs: { display: "flex", position: "static" }, bbox: { x: 0, y: 0, width: vp, height: 40 } }])), [a]);
+  }
+
+  it("emits both the authored fixed width and height per band", () => {
+    const css = generateCss(xIr(avatar()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/width:37\.5px/.test(all), `narrow-band width (37.5px) must survive, got: ${all}`);
+    assert.ok(/height:37\.5px/.test(all), `narrow-band height (37.5px) must survive, got: ${all}`);
+    assert.ok(/width:40px/.test(all), `desktop width (40px) must survive, got: ${all}`);
+    assert.ok(/height:40px/.test(all), `desktop height (40px) must survive, got: ${all}`);
+  });
+});
+
+// FIX 2 — aspectHeightLaw must account for the aspect-ratio↔max-height WIDTH transfer. At a
+// max-height-clamped viewport, choosing a ratio also caps the width at ratio×maxH; a square ratio for a
+// 1.66:1 box (w=698, h=maxH=420) satisfies the height-only check but would clamp the clone's width to
+// 420. The law must reject that ratio (and fall back to explicit per-band dimensions) rather than emit a
+// wrong aspect-square.
+describe("generateCss aspectHeightLaw rejects width-clamping ratio transfer (FIX 2)", () => {
+  function photo(): IRNode {
+    // 375: genuinely square, unclamped (304.69²). 768: 1.66:1 but height clamped to max-h 420 (w=698).
+    // 1280: genuinely square, unclamped (372²). The 768 clamp must not license aspect-square.
+    // Single-row grid (grid-template-rows == content height) so singleFluidGridRow fires and the
+    // media/aspect pass runs.
+    const container = xNode("n1", "div", {
+      375: { cs: { display: "grid", position: "static", maxHeight: "420px", aspectRatio: "auto", gridTemplateRows: "304.69px" }, bbox: { x: 0, y: 0, width: 304.69, height: 304.69 } },
+      768: { cs: { display: "grid", position: "static", maxHeight: "420px", aspectRatio: "auto", gridTemplateRows: "420px" }, bbox: { x: 0, y: 0, width: 697.69, height: 420 } },
+      1280: { cs: { display: "grid", position: "static", maxHeight: "none", aspectRatio: "auto", gridTemplateRows: "371.66px" }, bbox: { x: 0, y: 0, width: 371.66, height: 371.66 } },
+    });
+    return xNode("n0", "div", Object.fromEntries(XVPS.map((vp) => [vp, { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: vp, height: 500 } }])), [container]);
+  }
+
+  it("does not emit aspect-square for a box whose max-height clamp would shrink its width", () => {
+    const css = generateCss(xIr(photo()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/aspect-ratio:\s*1\s*\/\s*1/.test(all) && !/aspect-ratio:1\/1/.test(all),
+      `must not force aspect-square where the max-height transfer would clamp width, got: ${all}`);
+  });
+});
+
 // C1 (css side) — a computed `grid-template-rows: subgrid` is a STRUCTURAL keyword, not a baked px
 // regime. It must NEVER be dropped by the reflow-mode dropGridRows path (which strips px row tracks).
 describe("collectNodeRules never drops a subgrid rows template (C1)", () => {

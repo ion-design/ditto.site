@@ -882,7 +882,15 @@ function aspectHeightLaw(node: IRNode, viewports: number[]): Record<number, stri
     let chosen: { value: string; ratio: number } | undefined;
     for (const r of ordered) {
       const predicted = Math.min(s.w / r.ratio, s.maxH);
-      if (Math.abs(predicted - s.h) <= Math.max(1.5, 0.01 * s.h)) { chosen = r; break; }
+      if (Math.abs(predicted - s.h) > Math.max(1.5, 0.01 * s.h)) continue;
+      // Aspect-ratio + max-height also transfers into a max-WIDTH: per CSS transferred sizing, a box
+      // with `aspect-ratio:R` and `max-height:M` cannot exceed `R × M` wide (the height cap back-computes
+      // a width cap). The height-only check above accepts any ratio that makes min(w/R, M) ≈ h at a
+      // clamped viewport, but a ratio whose transferred max-width (R × M) is narrower than the measured
+      // box would clamp the clone's width below the source (a 1.66:1 box forced square to its 420px cap).
+      // Require the measured width to fit under the transferred cap at every clamped sample.
+      if (Number.isFinite(s.maxH) && s.w > r.ratio * s.maxH + Math.max(1.5, 0.01 * s.w)) continue;
+      chosen = r; break;
     }
     if (!chosen) return null;
     out[s.vp] = chosen.value;
@@ -1167,6 +1175,100 @@ function sourceFixedSizeIntent(node: IRNode): boolean {
   // padding (Astro integration tabs: `size-12 lg:size-16`). `size-fit` is deliberately excluded:
   // that one is content-derived and should stay auto.
   return /(?:^|\s)(?:[a-z0-9-]+:)*size-(?!fit(?:\s|$))\S+/.test(node.srcClass || "");
+}
+
+// An authored, definite length unit (px/rem/em/…) — the same predicate the capture-side probe uses to
+// call a dimension "load-bearing". Rejects auto/%/keywords and viewport/container units (those are
+// fluid laws the width/height passes already recover); a bare number (`0`) is not definite. Used to
+// read the arbitrary-value inner of a `h-[…]` / `w-[…]` source utility.
+function isDefiniteAuthoredLength(inner: string): boolean {
+  const v = inner.trim().toLowerCase();
+  if (!v) return false;
+  if (/^(auto|min-content|max-content|fit-content|inherit|initial|unset|revert)$/.test(v)) return false;
+  if (/%|vw|vh|vmin|vmax|svw|lvw|dvw|svh|lvh|dvh|\bfr\b/.test(v)) return false;
+  return /(?:^|[\s(*/+-])[\d.]+(?:px|rem|em|cm|mm|in|pt|pc|ex|ch|q)\b/.test(v);
+}
+
+/** Does the SOURCE class author an explicit, definite fixed height on this axis — `h-[<len>]`,
+ *  `min-h-[<len>]`, or the token forms (`h-<n>`, `h-px`) — at one or more breakpoints, corroborated by
+ *  geometry? This is the emission-side twin of the capture probe's authored-height guard: a banded
+ *  authored fixed height (`h-[4rem] sm:h-[4.5rem] md:h-[6.25rem]`) can still probe hFill/hAuto when the
+ *  box is a grid/flex item whose fill child (or stretched track) reproduces the box height — the
+ *  fill↔content cycle — so the probe alone would drop the baked band to `h-full`/auto. When the source
+ *  authors a definite height AND every painted viewport has a definite computed height matching its
+ *  bbox (the authored value actually resolved to that px), trust the baked per-band px. Geometry
+ *  corroboration keeps this from firing on a fluid/percentage box that merely mentions a fixed h-token
+ *  under an inactive variant. */
+function sourceFixedHeightIntent(node: IRNode, viewports: number[]): boolean {
+  if (REPLACED.has(node.tag) || node.tag === "canvas" || node.tag.includes("-")) return false;
+  if (!authorsFixedAxis(node.srcClass, "h")) return false;
+  return fixedAxisGeometryHolds(node, "h", viewports);
+}
+
+/** The WIDTH twin of sourceFixedHeightIntent: the source authors a definite `w-[<len>]`/`min-w-[<len>]`
+ *  (or token) width, corroborated by a definite computed width == bbox at every painted viewport. A
+ *  banded authored fixed width on a shrink-0 item (a testimonial avatar `h-[2.5rem] w-[2.5rem] shrink-0`
+ *  whose img child fills it) probes wAuto/wFill and would otherwise be dropped, collapsing the box to
+ *  its child's intrinsic size. Trust the authored fixed width. */
+function sourceFixedWidthIntent(node: IRNode, viewports: number[]): boolean {
+  if (REPLACED.has(node.tag) || node.tag === "canvas" || node.tag.includes("-")) return false;
+  if (!authorsFixedAxis(node.srcClass, "w")) return false;
+  return fixedAxisGeometryHolds(node, "w", viewports);
+}
+
+// True when the source class authors a definite fixed length on the given axis at any breakpoint:
+// `h-[4rem]` / `min-w-[24px]` (arbitrary), `h-px`, or a numeric token `w-24` (Tailwind's spacing scale
+// is a fixed rem length). `full`/`auto`/`screen`/fraction/`min`/`max`/`fit`/`svh`… tokens are fluid and
+// excluded. Variant-prefixed forms count (banded authored heights), matching the source-intent parser.
+function authorsFixedAxis(srcClass: string | undefined, axis: "h" | "w"): boolean {
+  if (!srcClass) return false;
+  for (const raw of srcClass.split(/\s+/).filter(Boolean)) {
+    const colon = lastTopLevelColon(raw);
+    const core = colon >= 0 ? raw.slice(colon + 1) : raw;
+    const m = new RegExp(`^(?:min-)?${axis}-(.+)$`).exec(core);
+    if (!m) continue;
+    const val = m[1]!;
+    if (val.startsWith("[") && val.endsWith("]")) {
+      if (isDefiniteAuthoredLength(val.slice(1, -1))) return true;
+      continue;
+    }
+    if (val === "px") return true;                 // 1px
+    if (/^\d+(?:\.\d+)?$/.test(val)) return true;   // spacing-scale token (fixed rem)
+  }
+  return false;
+}
+
+// Index of the variant/core separating colon at bracket depth 0 (so `h-[calc(1px:2)]` is not split on
+// an interior colon), mirroring parseSourceClass in the tailwind emitter.
+function lastTopLevelColon(raw: string): number {
+  let depth = 0, last = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (ch === "[" || ch === "(") depth++;
+    else if (ch === "]" || ch === ")") depth = Math.max(0, depth - 1);
+    else if (ch === ":" && depth === 0) last = i;
+  }
+  return last;
+}
+
+// Geometry corroboration for an authored fixed height/width: at EVERY painted viewport the node has a
+// definite (px, non-auto) computed value on the axis that equals its measured bbox extent. This proves
+// the authored fixed length actually resolved to the captured box (so the baked per-band px is the
+// authored value), not a fluid/percentage box that merely carries a fixed token under an inactive
+// variant. Requires ≥1 painted sample.
+function fixedAxisGeometryHolds(node: IRNode, axis: "h" | "w", viewports: number[]): boolean {
+  let painted = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const nb = node.bboxByVp[vp];
+    if (!cs || !nb || !node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    const val = axis === "h" ? cs.height : cs.width;
+    const ext = axis === "h" ? nb.height : nb.width;
+    if (!val || val === "auto" || !/px$/.test(val)) return false;
+    if (!(ext > 0)) return false;
+    if (Math.abs(pf(val) - ext) > Math.max(1.5, 0.01 * ext)) return false;
+    painted++;
+  }
+  return painted >= 1;
 }
 
 const ABSOLUTE_MEDIA_FILL_TAGS = new Set(["img", "picture", "video"]);
@@ -2352,6 +2454,7 @@ function declsForViewport(
   dropViewportMaxWidth = false,
   nowrapText = false,
   keepIdentityTransform = false,
+  forceHeight = false,
 ): Map<string, string> {
   const cs = node.computedByVp[vp];
   const out = new Map<string, string>();
@@ -2439,7 +2542,11 @@ function declsForViewport(
   // absolutely-positioned children). Without emitting it the block collapses to
   // its content in the clone. Content-filled blocks stay auto so margin
   // collapsing is preserved.
-  let explicitHeight = false;
+  // `forceHeight`: the caller proved this node authors a geometry-corroborated fixed height
+  // (sourceFixedHeightIntent) but the box's own content extent can't re-derive it (a shrink-0 box whose
+  // child fills it — the avatar case), so none of the structural explicit-height tests below fire. Trust
+  // the authored value and emit the baked per-band px.
+  let explicitHeight = forceHeight;
   const nb = node.bboxByVp[vp];
   // Probe ground truth, emission twin of the heightFlows keep (see the hAuto/hFill guard there):
   // the sizing probe proved height:auto did NOT reproduce this box (hAuto:false) AND it is not a
@@ -3295,9 +3402,15 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // parent, varies) OR the sizing probe measured that height:100% reproduces and auto does not
     // (heightProbeFills — direct ground truth, also catches constant fillers; inert pre-probe captures).
     const sourceFixedSize = !isContents && sourceFixedSizeIntent(node);
+    // Authored, geometry-corroborated fixed height/width on this node's own source class (banded or
+    // not). These break the fill↔content probe cycle that otherwise drops a banded authored height to
+    // `h-full` (logo tiles) or a shrink-0 box's authored width/height to auto (testimonial avatars):
+    // trust the baked per-band px the capture measured, exactly as the capture-side authored guard does.
+    const sourceFixedHeight = !isContents && sourceFixedHeightIntent(node, sampleVps);
+    const sourceFixedWidth = !isContents && sourceFixedWidthIntent(node, sampleVps);
     const mediaCover = !isContents && absoluteMediaCoversParent(node, parentNode, sampleVps);
     const absHeightFill = !isContents && absoluteHeightFill(node, parentNode, sampleVps);
-    const buttonFixedHeight = !isContents && (fixedHeightButtonLike(node, sampleVps) || sourceFixedSize);
+    const buttonFixedHeight = !isContents && (fixedHeightButtonLike(node, sampleVps) || sourceFixedSize || sourceFixedHeight);
     const heightFill = !isContents && !buttonFixedHeight && (isHeightFill(node, parentNode, parentDefiniteHeight, sampleVps) || absHeightFill || mediaCover || heightProbeFills(node, sampleVps));
     // This node's own height-drop decision, computed here so it can also feed childDefiniteHeight (a
     // height we drop becomes `auto` → does not confer a definite containing block). Same OR'd signals
@@ -3356,7 +3469,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const fillCap = !isContents ? fillsToCapWidth(node, parentNode, sampleVps) : null;
     // A width that leaves interior free space positions its children (auto margins / justify) — it's
     // load-bearing, so the content-sized branches below must NOT drop it (would kill the spacing).
-    const buttonFixedWidth = !isContents && (fixedWidthButtonLike(node, sampleVps) || sourceFixedSize);
+    const buttonFixedWidth = !isContents && (fixedWidthButtonLike(node, sampleVps) || sourceFixedSize || sourceFixedWidth);
     const lockWidth = !isContents && !fillCap && (hasInteriorFreeSpaceX(node, sampleVps) || buttonFixedWidth);
     // Ground-truth sizing probe is the primary signal after authored capped fills:
     // `width:100%; max-width:X` can look "auto" in a clone probe because the retained cap still
@@ -3374,6 +3487,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const mixedFill = (!lockWidth && !isContents && !percentVp) ? mixedFillByVp(node, parentNode, sampleVps) : null;
     const widthPlan: WidthPlan =
       fillCap ? { kind: "fillcap", cap: fillCap }
+      : sourceFixedWidth ? { kind: "fixed" }
       : sourceFixedSize ? inferred.plan
       : circularSlide ? { kind: "fixed" }
       : fullWidthSlide ? { kind: "basisFull" }
@@ -3485,7 +3599,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // gated to a breakpoint owns the transform only where it runs, but freezes a mid-scroll offset
     // at the OTHER bands — suppress those frozen deltas at every width).
     const animOwned = animOwnedProps(node, [baseVp, ...bands.map((b) => b.vp)]);
-    const baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform), tokenResolver);
+    const baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform, sourceFixedHeight), tokenResolver);
     const nr: NodeRule = { base: baseDecls, bands: [] };
 
     // Per-band overrides (delta vs base), using the parent's value AT THAT viewport.
@@ -3596,7 +3710,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
         }
       }
       const centeredVp = stableCenter || (layoutParent ? centeredAtVp(node, layoutParent, b.vp) : false);
-      const vpDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[b.vp], b.vp, assetMap, centeredVp, colorVar, ir.doc.perViewport[b.vp]?.scrollHeight, widthPlan, gridColsByVp?.get(b.vp), gridRowsByVp?.get(b.vp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform), tokenResolver);
+      const vpDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[b.vp], b.vp, assetMap, centeredVp, colorVar, ir.doc.perViewport[b.vp]?.scrollHeight, widthPlan, gridColsByVp?.get(b.vp), gridRowsByVp?.get(b.vp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform, sourceFixedHeight), tokenResolver);
       const delta = new Map<string, string>();
       for (const [k, v] of vpDecls) if (baseDecls.get(k) !== v) delta.set(k, v);
       for (const [k] of baseDecls) if (!vpDecls.has(k)) delta.set(k, resetValue(k));

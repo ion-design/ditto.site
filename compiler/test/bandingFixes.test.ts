@@ -97,3 +97,42 @@ describe("buildTailwind partial-coverage subgrid intent (C1)", () => {
     assert.ok(/grid-rows-subgrid/.test(cls), `subgrid must survive the partial-intent path, got class: "${cls}"`);
   });
 });
+
+// FIX 1 (source-intent side) — an authored banded FIXED height (`h-[4rem] md:h-[6.25rem]`) must be
+// recoverable through source intent even though sourceFluidLengthSuffix rejects fixed rem/px lengths.
+// The recovered value is re-emitted as the CAPTURED computed px (root-font-size independent), and the
+// generated `h-full`/`h-auto` on that axis is dropped in its favour.
+describe("buildTailwind recovers authored banded fixed height as computed px (FIX 1)", () => {
+  // A per-vp node with distinct computed height + matching bbox on each axis, so geometry corroborates.
+  function fixedHNode(id: string, tag: string, hByVp: Record<number, number>, srcClass: string): IRNode {
+    const computedByVp: Record<number, StyleMap> = {};
+    const bboxByVp: Record<number, BBox> = {};
+    const visibleByVp: Record<number, boolean> = {};
+    for (const vp of VPS) {
+      computedByVp[vp] = computed({ display: "flex", height: `${hByVp[vp]}px` });
+      bboxByVp[vp] = { x: 0, y: 0, width: vp, height: hByVp[vp]! };
+      visibleByVp[vp] = true;
+    }
+    const n: IRNode = { id, tag, attrs: {}, visibleByVp, bboxByVp, computedByVp, children: [] };
+    n.srcClass = srcClass;
+    // Probe reads the fill↔content cycle (a grid/flex item whose child fills it): hAuto:false but
+    // hFill:true, so the generator would otherwise emit h-full. Source intent must still recover.
+    n.sizingByVp = Object.fromEntries(VPS.map((vp) => [vp, { wAuto: false, wFill: true, hAuto: false, hFill: true }]));
+    return n;
+  }
+
+  it("emits banded computed px (h-[60px]/h-[100px]) and no h-full", () => {
+    // Source authors `h-[4rem]` (base) and `md:h-[6.25rem]`; the source root is 15px so 4rem→60px @375
+    // and 6.25rem→100px @1280. Emitted as px so the clone's root font-size can't mis-size it.
+    const el = fixedHNode("n1", "div", { 375: 60, 1280: 100 }, "flex h-[4rem] w-full md:h-[6.25rem]");
+    const root = pvNode("n0", "body", { 375: {}, 1280: {} }, [el]);
+    const tw = buildTailwind(irWith(root), new Map());
+    const cls = tw.classOf.get("n1") || "";
+    assert.ok(!/\bh-full\b/.test(cls), `authored fixed height must not stay h-full, got class: "${cls}"`);
+    // The captured px must appear (as an arbitrary px value or a clean rem token equivalent). Accept the
+    // px form or its 16px-root rem equivalent (100px→6.25rem, 60px→3.75rem) since the pretty-printer may
+    // fold clean px back to rem — both resolve to the captured px at the clone's 16px root.
+    assert.ok(/h-\[100px\]|h-\[6\.25rem\]/.test(cls), `desktop height (100px/6.25rem@16root) must appear, got class: "${cls}"`);
+    assert.ok(/h-\[60px\]|h-\[3\.75rem\]/.test(cls), `mobile height (60px/3.75rem@16root) must appear, got class: "${cls}"`);
+  });
+});
