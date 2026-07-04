@@ -8,6 +8,7 @@ import { generateInteractionCss } from "./interactionCss.js";
 import { generatePseudoStateCss } from "./pseudoStates.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, accordionJsx, accordionImportPath, ACCORDION_TSX, type AccordionRuntimeSpec, type RuntimeSpec } from "./interactive.js";
 import { buildMotionSpec, motionWireJsx, dittoMotionImportPath, motionHasContent, DITTO_MOTION_TSX, type MotionSpec } from "./motion.js";
+import { buildLottieSpec, lottieWireJsx, dittoLottieImportPath, lottieHasContent, materializeInlineLottieJson, materializeLottieFrameSvgs, DITTO_LOTTIE_TSX, type LottieSpec as LottieRuntimeSpec } from "./lottie.js";
 import { buildMenuSpecs, menusJsx, dropdownMenuImportPath, DROPDOWN_MENU_TSX, type RTMenu } from "./menu.js";
 import type { AssetGraph } from "../infer/assets.js";
 import type { FontGraph } from "../infer/fonts.js";
@@ -104,6 +105,7 @@ export type GenerateInput = {
   framework?: AppFramework; // output framework: Next.js App Router (default) or Vite React.
   reflow?: boolean; // Opt-in reflow trade: flow ALL heights incl wrappable
                     // text, accepting position drift the perceptual gate proves invisible. Default off.
+  forceCenter?: Set<string>; // layout-repair: re-centre fixed columns with uniform horizontal drift
 };
 
 export type AppFramework = "next" | "vite";
@@ -169,7 +171,7 @@ export type SectionRegistry = { plan: SectionPlan; modules: Map<string, string>;
  *  own `cid` (the grader aligns by data-cid). */
 export type SvgRegistry = { byKey: Map<string, string>; defs: Map<string, string>; order: string[]; nameCount: Map<string, number> };
 
-export type RenderCtx = { linkRewrite?: LinkRewrite; primitives?: Map<string, string>; components?: ComponentRegistry; classOf?: (cid: string) => string | undefined; styleOf?: (cid: string) => Map<string, string> | undefined; sections?: SectionRegistry; svgs?: SvgRegistry };
+export type RenderCtx = { linkRewrite?: LinkRewrite; primitives?: Map<string, string>; components?: ComponentRegistry; classOf?: (cid: string) => string | undefined; styleOf?: (cid: string) => Map<string, string> | undefined; sections?: SectionRegistry; svgs?: SvgRegistry; lottieFramePaths?: Map<string, string> };
 
 function buildAssetMap(assetGraph: AssetGraph): Map<string, string> {
   const m = new Map<string, string>();
@@ -531,6 +533,17 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
   const childTable = insideTable || node.tag === "table";
 
   if (node.rawHTML && tag === "svg") {
+    const frameSrc = ctx?.lottieFramePaths?.get(node.id);
+    if (frameSrc) {
+      const noHtml = (p: [string, string]) => p[0] !== "dangerouslySetInnerHTML";
+      const skipSvg = new Set(["viewBox", "xmlns", "preserveAspectRatio", "fill"]);
+      const attrs = renderAttrs(
+        propsList(node, assetMap, sourceUrl, ctx)
+          .filter((p) => noHtml(p) && !skipSvg.has(p[0]))
+          .concat([["src", JSON.stringify(frameSrc)], ["alt", JSON.stringify("")]]),
+      );
+      return `${pad}<img${attrs} />`;
+    }
     // Inline SVGs render as real JSX (`<path d=… />`), not a dangerouslySetInnerHTML blob —
     // attrs sans the __html prop, inner markup parsed to React-cased child elements.
     const innerSrc = svgInnerForNode(node, ctx);
@@ -1981,6 +1994,44 @@ function ctaContentTemplate(sectionName: string, jsx: string): { body: string; d
   };
 }
 
+function rewriteComponentDataMapsInBody(body: string, compName: string, prop: string): string {
+  const re = /\b([A-Za-z]\w*)Data\.map\(/g;
+  const compRe = new RegExp(`<${compName}(?:\\s|>|/)`);
+  let out = body;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    const alias = m[1]!;
+    const chunk = body.slice(m.index, m.index + 240);
+    if (!compRe.test(chunk)) continue;
+    if (`${alias}Data` === prop) continue;
+    out = out.split(`${alias}Data.map(`).join(`${prop}.map(`);
+  }
+  return out;
+}
+
+function rewriteDataMapRefs(
+  body: string,
+  decl: { varName: string; compName: string; dataModel?: string },
+  prop: string,
+  allDecls: Array<{ varName: string; compName: string; dataModel?: string }>,
+): string {
+  const aliases = new Set<string>([decl.varName, `${decl.compName}Data`]);
+  const sameComp = allDecls.filter((d) => d.compName === decl.compName);
+  if (sameComp.length === 1) {
+    aliases.add(`${decl.compName.charAt(0).toLowerCase()}${decl.compName.slice(1)}Data`);
+  }
+  if (decl.dataModel) {
+    aliases.add(`${pascalIdent(decl.dataModel, decl.compName)}Data`);
+    aliases.add(`${decl.dataModel.charAt(0).toUpperCase()}${decl.dataModel.slice(1)}Data`);
+  }
+  let out = body;
+  for (const alias of aliases) {
+    if (alias === prop) continue;
+    out = out.split(`${alias}.map(`).join(`${prop}.map(`);
+  }
+  return out;
+}
+
 /** Each hoisted section as its own editable module (default export). The section's data
  *  arrays become props that DEFAULT to the content.ts arrays — so the section is drop-in
  *  editable (pass your own data to override) while still rendering the captured content by
@@ -1993,7 +2044,12 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
     const jsx = sreg.modules.get(name) ?? "";
     const { comps, dataVars, cidVars, styleVars } = scanRefs(jsx);
     const knownData = new Set(reg?.dataDecls.map((d) => d.varName) ?? []);
-    const usedData = dataVars.filter((v) => knownData.has(v));
+    const byVar = new Map((reg?.dataDecls ?? []).map((d) => [d.varName, d]));
+    const usedDataSet = new Set(dataVars.filter((v) => knownData.has(v)));
+    for (const decl of reg?.dataDecls ?? []) {
+      if (jsx.includes(`<${decl.compName}`)) usedDataSet.add(decl.varName);
+    }
+    const usedData = [...usedDataSet];
     const inlineVars = usedData.filter((v) => !contentBindings.has(v));
     const { consts, typeForComp } = inlineData(inlineVars, reg);
     const lines: string[] = [];
@@ -2015,7 +2071,8 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
     let body = jsx;
     for (const v of usedData) {
       const p = dataProps.get(v) ?? camelVar(v);
-      if (p !== v) body = body.split(`${v}.map(`).join(`${p}.map(`);
+      const decl = byVar.get(v);
+      body = decl ? rewriteDataMapRefs(body, decl, p, reg?.dataDecls ?? []) : p !== v ? body.split(`${v}.map(`).join(`${p}.map(`) : body;
       const binding = contentBindings.get(v);
       if (binding) {
         const alias = safeIdent(`${p}Content`, "contentData");
@@ -2024,6 +2081,23 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
       } else {
         dataParamParts.push(`${p} = ${v}`);
       }
+    }
+    const compUseCount = new Map<string, number>();
+    for (const v of usedData) {
+      const decl = byVar.get(v);
+      if (!decl) continue;
+      compUseCount.set(decl.compName, (compUseCount.get(decl.compName) ?? 0) + 1);
+    }
+    const propByComp = new Map<string, string>();
+    for (const v of usedData) {
+      const decl = byVar.get(v);
+      if (!decl) continue;
+      if ((compUseCount.get(decl.compName) ?? 0) === 1) {
+        propByComp.set(decl.compName, dataProps.get(v) ?? camelVar(v));
+      }
+    }
+    for (const [compName, prop] of propByComp) {
+      body = rewriteComponentDataMapsInBody(body, compName, prop);
     }
     const cta = ctaContentTemplate(name, body);
     if (cta) {
@@ -2050,21 +2124,24 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
   return { files, contentDecls };
 }
 
-export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl: string, ctx?: RenderCtx, wires?: RuntimeSpec[], motionSpec?: MotionSpec, menus?: RTMenu[], accordions?: AccordionRuntimeSpec[]): string {
+export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl: string, ctx?: RenderCtx, wires?: RuntimeSpec[], motionSpec?: MotionSpec, menus?: RTMenu[], accordions?: AccordionRuntimeSpec[], lottieSpec?: LottieRuntimeSpec): string {
   // page renders the body's children; the <body> element itself (c0) is rendered
   // by layout so cid alignment is preserved.
   const hasWires = !!wires && wires.length > 0;
   const hasMotion = !!motionSpec && motionHasContent(motionSpec);
+  const hasLottie = !!lottieSpec && lottieHasContent(lottieSpec);
   const hasMenus = !!menus && menus.length > 0;
   const hasAccordions = !!accordions && accordions.length > 0;
+  const renderCtx: RenderCtx | undefined = ctx;
   const wiresBlock = hasWires ? "\n" + wiresJsx(wires!, 3) : "";
   const motionBlock = hasMotion ? "\n" + motionWireJsx(motionSpec!, 3) : "";
+  const lottieBlock = hasLottie ? "\n" + lottieWireJsx(lottieSpec!, 3) : "";
   const menusBlock = hasMenus ? "\n" + menusJsx(menus!, 3) : "";
   const accordionBlock = hasAccordions ? "\n" + accordionJsx(accordions!, 3) : "";
   // Render the body first so component extraction populates the registry, then import
   // each extracted component from its own `components/Name` module (written by
   // generateApp) and its data from the editable ./content module (Stage 6).
-  const body = renderChildrenJsx(ir.root.children, assetMap, sourceUrl, 3, ctx);
+  const body = renderChildrenJsx(ir.root.children, assetMap, sourceUrl, 3, renderCtx);
   // Import the section components (when split) + only the extracted components/data/cids
   // the page composes DIRECTLY (the rest are imported by the section modules). buildRefImports
   // scans the rendered body, so it works whether or not the page was split into sections.
@@ -2076,6 +2153,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
     hasWires ? `import DittoWire from "${dittoWireImportPath(0)}";` : "",
     hasAccordions ? `import Accordion from "${accordionImportPath(0)}";` : "",
     hasMotion ? `import DittoMotion from "${dittoMotionImportPath(0)}";` : "",
+    hasLottie ? `import DittoLottie from "${dittoLottieImportPath(0)}";` : "",
     hasMenus ? `import DropdownMenu from "${dropdownMenuImportPath(0)}";` : "",
     ...compImports,
   ].filter(Boolean).join("\n");
@@ -2083,7 +2161,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
   return `${importBlock}export default function Page() {
   return (
     <>
-${body}${wiresBlock}${accordionBlock}${motionBlock}${menusBlock}
+${body}${wiresBlock}${accordionBlock}${motionBlock}${lottieBlock}${menusBlock}
     </>
   );
 }
@@ -2380,6 +2458,9 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const accordions = runtimeSpecs.filter((s): s is AccordionRuntimeSpec => s.kind === "accordion");
   const wires = runtimeSpecs.filter((s) => s.kind !== "accordion");
   const motionSpec = buildMotionSpec(ir, input.motion);
+  const lottieInlinePaths = materializeInlineLottieJson(input.motion, join(appDir, "public"));
+  const lottieFramePaths = materializeLottieFrameSvgs(ir, input.motion, join(appDir, "public"));
+  const lottieSpec = buildLottieSpec(ir, input.motion, assetGraph, undefined, lottieInlinePaths);
   const components = input.components ? buildComponentRegistry(ir, input.primitives, input.recipeReport) : undefined;
   const linkRewrite = sameOriginRelativeLinkRewrite(sourceUrl);
   const menus = buildMenuSpecs(ir, input.interaction?.menus, assetMap, sourceUrl, linkRewrite);
@@ -2391,7 +2472,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const mode = input.humanizeMode ?? "tailwind";
   // Tailwind mode (default): translate each node's exact decls to utility classes.
   // CSS mode: dedup into shared semantic CSS classes. Both fidelity-neutral.
-  const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow }) : undefined;
+  const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow, forceCenter: input.forceCenter }) : undefined;
   const classMap = humanize && mode === "css" ? buildClassMap(ir, assetMap, input.colorVar, input.primitives, input.tokenResolver) : undefined;
   const cleanRecipeClass = recipeResponsiveClassCleaner(input.recipeReport, { tailwind: !!tw });
   const classOf = tw ? (cid: string) => cleanRecipeClass(cid, tw.classOf.get(cid)) : classMap ? (cid: string) => classMap.classOf.get(cid) : undefined;
@@ -2401,7 +2482,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const sectionPlan = humanize ? planSections(ir, input.recipeReport) : undefined;
   const sections: SectionRegistry | undefined = sectionPlan && sectionPlan.roots.size > 0 ? { plan: sectionPlan, modules: new Map(), order: [] } : undefined;
   const svgs: SvgRegistry | undefined = humanize ? { byKey: new Map(), defs: new Map(), order: [], nameCount: new Map() } : undefined;
-  const pageTsx = generatePageTsx(ir, assetMap, sourceUrl, { primitives: input.primitives, components, linkRewrite, classOf, styleOf, sections, svgs }, wires, motionSpec, menus, accordions);
+  const pageTsx = generatePageTsx(ir, assetMap, sourceUrl, { primitives: input.primitives, components, linkRewrite, classOf, styleOf, sections, svgs, lottieFramePaths }, wires, motionSpec, menus, accordions, lottieSpec);
   // Tailwind mode: utilities live in the JSX; ditto.css carries only pseudo-elements +
   // keyframes + interaction CSS (keyed by [data-cid], since nodes have no c<id> class).
   // Tailwind mode folds hover/focus into the className as `hover:`/`focus:` variant utilities
@@ -2417,7 +2498,8 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const contentTs = contentModule(components, sectionOut.contentDecls);
 
   // Scaffold
-  writeText(join(appDir, "package.json"), framework === "vite" ? (tw ? PACKAGE_JSON_VITE_TW : PACKAGE_JSON_VITE) : (tw ? PACKAGE_JSON_TW : PACKAGE_JSON));
+  const pkgBase = framework === "vite" ? (tw ? PACKAGE_JSON_VITE_TW : PACKAGE_JSON_VITE) : (tw ? PACKAGE_JSON_TW : PACKAGE_JSON);
+  writeText(join(appDir, "package.json"), lottieHasContent(lottieSpec) ? injectLottieDep(pkgBase) : pkgBase);
   writeText(join(appDir, "tsconfig.json"), framework === "vite" ? TSCONFIG_JSON_VITE : TSCONFIG_JSON);
   if (framework === "vite") {
     rmSync(join(appDir, "next.config.mjs"), { force: true });
@@ -2501,6 +2583,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   if (wires.length) writeText(join(rootDir, "ditto", "DittoWire.tsx"), DITTO_WIRE_TSX);
   if (accordions.length) writeText(join(rootDir, "ditto", "Accordion.tsx"), ACCORDION_TSX);
   if (motionHasContent(motionSpec)) writeText(join(rootDir, "ditto", "DittoMotion.tsx"), DITTO_MOTION_TSX);
+  if (lottieHasContent(lottieSpec)) writeText(join(rootDir, "ditto", "DittoLottie.tsx"), DITTO_LOTTIE_TSX);
   if (menus.length) writeText(join(rootDir, "ditto", "DropdownMenu.tsx"), DROPDOWN_MENU_TSX);
   const routeSummary = routeSummaryFromIr(ir, "/", "/", sourceUrl);
   if (framework === "next") {
@@ -2530,11 +2613,19 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
       ...(wires.length ? ["DittoWire"] : []),
       ...(accordions.length ? ["Accordion"] : []),
       ...(motionHasContent(motionSpec) ? ["DittoMotion"] : []),
+      ...(lottieHasContent(lottieSpec) ? ["DittoLottie"] : []),
       ...(menus.length ? ["DropdownMenu"] : []),
     ],
   });
 
   return { pageTsx, cloneCss, components: components ? summarizeComponents(components) : [] };
+}
+
+/** Add lottie-web to a generated package.json's dependencies — DittoLottie imports it at
+ *  runtime, so it must be installed alongside react/next. Injected only when the page
+ *  actually has lottie content, keeping lottie-free clones byte-identical to before. */
+export function injectLottieDep(pkgJson: string): string {
+  return pkgJson.replace(/("dependencies":\s*\{\n)/, `$1    "lottie-web": "5.12.2",\n`);
 }
 
 export const PACKAGE_JSON = `{

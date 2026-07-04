@@ -10,31 +10,48 @@ import type { Backend, BundleFormat, CloneBundle, FileFacet, JobView, ResultOutc
 
 export type RunJob = (input: RunCloneJobInput) => Promise<CloneJobResult>;
 
-/** Sync, in-memory backend (M1): runs the clone INLINE on submit and holds results
- *  in memory. POST returns the file map immediately (200). */
+/** In-memory backend: enqueues a clone (202) and runs it in the background so long
+ *  captures (multi-viewport + verify) never hold a single HTTP connection open for
+ *  minutes — which browsers surface as `TypeError: Failed to fetch` when the link
+ *  drops (server restart, hot-reload, idle timeout). Poll /v1/clones/:id + /events. */
 export class InMemoryBackend implements Backend {
   constructor(private deps: { store: InMemoryStore; runJob: RunJob; makeTempBase?: () => string; captureCacheDir?: string }) {}
+
+  private activeClones = 0;
 
   private makeBase(): string {
     return (this.deps.makeTempBase ?? (() => mkdtempSync(join(tmpdir(), "api-clone-"))))();
   }
 
   async submit(url: string, options: CloneOptions | undefined): Promise<SubmitOutcome> {
+    if (this.activeClones > 0 || this.deps.store.list().some((j) => j.status === "running")) {
+      throw new Error("BUSY: another clone is already running — wait for it to finish (use npm run dev:api:stable to avoid hot-reload killing Playwright)");
+    }
     const id = randomUUID();
     const base = this.makeBase();
-    // Record the job BEFORE running it so a second connection can poll
-    // /v1/clones/:id and /events while the inline clone is in flight.
     const events: Array<Record<string, unknown>> = [];
     const kind: "clone" | "clone_site" = resolveCloneMode(options) === "multi" ? "clone_site" : "clone";
     const rec = { id, status: "running" as const, url, kind, options: options ?? {}, createdAt: Date.now(), base, events };
     this.deps.store.put(rec);
+    void this.runInBackground(id, url, options, rec, base, events, kind);
+    return { jobId: id, status: "queued", httpStatus: 202 };
+  }
+
+  private async runInBackground(
+    id: string,
+    url: string,
+    options: CloneOptions | undefined,
+    rec: { id: string; status: "running"; url: string; kind: "clone" | "clone_site"; options: CloneOptions; createdAt: number; base: string; events: Array<Record<string, unknown>> },
+    base: string,
+    events: Array<Record<string, unknown>>,
+    kind: "clone" | "clone_site",
+  ): Promise<void> {
+    this.activeClones++;
     const log = (e: Record<string, unknown>) => {
       events.push({ t: Date.now(), ...e });
+      this.deps.store.put({ ...rec, events: [...events] });
     };
     try {
-      // captureCacheDir (persistent, shared across submits) powers the single→multi
-      // reuse: a single-page submit stashes its capture; a later multi-page submit for
-      // the same URL reuses it as the entry route (no re-capture) and expands the site.
       const result = await this.deps.runJob({ url, options, runsDir: base, captureCacheDir: this.deps.captureCacheDir, log });
       log({ event: "clone_done" });
       this.deps.store.put({ id, status: "succeeded", url, kind: result.kind, options: result.options, createdAt: rec.createdAt, result, base, events });
@@ -49,7 +66,6 @@ export class InMemoryBackend implements Backend {
           result.verify = { error: String(e).slice(0, 500), async: true };
         });
       }
-      return { jobId: id, status: "succeeded", httpStatus: 200, result: buildRestResult(id, result, `/v1/clones/${id}/files`) };
     } catch (e) {
       try {
         rmSync(base, { recursive: true, force: true });
@@ -58,7 +74,8 @@ export class InMemoryBackend implements Backend {
       }
       log({ event: "clone_error", error: String(e).slice(0, 300) });
       this.deps.store.put({ id, status: "failed", url, kind, options: options ?? {}, createdAt: rec.createdAt, error: String(e), events });
-      throw e;
+    } finally {
+      this.activeClones = Math.max(0, this.activeClones - 1);
     }
   }
 

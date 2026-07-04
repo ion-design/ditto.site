@@ -244,10 +244,12 @@ export function createApp(deps: AppDeps): Hono {
 
     try {
       const out = await backend.submit(url, opts);
-      if (out.status === "queued") return c.json({ jobId: out.jobId, status: "queued" }, 202);
+      if (out.status === "queued") return c.json({ jobId: out.jobId, status: "queued" }, out.httpStatus);
       return c.json(out.result, 200);
     } catch (e) {
-      return c.json({ status: "failed", error: String(e).slice(0, 500) }, 500);
+      const msg = String(e);
+      if (msg.startsWith("BUSY:")) return c.json({ error: msg.slice(5).trim() }, 429);
+      return c.json({ status: "failed", error: msg.slice(0, 500) }, 500);
     }
   });
 
@@ -288,10 +290,10 @@ export function createApp(deps: AppDeps): Hono {
     return c.body(file.bytes);
   });
 
-  // Pipeline progress events (poll every ~300ms while a clone runs). Backends
-  // without event support (DB/queue) 404 — clients fall back to status polling.
+  // Pipeline progress events (poll every ~300ms while a clone runs).
   app.get("/v1/clones/:id/events", async (c) => {
-    const events = backend.events ? await backend.events(c.req.param("id")) : null;
+    const after = Math.max(0, Number(c.req.query("after") ?? "0") || 0);
+    const events = backend.events ? await backend.events(c.req.param("id"), after) : null;
     if (!events) return c.json({ error: "not found" }, 404);
     return c.json({ jobId: c.req.param("id"), events });
   });

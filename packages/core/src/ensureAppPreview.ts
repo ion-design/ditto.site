@@ -49,13 +49,12 @@ export function relativizeExportRefs(content: string, depth: number, kind: "html
       (_m, q) => `url(${q}${rel}${root}/`,
     );
   }
-  // srcset carries several comma-separated URLs in one attribute value; each URL
-  // starts a token after `"` or `, `. Run ONCE outside the roots loop — the values
-  // it inserts (`./assets/…`) contain `/assets/` themselves and would compound.
+  // srcset / imageSrcSet carry comma-separated URLs; React may emit camelCase
+  // attribute names. Match case-insensitively so every variant is depth-rewritten.
   if (kind === "html") {
-    out = out.replace(/srcset=(["'])([^"']*)\1/g, (_m, q, val: string) => {
+    out = out.replace(/(\b(?:srcset|imagesrcset|srcSet|imageSrcSet)=)(["'])([^"']*)\2/gi, (_m, attr, q, val: string) => {
       const v = val.replace(new RegExp(`(^|,\\s*)/(${REWRITE_ROOTS.join("|")})/`, "g"), (_s, pre, root) => `${pre}${rel}${root}/`);
-      return `srcset=${q}${v}${q}`;
+      return `${attr}${q}${v}${q}`;
     });
   }
   return out;

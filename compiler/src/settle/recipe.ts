@@ -48,8 +48,67 @@ export async function freezeAnimations(page: Page): Promise<void> {
   });
 }
 
+/** Freeze opacity-cycling decks/carousels to the first visible card (deterministic). */
+export async function freezeOpacityDecks(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const visible = (el: Element): boolean => {
+      const cs = getComputedStyle(el);
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return false;
+      if (parseFloat(cs.opacity || "1") < 0.05) return false;
+      if (cs.visibility === "hidden" || cs.display === "none") return false;
+      return true;
+    };
+    const children = (el: Element): Element[] => Array.from(el.children).filter((c) => c instanceof HTMLElement);
+    let frozen = 0;
+    const visit = (root: Element): void => {
+      const kids = children(root);
+      if (kids.length < 2 || kids.length > 24) {
+        for (const k of kids) visit(k);
+        return;
+      }
+      const boxes = kids.map((k) => (k as HTMLElement).getBoundingClientRect());
+      const w0 = boxes[0]!.width;
+      const h0 = boxes[0]!.height;
+      if (w0 < 40 || h0 < 40) {
+        for (const k of kids) visit(k);
+        return;
+      }
+      const sameGeom = boxes.every((b) => Math.abs(b.width - w0) < 4 && Math.abs(b.height - h0) < 4);
+      if (!sameGeom) {
+        for (const k of kids) visit(k);
+        return;
+      }
+      const opacities = kids.map((k) => parseFloat(getComputedStyle(k).opacity || "1"));
+      const vis = kids.filter((k, i) => visible(k) && opacities[i]! > 0.5);
+      if (vis.length === 1 && opacities.filter((o) => o < 0.05).length >= kids.length - 1) {
+        for (let i = 0; i < kids.length; i++) {
+          const el = kids[i] as HTMLElement;
+          if (i === 0) {
+            el.style.opacity = "1";
+            el.style.visibility = "visible";
+            el.style.pointerEvents = "auto";
+          } else {
+            el.style.opacity = "0";
+            el.style.visibility = "hidden";
+            el.style.pointerEvents = "none";
+          }
+        }
+        frozen++;
+        return;
+      }
+      for (const k of kids) visit(k);
+    };
+    visit(document.body);
+    return frozen;
+  });
+}
+
 /** Full pre-screenshot settle: fonts + optional animation freeze. */
-export async function preScreenshotSettle(page: Page, opts?: { freezeCss?: boolean }): Promise<void> {
+export async function preScreenshotSettle(page: Page, opts?: { freezeCss?: boolean; freezeDecks?: boolean }): Promise<void> {
   await waitForFonts(page);
+  if (opts?.freezeDecks !== false) {
+    try { await freezeOpacityDecks(page); } catch { /* non-fatal */ }
+  }
   if (opts?.freezeCss !== false) await freezeAnimations(page);
 }

@@ -1018,11 +1018,11 @@ function interactionUtilities(
   return { byCid, groups };
 }
 
-export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: (v: string) => string | null, opts?: { interner?: ColorInterner; includeNode?: (id: string) => boolean; interaction?: InteractionCapture; reflow?: boolean }): TailwindOutput {
+export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: (v: string) => string | null, opts?: { interner?: ColorInterner; includeNode?: (id: string) => boolean; interaction?: InteractionCapture; reflow?: boolean; forceCenter?: Set<string> }): TailwindOutput {
   // Colors tokenized (var(--…)); typography/geometry kept RAW (text-[16px] reads cleaner
   // than a token ref). The full tokenResolver is deliberately NOT passed — only colors are
   // tokenized below, so spacing/type stay as readable arbitrary values.
-  const rules = collectNodeRules(ir, assetMap, opts?.includeNode, colorVar, undefined, opts?.reflow);
+  const rules = collectNodeRules(ir, assetMap, opts?.includeNode, colorVar, undefined, opts?.reflow, opts?.forceCenter);
   const classOf = new Map<string, string>();
   const styleOf = new Map<string, Map<string, string>>(); // cid → inline style (base-only gradients/url)
   const extraParts: string[] = []; // pseudo rules + url()-bearing decls, keyed by [data-cid]

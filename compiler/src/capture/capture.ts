@@ -672,79 +672,122 @@ export async function captureSite(opts: {
     // hero on each fresh load) and session-reuse degeneration (warbyparker returned
     // a 13-node shell when reloaded with a carried session). The IR's cross-viewport
     // alignment then operates on one logical DOM that CSS merely reflows.
-    const context: BrowserContext = await browser.newContext({
-      ignoreHTTPSErrors: true,
-      viewport: { width: canonical, height: viewportHeight(canonical) },
-      deviceScaleFactor: 1,
-      userAgent: DESKTOP_UA,
-      javaScriptEnabled: true,
-    });
-    const page = await context.newPage();
-    // tsx/esbuild wraps functions with a __name() helper for stack traces; that
-    // helper does not exist in the browser when we serialize page.evaluate
-    // callbacks. Shim it (as a raw string so it isn't itself transformed).
-    await page.addInitScript(ESBUILD_SHIM);
-    if (opts.deterministicEnv ?? true) await page.addInitScript(DETERMINISTIC_ENV_SHIM);
     const bodyPromises: Promise<void>[] = [];
+    const isClosedError = (e: unknown) =>
+      /Target page, context or browser has been closed|page closed|has crashed|browser has been closed/i.test(String(e));
 
-    page.on("response", (resp) => {
-      try {
-        const url = resp.url();
-        if (url.startsWith("data:") || url.startsWith("blob:")) return;
-        const ct = resp.headers()["content-type"] || null;
-        const type = classifyAsset(url, ct);
-        if (!type) return;
-        const status = resp.status();
-        recordAsset(url, type, ct, status, "network");
-        const existing = assetMap.get(url);
-        if (existing?.storedAs) return;
-        if (status >= 400) return;
-        // A 206 body is a RANGE FRAGMENT (media elements fetch videos in chunks) —
-        // storing it would freeze a truncated file as "downloaded" (cropin's hero
-        // video landed as 27KB of a multi-MB mp4). Leave it unstored; the fallback
-        // downloader fetches the complete file with a plain GET.
-        if (status === 206) return;
-        bodyPromises.push(
-          (async () => {
-            try {
-              const buf = await resp.body();
-              storeBytes(url, type, buf);
-              if (type === "css") cssTextsForParsing.push({ baseUrl: url, text: buf.toString("utf8") });
-              if (type === "manifest") parseManifestForAssets(buf.toString("utf8"), url);
-            } catch { /* body unavailable */ }
-          })(),
-        );
-      } catch { /* ignore */ }
-    });
+    const attachPageHandlers = (pg: Page) => {
+      pg.on("crash", () => log({ event: "page_crash" }));
+      pg.on("response", (resp) => {
+        try {
+          const url = resp.url();
+          if (url.startsWith("data:") || url.startsWith("blob:")) return;
+          const ct = resp.headers()["content-type"] || null;
+          const type = classifyAsset(url, ct);
+          if (!type) return;
+          const status = resp.status();
+          recordAsset(url, type, ct, status, "network");
+          const existing = assetMap.get(url);
+          if (existing?.storedAs) return;
+          if (status >= 400) return;
+          // A 206 body is a RANGE FRAGMENT (media elements fetch videos in chunks) —
+          // storing it would freeze a truncated file as "downloaded" (cropin's hero
+          // video landed as 27KB of a multi-MB mp4). Leave it unstored; the fallback
+          // downloader fetches the complete file with a plain GET.
+          if (status === 206) return;
+          bodyPromises.push(
+            (async () => {
+              try {
+                const buf = await resp.body();
+                storeBytes(url, type, buf);
+                if (type === "css") cssTextsForParsing.push({ baseUrl: url, text: buf.toString("utf8") });
+                if (type === "manifest") parseManifestForAssets(buf.toString("utf8"), url);
+              } catch { /* body unavailable */ }
+            })(),
+          );
+        } catch { /* ignore */ }
+      });
+    };
+
+    const newSession = async (): Promise<{ context: BrowserContext; page: Page }> => {
+      const context = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        viewport: { width: canonical, height: viewportHeight(canonical) },
+        deviceScaleFactor: 1,
+        userAgent: DESKTOP_UA,
+        javaScriptEnabled: true,
+      });
+      const page = await context.newPage();
+      // tsx/esbuild wraps functions with a __name() helper for stack traces; that
+      // helper does not exist in the browser when we serialize page.evaluate
+      // callbacks. Shim it (as a raw string so it isn't itself transformed).
+      attachPageHandlers(page);
+      await page.addInitScript(ESBUILD_SHIM);
+      if (opts.deterministicEnv ?? true) await page.addInitScript(DETERMINISTIC_ENV_SHIM);
+      return { context, page };
+    };
 
     // Single navigation at the canonical width; every viewport below is a resize.
     // Bounded by a TOTAL budget (not per-attempt × retries) so a hanging origin
     // fails fast with a clear error instead of stalling the pipeline for minutes.
-    log({ event: "goto", url: opts.url });
-    const NAV_BUDGET_MS = 60_000;
-    const navStart = Date.now();
-    let navigated = false;
-    let navErr: unknown = null;
-    for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
-      const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
-      if (remaining < 5_000) break;
-      try {
-        await page.goto(opts.url, {
-          waitUntil: attempt === 0 ? "load" : "domcontentloaded",
-          timeout: Math.min(attempt === 0 ? 30_000 : 15_000, remaining),
-        });
-        navigated = true;
-      } catch (e) {
-        navErr = e;
-        await page.waitForTimeout(1000);
+    const navigateLoaded = async (pg: Page): Promise<void> => {
+      log({ event: "goto", url: opts.url });
+      const NAV_BUDGET_MS = 60_000;
+      const navStart = Date.now();
+      let navigated = false;
+      let navErr: unknown = null;
+      for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
+        const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
+        if (remaining < 5_000) break;
+        try {
+          await pg.goto(opts.url, {
+            waitUntil: attempt === 0 ? "load" : "domcontentloaded",
+            timeout: Math.min(attempt === 0 ? 30_000 : 15_000, remaining),
+          });
+          navigated = true;
+        } catch (e) {
+          navErr = e;
+          await pg.waitForTimeout(1000);
+        }
       }
-    }
-    if (!navigated) {
-      throw new Error(
-        `navigation failed for ${opts.url} within ${Math.round((Date.now() - navStart) / 1000)}s: ${String(navErr).slice(0, 300)}`,
-      );
-    }
-    await settle(page);
+      if (!navigated) {
+        throw new Error(
+          `navigation failed for ${opts.url} within ${Math.round((Date.now() - navStart) / 1000)}s: ${String(navErr).slice(0, 300)}`,
+        );
+      }
+      await settle(pg);
+    };
+
+    let { context, page } = await newSession();
+    await navigateLoaded(page);
+
+    const recoverSession = async (): Promise<void> => {
+      log({ event: "capture_recover", reason: "browser_or_page_closed" });
+      try {
+        if (!page.isClosed()) await page.close();
+      } catch { /* ignore */ }
+      try {
+        await context.close();
+      } catch { /* ignore */ }
+      ({ context, page } = await newSession());
+      await navigateLoaded(page);
+    };
+
+    const safeSetViewport = async (vw: number, vh: number): Promise<void> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (page.isClosed()) throw new Error("page closed");
+          await page.setViewportSize({ width: vw, height: vh });
+          return;
+        } catch (e) {
+          if (attempt === 0 && isClosedError(e)) {
+            await recoverSession();
+            continue;
+          }
+          throw e;
+        }
+      }
+    };
 
     // Auth/bot-wall fast fail: a wall page would otherwise burn the full
     // multi-viewport capture and only get flagged by the pollution gate afterward.
@@ -762,8 +805,9 @@ export async function captureSite(opts: {
     }
 
     for (const vw of viewports) {
+      if (perViewport.some((p) => p.viewport === vw)) continue;
       const vh = viewportHeight(vw);
-      await page.setViewportSize({ width: vw, height: vh });
+      await safeSetViewport(vw, vh);
       await settle(page, 1500); // let the resize reflow + any width-triggered content settle
 
       // Stage 2: dismiss cookie/consent/newsletter/region overlays. Run TWICE —
@@ -967,6 +1011,17 @@ export async function captureSite(opts: {
         const LAZY_ATTRS = ["data-src", "data-lazy-src", "data-original", "data-bg", "data-background", "data-background-image"];
         for (const el of Array.from(document.querySelectorAll(LAZY_ATTRS.map((a) => `[${a}]`).join(",")))) {
           for (const a of LAZY_ATTRS) push(el.getAttribute(a));
+        }
+        for (const el of Array.from(document.querySelectorAll("picture source[srcset], picture source[src], source[srcset]"))) {
+          const ss = el.getAttribute("srcset") ?? el.getAttribute("src") ?? "";
+          for (const part of ss.split(",")) push(part.trim().split(/\s+/)[0]);
+        }
+        for (const el of Array.from(document.querySelectorAll("[style*='background'], [style*='url(']"))) {
+          const st = el.getAttribute("style") ?? "";
+          for (const m of st.matchAll(/url\(\s*['"]?([^'")]+)['"]?\s*\)/gi)) push(m[1]);
+        }
+        for (const el of Array.from(document.querySelectorAll("noscript"))) {
+          for (const m of (el.textContent ?? "").matchAll(/(?:src|href|srcset)\s*=\s*['"]([^'"]+)['"]/gi)) push(m[1]);
         }
         for (const el of Array.from(document.querySelectorAll("img[srcset], source[srcset], [data-srcset]"))) {
           const ss = el.getAttribute("srcset") ?? el.getAttribute("data-srcset") ?? "";

@@ -2730,7 +2730,7 @@ export function keyframesCss(ir: IR, assetMap: Map<string, string>, includeNode?
  *  per-node CSS emitter (generateCss) and the semantic class-map emitter (classMap.ts).
  *  `includeNode` scopes which nodes are emitted (multi-route shared layout) while still
  *  recursing so inheritance diffing against parents stays correct. */
-export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeNode?: (id: string) => boolean, colorVar?: (value: string) => string | null, tokenResolver?: TokenResolver, reflow = false): Map<string, NodeRule> {
+export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeNode?: (id: string) => boolean, colorVar?: (value: string) => string | null, tokenResolver?: TokenResolver, reflow = false, forceCenter?: Set<string>): Map<string, NodeRule> {
   const bands = computeBands(ir.doc.viewports, ir.doc.canonicalViewport);
   const baseVp = ir.doc.canonicalViewport;
   const rules = new Map<string, NodeRule>();
@@ -2842,6 +2842,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // card grid that becomes a mobile horizontal scroller) → per-vp width: 100% where it fills, baked
     // px where it overflows. Only when the clean per-band fraction law (percentVp) didn't already fit.
     const mixedFill = (!lockWidth && !isContents && !percentVp) ? mixedFillByVp(node, parentNode, sampleVps) : null;
+    const repairCenter = !!forceCenter?.has(node.id);
     const widthPlan: WidthPlan =
       fillCap ? { kind: "fillcap", cap: fillCap }
       : sourceFixedSize ? inferred.plan
@@ -2859,11 +2860,13 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       : (!lockWidth && flexFill) ? { kind: "flexfill" }
       : percentVp ? { kind: "percentVp", pctByVp: percentVp }
       : mixedFill ? { kind: "percentVp", pctByVp: mixedFill }
+      : repairCenter ? { kind: "auto" }
       : inferred.plan;
-    const centerAlways = inferred.centerAlways;
+    const centerAlways = inferred.centerAlways || repairCenter;
     const centeredAtAnySample = !!layoutParent && sampleVps.some((vp) => centeredAtVp(node, layoutParent, vp));
     const stableCenter =
       centerAlways ||
+      repairCenter ||
       sourceMarginAutoIntent(node) ||
       ((!!fillCap || hasPxMaxWidthCap(node, sampleVps)) && centeredAtAnySample);
     // Fluid grid-template-columns (fr), per-viewport (the column count may change across breakpoints).

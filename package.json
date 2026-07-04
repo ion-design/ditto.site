@@ -38,7 +38,8 @@
     "bench-site": "npm run bench-site --workspace clone-static --",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "dev:api": "npm run dev --workspace @cloner/api",
+    "dev:api": "npm run start --workspace @cloner/api",
+    "dev:api:watch": "npm run dev --workspace @cloner/api",
     "dev:worker": "npm run dev --workspace @cloner/worker",
     "db:generate": "npm run generate --workspace @cloner/db",
     "db:migrate": "npm run migrate --workspace @cloner/db"

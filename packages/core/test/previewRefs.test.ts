@@ -25,6 +25,10 @@ describe("relativizeExportRefs", () => {
     assert.equal(relativizeExportRefs(`body{background:url(/assets/cloned/images/b.png)}`, 0, "css"), `body{background:url(./assets/cloned/images/b.png)}`);
     const out = relativizeExportRefs(`<img srcset="/assets/a.png 1x, /assets/b.png 2x">`, 0, "html");
     assert.equal(out, `<img srcset="./assets/a.png 1x, ./assets/b.png 2x">`);
+    const camel = relativizeExportRefs(`<link imageSrcSet="/assets/a.webp 768w, /assets/b.webp 1536w">`, 0, "html");
+    assert.equal(camel, `<link imageSrcSet="./assets/a.webp 768w, ./assets/b.webp 1536w">`);
+    const mixed = relativizeExportRefs(`<img srcSet="/assets/x.png 1x">`, 0, "html");
+    assert.equal(mixed, `<img srcSet="./assets/x.png 1x">`);
   });
 
   it("leaves external and already-relative refs alone", () => {

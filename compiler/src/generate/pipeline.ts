@@ -15,6 +15,7 @@ import { buildManifest } from "./manifest.js";
 import { buildSeoInventory, seoInventoryToMarkdown, type SeoInventory } from "./seo.js";
 import { generateMirror, MIRROR_MOUNT } from "./mirror.js";
 import { resolvePatternHints, type PatternHints } from "../knowledge/patternIndex.js";
+import { readLayoutRepairHints } from "./layoutRepair.js";
 import { writeJSON, writeText, readJSON, fileExists } from "../util/fsx.js";
 import type { CaptureResult } from "../capture/capture.js";
 
@@ -90,7 +91,11 @@ export function generateAll(opts: {
   const cloneOpts = fileExists(optPath) ? readJSON<{ components?: boolean; humanizeMode?: "tailwind" | "css"; framework?: AppFramework; reflow?: boolean }>(optPath) : {};
   const components = !!cloneOpts.components;
   const humanizeMode = cloneOpts.humanizeMode; // undefined → generateApp default ("tailwind")
-  const gen = generateApp({ ir, assetGraph, fontGraph, appDir, sourceDir, sourceUrl: url, seoInventory, colorVar: palette.varForColor, tokenResolver, primitives, recipeReport, interaction: capture.interaction, pseudoStates: capture.pseudoStates, rejectedSpecs, components, humanizeMode, framework: cloneOpts.framework, motion: capture.motion, reflow: !!cloneOpts.reflow }, tokensCss);
+  const layoutRepair = readLayoutRepairHints(sourceDir);
+  const forceCenter = layoutRepair?.forceCenterCids?.length
+    ? new Set(layoutRepair.forceCenterCids)
+    : undefined;
+  const gen = generateApp({ ir, assetGraph, fontGraph, appDir, sourceDir, sourceUrl: url, seoInventory, colorVar: palette.varForColor, tokenResolver, primitives, recipeReport, interaction: capture.interaction, pseudoStates: capture.pseudoStates, rejectedSpecs, components, humanizeMode, framework: cloneOpts.framework, motion: capture.motion, reflow: !!cloneOpts.reflow, forceCenter }, tokensCss);
   const mat = materializeAssets(assetGraph, sourceDir, join(appDir, "public"));
 
   // Static HTML mirror at /static/ (served from app/public/static/).

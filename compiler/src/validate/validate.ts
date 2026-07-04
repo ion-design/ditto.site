@@ -9,6 +9,7 @@ import { detectSections } from "../infer/sections.js";
 import { buildAssetGraph } from "../infer/assets.js";
 import { buildFontGraph } from "../infer/fonts.js";
 import { generateAll } from "../generate/pipeline.js";
+import { detectUniformHorizontalOffset, writeLayoutRepairHints } from "../generate/layoutRepair.js";
 import { COMPILER_VERSION } from "../generate/manifest.js";
 import { interactionRejectedArtifact } from "../generate/interactive.js";
 import { buildApp, serveStatic, renderApp, measureProbeWidths, findRemoteRefs } from "./render.js";
@@ -129,6 +130,31 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
       }
     } finally {
       await server.close();
+    }
+    // Layout repair: uniform horizontal drift → mx-auto recentre, rebuild, re-render (≤3).
+    let outDir = build.outDir;
+    for (let li = 0; li < 3; li++) {
+      const probe = gate5Layout(ir, snapshots, sections, viewports, reflowOpt);
+      if (probe.pass) break;
+      const hints = detectUniformHorizontalOffset(ir, snapshots, viewports);
+      if (!hints) break;
+      writeLayoutRepairHints(sourceDir, hints);
+      generateAll({ sourceDir, capture, viewports, sampleViewports: capture.viewports, url, outDir: generatedDir });
+      const reb = buildApp(appDir, harnessDir);
+      if (!reb.ok || !reb.outDir) break;
+      outDir = reb.outDir;
+      const srv = await serveStatic(outDir);
+      try {
+        const r2 = await renderApp({ url: srv.url + "/", viewports, renderedDir });
+        snapshots = r2.snapshots;
+        runtimeErrors = r2.runtimeErrors;
+        httpStatus = r2.httpStatus;
+        failedResources = r2.failedResources;
+        probeSnaps = await measureProbeWidths({ url: srv.url + "/", widths: probeWidthsFor(viewports) });
+      } finally {
+        await srv.close();
+      }
+      log({ event: "layout_repair", iter: li + 1, cids: hints.forceCenterCids.length });
     }
   }
   // Video/audio elements stream and their requests are aborted ("failed") when the

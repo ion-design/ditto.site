@@ -142,4 +142,10 @@ export class DbBackend implements Backend {
     const url = this.deps.store.uploadBundle ? await this.deps.store.uploadBundle(jobId, format, bytes) : undefined;
     return { bytes, sha256: sha256hex(bytes), format, url };
   }
+
+  async events(jobId: string, after = 0): Promise<Array<Record<string, unknown>> | null> {
+    const job = await repo.getJob(this.deps.db, jobId);
+    if (!job) return null;
+    return repo.listJobEvents(this.deps.db, jobId, after);
+  }
 }

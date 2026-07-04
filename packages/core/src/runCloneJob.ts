@@ -166,6 +166,7 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       // Repeat-clone speed path: reuse the URL-keyed cached capture when it is fresh
       // AND feature-compatible with this request (viewports/interactions/motion/screenshots).
       const reuseSource =
+        !requestOptions.noCache &&
         cacheEntry &&
         freshCapture(cacheEntry, input.captureCacheTtlMs) &&
         captureCompatible(cacheEntry, options, captureValidationArtifacts)
