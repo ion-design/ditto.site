@@ -475,6 +475,29 @@ describe("generateCss literal-margin vs auto-centring", () => {
     const mobile = xBandRule(css, /^\(max-width/, "n1");
     assert.ok(/max-width:311px/.test(mobile), `mobile band carries its own fluid cap, got: ${mobile}`);
   });
+
+  // Same centred `width:100%; max-width:min(Wpx, …); margin:0 auto` container, but it is a FLEX ITEM
+  // (its parent is display:flex). planWidth case (a) and centeredAtVp both bail on flex/grid items, so
+  // without isCappedCenteredContainer it would freeze its captured per-band side margins (32/47/67px)
+  // and left-align at every non-captured width. margin:auto centres a flex item correctly, and the
+  // retained per-band max-width cap keeps it safe (auto only absorbs the centring slack).
+  it("auto-centres a fluid-max-width container that is a FLEX ITEM (parent is flex)", () => {
+    const child = xNode("n1", "div", {
+      375: { cs: { display: "block", boxSizing: "border-box", maxWidth: "311px", marginLeft: "32px", marginRight: "32px", width: "311px" }, bbox: { x: 32, y: 0, width: 311, height: 200 } },
+      768: { cs: { display: "block", boxSizing: "border-box", maxWidth: "673.2px", marginLeft: "47.4px", marginRight: "47.4px", width: "673.2px" }, bbox: { x: 47.4, y: 0, width: 673.2, height: 200 } },
+      1280: { cs: { display: "block", boxSizing: "border-box", maxWidth: "1145.08px", marginLeft: "67.46px", marginRight: "67.46px", width: "1145.08px" }, bbox: { x: 67.46, y: 0, width: 1145.08, height: 200 } },
+    });
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "flex", flexDirection: "column" }, bbox: { x: 0, y: 0, width: 375, height: 200 } },
+      768: { cs: { display: "flex", flexDirection: "column" }, bbox: { x: 0, y: 0, width: 768, height: 200 } },
+      1280: { cs: { display: "flex", flexDirection: "column" }, bbox: { x: 0, y: 0, width: 1280, height: 200 } },
+    }, [child]);
+    const css = generateCss(xIr(parent), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/margin-left:auto/.test(all), `flex-item fluid-cap centred container must auto-centre, got: ${all}`);
+    assert.ok(!/margin-left:32px|margin-left:47|margin-left:0?67/.test(all), `must NOT bake literal per-band left margins, got: ${all}`);
+    assert.ok(baseRule(css, "n1").includes("max-width:1145.08px"), `base carries the canonical cap, got: ${baseRule(css, "n1")}`);
+  });
 });
 
 // BUG C — a single-line text leaf whose unwrapped width nearly fills its column at every width gets
@@ -963,6 +986,51 @@ describe("generateCss circular carousel slide with a block-level fill child (FIX
   });
 });
 
+// FIX 4b — the circular-slide detector must NOT misfire on a genuine fluid full-bleed section. A
+// `shrink-0` flex/grid item whose box spans the FULL viewport at ≥2 distinct captured widths (x≈0,
+// width≈vp) with zero horizontal margins provably HAS a width source (it fills a fluid container /
+// was authored width:100%) — there is no circular collapse, so it must emit a fluid width, not freeze
+// to per-breakpoint captured px (w-320/w-192/w-480). Same "proven fluid" bar (≥2 distinct widths).
+describe("generateCss circular-slide guard skips fluid full-bleed section (FIX 4b)", () => {
+  const blockFill = (): RawSizing => ({ wAuto: true, wFill: true, hAuto: true, hFill: true });
+  function fullBleedSection() {
+    // A shrink-0 flex item whose bbox tracks the viewport (375/768/1280) with zero horizontal margins:
+    // a fluid full-bleed section, NOT a fixed-width carousel slide. Its block child fills it.
+    const child = xNode("n2", "div", {
+      375: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 375, height: 80 }, sizing: blockFill() },
+      768: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 768, height: 80 }, sizing: blockFill() },
+      1280: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 1280, height: 80 }, sizing: blockFill() },
+    }, [{ text: "Full bleed" } as IRChild]);
+    // flex-shrink:0 item; its captured px equals the viewport at each width (what the library/probe saw).
+    // boxSizing:content-box keeps isFillsContainerWidth/isFullWidthShrinkSlide (border-box only) off, so
+    // WITHOUT the guard the circular-slide detector wins and freezes these per-breakpoint px.
+    const secCs = (w: number) => ({ display: "block", position: "static", flexShrink: "0", boxSizing: "content-box", marginLeft: "0px", marginRight: "0px", width: `${w}px` });
+    const section = xNode("n1", "nav", {
+      375: { cs: secCs(375), bbox: { x: 0, y: 0, width: 375, height: 80 } },
+      768: { cs: secCs(768), bbox: { x: 0, y: 0, width: 768, height: 80 } },
+      1280: { cs: secCs(1280), bbox: { x: 0, y: 0, width: 1280, height: 80 } },
+    }, [child]);
+    // A flex track with symmetric padding: its CONTENT width is narrower than the full-viewport section,
+    // so the "fills the flex container content" detectors (isFillsContainerWidth / isFullWidthShrinkSlide)
+    // do NOT fire — leaving the circular-slide detector as the width-plan winner it must be guarded from.
+    const trackCs = { display: "flex", position: "static", paddingLeft: "24px", paddingRight: "24px" };
+    return xNode("n0", "body", {
+      375: { cs: trackCs, bbox: { x: 0, y: 0, width: 375, height: 80 } },
+      768: { cs: trackCs, bbox: { x: 0, y: 0, width: 768, height: 80 } },
+      1280: { cs: trackCs, bbox: { x: 0, y: 0, width: 1280, height: 80 } },
+    }, [section]);
+  }
+
+  it("emits a fluid width for a full-viewport-span shrink-0 flex item, not frozen per-breakpoint px", () => {
+    const css = generateCss(xIr(fullBleedSection()), new Map());
+    const section = allRulesX(css, "n1");
+    assert.ok(!/width:375px|width:768px|width:1280px/.test(section), `a fluid full-bleed section must not freeze to captured px, got: ${section}`);
+    // A fluid outcome is either an explicit fluid width (width:100%/auto) OR no width at all — the block
+    // default resolves to auto and fills the container. Any FIXED px width would be the frozen misfire.
+    assert.ok(!/width:\d/.test(section) || /width:100%|width:auto/.test(section), `a fluid full-bleed section must emit a fluid width (or none), got: ${section}`);
+  });
+});
+
 // ===========================================================================
 // Emission-geometry fix wave (T1/T2/T3/T5, C1 css side, C2)
 // ===========================================================================
@@ -1149,6 +1217,40 @@ describe("generateCss aspectHeightLaw rejects width-clamping ratio transfer (FIX
     const all = allRulesX(css, "n1");
     assert.ok(!/aspect-ratio:\s*1\s*\/\s*1/.test(all) && !/aspect-ratio:1\/1/.test(all),
       `must not force aspect-square where the max-height transfer would clamp width, got: ${all}`);
+  });
+});
+
+// FIX 4 — a full-screen hero authored `min-h-[100vh] md:min-h-[calc(100vh - 137px)]` gets its
+// per-viewport min-height baked to px at capture, freezing the hero to one window height and leaving
+// whitespace at other heights. With an authored vh-token corroboration, the constant-offset law
+// `calc(100vh - 137px)` (k=1) must be recovered from samples spanning DIFFERENT viewport heights and
+// re-emitted, instead of the frozen px. XVPS heights are 812/1024/800, so C=137 → 675/887/663px.
+describe("generateCss recovers a viewport-relative min-height law (FIX 4)", () => {
+  function hero(src: string | undefined): IRNode {
+    const n = xNode("n1", "section", {
+      375: { cs: { display: "flex", position: "static", minHeight: "675px" }, bbox: { x: 0, y: 0, width: 375, height: 675 } },
+      768: { cs: { display: "flex", position: "static", minHeight: "887px" }, bbox: { x: 0, y: 0, width: 768, height: 887 } },
+      1280: { cs: { display: "flex", position: "static", minHeight: "663px" }, bbox: { x: 0, y: 0, width: 1280, height: 663 } },
+    });
+    if (src !== undefined) n.srcClass = src;
+    return xNode("n0", "body", Object.fromEntries(XVPS.map((vp) => [vp, { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: vp, height: 900 } }])), [n]);
+  }
+
+  it("emits calc(100vh - 137px) and drops the frozen px when srcClass carries a vh token", () => {
+    const css = generateCss(xIr(hero("flex min-h-[100vh] md:min-h-[calc(100vh_-_137px)]")), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/min-height:calc\(100vh - 137px\)/.test(all), `hero min-height must become the viewport law, got: ${all}`);
+    assert.ok(!/min-height:663px/.test(all), `desktop min-height must not stay frozen px, got: ${all}`);
+    assert.ok(!/min-height:887px/.test(all), `768 min-height must not stay frozen px, got: ${all}`);
+    assert.ok(!/min-height:675px/.test(all), `375 min-height must not stay frozen px, got: ${all}`);
+  });
+
+  it("keeps the baked px when srcClass has NO viewport-relative token (corroboration guard)", () => {
+    const css = generateCss(xIr(hero("flex min-h-[675px] md:min-h-[663px]")), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/calc\(100vh/.test(all), `a content-driven min-height must not be mistaken for a vh law, got: ${all}`);
+    assert.ok(/min-height:663px/.test(all) || /min-height:675px/.test(all) || /min-height:887px/.test(all),
+      `without a vh token the baked px min-height must survive, got: ${all}`);
   });
 });
 

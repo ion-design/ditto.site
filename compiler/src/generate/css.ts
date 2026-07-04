@@ -318,6 +318,7 @@ const viewportHeightFor = (vp: number): number => CAPTURE_VIEWPORT_HEIGHTS[vp] ?
 type GeometryPlan = {
   heightByVp?: Record<number, string>;
   aspectByVp?: Record<number, string>;
+  minHeightByVp?: Record<number, string>;
   leftByVp?: Record<number, string>;
   topByVp?: Record<number, string>;
 };
@@ -813,6 +814,69 @@ function singleFluidGridRow(node: IRNode, viewports: number[]): Map<number, stri
   return painted >= 2 ? result : null;
 }
 
+/** A box authored with a viewport-relative min-height (e.g. `min-h-screen` or
+ * `min-h-[calc(100vh - Cpx)]`) whose per-viewport px is baked at capture, freezing a full-screen
+ * hero to one window height. The engine only sees the resolved px, so we recover the authored law
+ * `calc(100vh - Cpx)` (constant offset C, k=1) from samples spanning DIFFERENT viewport heights and
+ * re-emit it as a viewport unit. Gated by an authored vh-token corroboration so a content-driven
+ * min-height can't be mistaken for a viewport law. */
+function viewportMinHeightLaw(node: IRNode, viewports: number[]): Record<number, string> | null {
+  // Authored corroboration: only recover a viewport law when the source class carries a
+  // viewport-relative min-height intent. Without srcClass we can't distinguish it from a fixed box.
+  const src = node.srcClass || "";
+  if (!src) return null;
+  const hasVhIntent =
+    /\b\d*\.?\d*(?:vh|dvh|svh|lvh)\b/.test(src) ||
+    src.includes("100vh") || src.includes("min-h-screen") ||
+    src.includes("min-h-[100vh") || src.includes("calc(100vh");
+  if (!hasVhIntent) return null;
+
+  const samples: Array<{ vp: number; mh: number; vh: number }> = [];
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const nb = node.bboxByVp[vp];
+    if (!cs || !nb || !node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    const mhRaw = cs.minHeight;
+    if (!mhRaw || !mhRaw.endsWith("px")) continue;
+    const mh = pf(mhRaw);
+    if (!(mh >= 120)) continue; // avoid tiny content boxes
+    samples.push({ vp, mh, vh: viewportHeightFor(vp) });
+  }
+  if (samples.length < 2) return null;
+  // The law must be DETERMINED: at least two samples whose viewport heights actually differ.
+  // If every sample shares one viewport height, a fixed px is indistinguishable from `100vh`.
+  const vhs = samples.map((s) => s.vh);
+  if (Math.max(...vhs) - Math.min(...vhs) <= 1) return null;
+
+  // Per-sample offset C_i = vh_i - mh_i, checked against the SAME viewport's own captured height (an
+  // exact per-sample identity, not an extrapolation). Responsive heroes are commonly authored as a
+  // BREAKPOINT-SPLIT law — `min-h-[100vh] md:min-h-[calc(100vh - Cpx)]` — so C is a per-regime
+  // constant, NOT globally constant: the mobile band has C≈0 (`100vh`) while the desktop bands share
+  // one positive C (`calc(100vh - Cpx)`). We allow that split but keep each regime determined:
+  //   - each C_i must be a modest subtraction (0 <= C_i <= 0.5·vh_i), else the box isn't viewport-fit;
+  //   - the NON-ZERO offsets must all agree within 1.5px (one determined desktop offset, k=1) — a
+  //     spread of distinct positive C's is ambiguous, so bail rather than freeze a wrong law.
+  const offsets = samples.map((s) => ({ vp: s.vp, c: s.vh - s.mh, vh: s.vh }));
+  for (const o of offsets) {
+    if (o.c < -1.5) return null;              // an addition, not a viewport-fit subtraction
+    if (o.c > 0.5 * o.vh) return null;        // too large an offset to be a full-screen hero
+  }
+  const nonZero = offsets.filter((o) => o.c > 1.5).map((o) => o.c);
+  let deskC = 0;
+  if (nonZero.length) {
+    // A non-zero offset regime must be CORROBORATED: a lone desktop sample with a unique positive C is
+    // indistinguishable from a genuinely fixed px min-height (e.g. `min-h-[100vh] md:min-h-[500px]`), so
+    // require >= 2 desktop samples that agree on one C (within 1.5px). A C≈0 (`100vh`) band is an exact
+    // per-sample viewport identity and needs no such corroboration.
+    if (nonZero.length < 2) return null;
+    const mean = nonZero.reduce((a, b) => a + b, 0) / nonZero.length;
+    if (nonZero.some((c) => Math.abs(c - mean) > 1.5)) return null; // desktop offsets disagree
+    deskC = Math.round(mean);
+  }
+  const out: Record<number, string> = {};
+  for (const o of offsets) out[o.vp] = o.c <= 1.5 ? "100vh" : `calc(100vh - ${deskC}px)`;
+  return out;
+}
+
 /** A large structural/media box whose captured height is a viewport-height expression with a lower
  * and/or upper clamp. Cursor's demo frames are the canonical example: every sampled height equals
  * `clamp(MIN, 70vh, MAX)`, but the engine only sees the resolved px row height. */
@@ -1025,6 +1089,22 @@ function isFlexFillItem(node: IRNode, parentNode: IRNode | undefined, viewports:
  *  genuine circular collapse, never on a normal content-sized shrink-0 item. */
 function isCircularShrinkSlide(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
   if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return false;
+  // A box that spans the full viewport at ≥2 distinct widths with no horizontal margins has a real
+  // width source (it fills a fluid container / was authored width:100%) — it is NOT a circular-collapse
+  // slide. `width:100%`/`auto` gives its fill-children a valid definite basis, so there is nothing to
+  // collapse. Same "proven fluid" bar (samples >= 2 distinct widths) used by isFluidFullBleed /
+  // isFluidFillItem above; freezing such a full-bleed section to captured px is exactly the misfire.
+  const nearZero = (v: string | undefined): boolean => v != null && v !== "auto" && Math.abs(parseFloat(v)) <= 1.5;
+  let fluidSpan = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const bb = node.bboxByVp[vp];
+    if (!cs || !bb || !node.visibleByVp[vp] || (cs.display || "") === "none" || !(bb.width > 0)) continue;
+    if (Math.abs(bb.x) > 1.5) continue;                  // must start at the left edge
+    if (Math.abs(bb.width - vp) > 1.5) continue;         // must span the full viewport
+    if (!nearZero(cs.marginLeft) || !nearZero(cs.marginRight)) continue; // margins make the width load-bearing
+    fluidSpan++;
+  }
+  if (fluidSpan >= 2) return false;                       // proven fluid full-bleed, not a circular slide
   let painted = 0;
   for (const vp of viewports) {
     const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp]; const nb = node.bboxByVp[vp];
@@ -2693,8 +2773,13 @@ function declsForViewport(
   } else if (cs.height && cs.height !== "auto" && !isTableWithCaption && !rootUnclamp && !dropHeight && (!isInlineOnly || REPLACED.has(tag)) && (noCollapse || isLeaf || explicitHeight)) {
     out.set("height", cs.height);
   }
+  const plannedMinHeight = geometry.minHeightByVp?.[vp];
   if (cs.minHeight && cs.minHeight !== "0px" && cs.minHeight !== "auto") {
-    out.set("min-height", isViewportHeight(cs.minHeight, vp) ? "100vh" : cs.minHeight);
+    if (plannedMinHeight) {
+      out.set("min-height", plannedMinHeight);
+    } else {
+      out.set("min-height", isViewportHeight(cs.minHeight, vp) ? "100vh" : cs.minHeight);
+    }
   }
 
   // borders (complete triple per side, only when width > 0). When all four sides are
@@ -3083,6 +3168,59 @@ function hasPxMaxWidthCap(node: IRNode, viewports: number[]): boolean {
   const max = Math.max(...caps);
   const min = Math.min(...caps);
   return max > 0 && max - min <= Math.max(2, max * 0.02);
+}
+
+/** A centred max-width container that also qualifies when it is a FLEX/GRID ITEM (which
+ *  `planWidth` case (a) and `centeredAtVp` both bail on — a flex/grid item is normally positioned by
+ *  the parent layout). The pattern: `width:100%; max-width:W; margin:0 auto` — the box fills its
+ *  container below the cap and centres (symmetric free space) above it. `margin:auto` centres a
+ *  flex/grid item along the main axis exactly as it centres a block, so emitting `mx-auto` is correct
+ *  here too; freezing the captured side margins (which vary per width — 32/47/67/324px) instead
+ *  left-aligns the box at any non-captured width.
+ *
+ *  This is SAFE (unlike the width-dropped fill-inset case `centeredAtVp` guards against, where
+ *  `margin:auto` resolves to 0 and blows the box full-bleed) precisely because a px `max-width` cap
+ *  is RETAINED at every band: the cap holds the width, so `margin:auto` can only absorb the centring
+ *  slack, never over-widen. The `max-width` cap may VARY per viewport (a fluid
+ *  `min(Wpx, 100% − 2·gutter)` resolves to a different px per width) — we accept per-band caps and let
+ *  the normal `max-width` emission carry them, mirroring `planWidth` case (a)'s documented reasoning.
+ *
+ *  Every guard holds over the painted samples (≥2), and centring must be OBSERVED (symmetric positive
+ *  free space with equal margins) at ≥1 band where the container exceeds the cap: */
+function isCappedCenteredContainer(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
+  if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return false;
+  let painted = 0;
+  let sawCenter = false;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp];
+    const nb = node.bboxByVp[vp]; const pb = parentNode.bboxByVp[vp];
+    if (!cs || !pcs || !nb || !pb || !node.visibleByVp[vp] || (cs.display || "") === "none" || !(nb.width > 0)) continue;
+    // Block-LEVEL box (block/list-item/flow-root/table, or a grid/flex CONTAINER — all margin-auto
+    // centreable), in normal flow, border-box. Inline-level boxes centre via text-align, not margins.
+    if (!/^(block|list-item|flow-root|table|grid|flex)$/.test(cs.display || "")) return false;
+    const pos = cs.position || "static";
+    if (pos !== "static" && pos !== "relative") return false;
+    if ((cs.float || "none") !== "none") return false;
+    if ((cs.boxSizing || "border-box") === "content-box") return false;
+    const maxW = cs.maxWidth || "";
+    if (!maxW.endsWith("px")) return false;               // must carry a px max-width cap at every band
+    const cap = pf(maxW);
+    if (!(cap > 0)) return false;
+    const content = pb.width - pf(pcs.paddingLeft) - pf(pcs.paddingRight) - pf(pcs.borderLeftWidth) - pf(pcs.borderRightWidth);
+    if (!(content > 0)) return false;
+    // The box sits at min(containerContent, cap): it fills the container below the cap and plateaus at
+    // the cap above it — the exact `width:100%; max-width:W` trajectory (NOT a fixed or content width).
+    if (Math.abs(nb.width - Math.min(content, cap)) > Math.max(1.5, 0.01 * nb.width)) return false;
+    const ml = pf(cs.marginLeft); const mr = pf(cs.marginRight);
+    // Where the container exceeds the cap there is room to centre — the box MUST be centred there
+    // (symmetric positive side margins), else it is left/right-aligned and margin:auto would move it.
+    if (content > cap + 4) {
+      if (ml > 1 && mr > 1 && Math.abs(ml - mr) <= 1.5) sawCenter = true;
+      else return false;
+    }
+    painted++;
+  }
+  return painted >= 2 && sawCenter;
 }
 
 function hasElementChild(node: IRNode): boolean {
@@ -3546,7 +3684,11 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const stableCenter =
       centerAlways ||
       sourceMarginAutoIntent(node) ||
-      ((!!fillCap || hasPxMaxWidthCap(node, sampleVps)) && centeredAtAnySample);
+      ((!!fillCap || hasPxMaxWidthCap(node, sampleVps)) && centeredAtAnySample) ||
+      // A centred max-width container that is a flex/grid ITEM (which centerAlways / centeredAtVp bail
+      // on): `width:100%; max-width:W; margin:0 auto`. Safe because the px max-width cap is retained,
+      // so mx-auto only absorbs the centring slack. Handles per-viewport-varying caps.
+      isCappedCenteredContainer(node, parentNode, sampleVps);
     // Fluid grid-template-columns (fr), per-viewport (the column count may change across breakpoints).
     const gridColsByVp = fluidGridColumns(node, sampleVps);
     // Large one-row media grids need a definite height/aspect law before the single `1fr` row is
@@ -3558,8 +3700,11 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const mediaGeometry = lottieHeight ? { heightByVp: lottieHeight } : singleRowsByVp ? mediaHeightGeometry(node, sampleVps) : {};
     const leftClampByVp = !isContents ? centeredInsetClamp(node, cbAncestor, sampleVps, "x") : null;
     const topClampByVp = !isContents ? centeredInsetClamp(node, cbAncestor, sampleVps, "y") : null;
-    const geometry: GeometryPlan = (mediaGeometry.heightByVp || mediaGeometry.aspectByVp || leftClampByVp || topClampByVp)
-      ? { ...mediaGeometry, ...(leftClampByVp ? { leftByVp: leftClampByVp } : {}), ...(topClampByVp ? { topByVp: topClampByVp } : {}) }
+    // Recover an authored viewport-relative min-height (`100vh`/`calc(100vh - Cpx)`) so a full-screen
+    // hero refills the window instead of freezing to the captured px at each band.
+    const minHeightByVp = !isContents ? viewportMinHeightLaw(node, sampleVps) : null;
+    const geometry: GeometryPlan = (mediaGeometry.heightByVp || mediaGeometry.aspectByVp || minHeightByVp || leftClampByVp || topClampByVp)
+      ? { ...mediaGeometry, ...(minHeightByVp ? { minHeightByVp } : {}), ...(leftClampByVp ? { leftByVp: leftClampByVp } : {}), ...(topClampByVp ? { topByVp: topClampByVp } : {}) }
       : GEOMETRY_NONE;
     // Fluid grid-template-rows (1fr) for equal, responsive, content-height-filling row regimes.
     const gridRowsByVp = fluidGridRows(node, sampleVps) ?? ((geometry.heightByVp || geometry.aspectByVp) ? singleRowsByVp : null);
