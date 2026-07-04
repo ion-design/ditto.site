@@ -820,3 +820,47 @@ describe("generateCss text-wrap", () => {
     assert.ok(!/text-wrap/.test(baseRule(css, "n2")), `inherited child does not re-emit (got: ${baseRule(css, "n2")})`);
   });
 });
+
+// FIX 4 — a library-sized carousel slide (a shrink-0 flex item with an injected inline `width:Npx`)
+// whose only in-flow child is a display:block box. A block box's `width:auto` IS its fill width, so
+// the sizing probe reports the child wAuto AND wFill both true. The circular-slide detector must count
+// that block-level fill child as width-DERIVING (it never establishes a width) and pin the slide's
+// captured px — otherwise the guard misreads the child as a genuine content-width source, bails, and
+// the slide content-sizes to a different width (ragged carousel rails).
+describe("generateCss circular carousel slide with a block-level fill child (FIX 4)", () => {
+  // The slide's child is display:block: its auto width equals the fill width, so BOTH probe bits fire.
+  const blockFill = (): RawSizing => ({ wAuto: true, wFill: true, hAuto: true, hFill: true });
+  function slideRow() {
+    // Uniform 220px slides at every viewport (Splide's inline width) inside a flex track.
+    const mkSlide = (id: string, childId: string): IRNode => {
+      const child = xNode(childId, "div", {
+        375: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 220, height: 357 }, sizing: blockFill() },
+        768: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 220, height: 357 }, sizing: blockFill() },
+        1280: { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: 220, height: 357 }, sizing: blockFill() },
+      }, [{ text: "Men's Tops & Shirts" } as IRChild]);
+      const slideCs = { display: "block", position: "static", flexShrink: "0", width: "220px" };
+      return xNode(id, "div", {
+        375: { cs: slideCs, bbox: { x: 0, y: 0, width: 220, height: 357 } },
+        768: { cs: slideCs, bbox: { x: 0, y: 0, width: 220, height: 357 } },
+        1280: { cs: slideCs, bbox: { x: 0, y: 0, width: 220, height: 357 } },
+      }, [child]);
+    };
+    const trackCs = { display: "flex", position: "static" };
+    const track = xNode("n1", "ul", {
+      375: { cs: trackCs, bbox: { x: 0, y: 0, width: 375, height: 357 } },
+      768: { cs: trackCs, bbox: { x: 0, y: 0, width: 768, height: 357 } },
+      1280: { cs: trackCs, bbox: { x: 0, y: 0, width: 1280, height: 357 } },
+    }, [mkSlide("n2", "n3"), mkSlide("n4", "n5")]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 357 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 357 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 357 } },
+    }, [track]);
+  }
+
+  it("pins the slide's captured width even though its block child reports wAuto:true", () => {
+    const css = generateCss(xIr(slideRow()), new Map());
+    const slide = allRulesX(css, "n2");
+    assert.ok(/width:220px/.test(slide), `the library-sized slide must keep its 220px width, got: ${slide}`);
+  });
+});

@@ -251,6 +251,54 @@ export function isIdentityTransform(value: string | undefined): boolean {
   return false;
 }
 
+/** Parse a CSS length to px (number), 0 for `auto`/empty/non-px. */
+function pfLen(v: string | undefined): number {
+  if (!v) return 0;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** The horizontal translate (matrix `e`) of a computed transform, or null if the transform is not a
+ *  pure-2D matrix/matrix3d with a definite tx (rotation/scale/skew or 3D perspective → null: we only
+ *  re-anchor plain horizontal track offsets). `matrix(a,b,c,d,e,f)` → e; `matrix3d(...)` → m41. */
+function translateXOf(value: string | undefined): number | null {
+  if (!value || value === "none") return null;
+  const m = /^matrix\(([^)]*)\)$/.exec(value.trim());
+  if (m) {
+    const n = m[1]!.split(",").map((s) => parseFloat(s.trim()));
+    if (n.length !== 6 || n.some((x) => !Number.isFinite(x))) return null;
+    if (n[1] !== 0 || n[2] !== 0) return null;               // has rotation/skew → not a plain slide
+    return n[4]!;
+  }
+  const m3 = /^matrix3d\(([^)]*)\)$/.exec(value.trim());
+  if (m3) {
+    const n = m3[1]!.split(",").map((s) => parseFloat(s.trim()));
+    if (n.length !== 16 || n.some((x) => !Number.isFinite(x))) return null;
+    // Require an otherwise-identity 3D matrix apart from the translate column (indices 12/13/14).
+    const idExceptTranslate = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, /*12*/ 0, /*13*/ 0, /*14*/ 0, 1];
+    for (let i = 0; i < 16; i++) { if (i === 12 || i === 13 || i === 14) continue; if (n[i] !== idExceptTranslate[i]) return null; }
+    return n[12]!;
+  }
+  return null;
+}
+
+/** Return `value` with its horizontal translate replaced by `tx` (keeps the rest of the matrix). */
+function setTranslateX(value: string, tx: number): string {
+  const m = /^matrix\(([^)]*)\)$/.exec(value.trim());
+  if (m) {
+    const n = m[1]!.split(",").map((s) => s.trim());
+    n[4] = String(tx);
+    return `matrix(${n.join(", ")})`;
+  }
+  const m3 = /^matrix3d\(([^)]*)\)$/.exec(value.trim());
+  if (m3) {
+    const n = m3[1]!.split(",").map((s) => s.trim());
+    n[12] = String(tx);
+    return `matrix3d(${n.join(", ")})`;
+  }
+  return value;
+}
+
 /**
  * Normalize per-viewport transform values so identity is represented uniformly as the literal
  * `none`. Two problems this closes, both in the per-viewport delta emission downstream:
@@ -506,6 +554,8 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     // interactive panel so its whole (possibly display:none) subtree is retained.
     const keepAll = forced || preserveCaps.has(node.attrs["data-cid-cap"] ?? "");
     const keptChildren: IRChild[] = [];
+    // Per element child, in original order: was it kept? (for track-transform re-anchoring below.)
+    const elemKept: Array<{ child: IRNode; kept: boolean }> = [];
     let hasVisibleDescendant = false;
     let hasText = false;
     for (const c of node.children) {
@@ -522,16 +572,81 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       if (keepAll) {
         prune(c, true);
         keptChildren.push(c);
+        elemKept.push({ child: c, kept: true });
         if (Object.values(c.visibleByVp).some(Boolean) || childHasVisible(c)) hasVisibleDescendant = true;
       } else if (prune(c, false) || keepSource) {
         keptChildren.push(c);
+        elemKept.push({ child: c, kept: true });
         if (Object.values(c.visibleByVp).some(Boolean) || childHasVisible(c)) hasVisibleDescendant = true;
+      } else {
+        elemKept.push({ child: c, kept: false });
       }
     }
     node.children = keptChildren;
+    reanchorTrackTransform(node, elemKept);
     if (keepAll) return true;
     const selfVisible = Object.values(node.visibleByVp).some(Boolean);
-    return selfVisible || hasVisibleDescendant || hasText || !!node.rawHTML;
+    return selfVisible || hasVisibleDescendant || hasText || !!node.rawHTML || isSizedInvisibleSpacer(node);
+  };
+  // An in-flow `visibility:hidden` box with a nonzero border box is LOAD-BEARING geometry: it is
+  // invisible (so `visibleByVp` is false and the visibility prune would drop it), but it still takes
+  // up its captured width/height in normal flow — a spacer/ghost column that reserves the row height
+  // its absolutely-positioned siblings paint into. Dropping it collapses the column and shifts
+  // everything below it up. Keep it as an empty sized placeholder (generation emits its w/h with
+  // `visibility:hidden` and no content). `display:none`-everywhere nodes (never in flow, zero box)
+  // and out-of-flow probes stay pruned; font-metric probes are already dropped before pruning.
+  const isSizedInvisibleSpacer = (node: IRNode): boolean => {
+    for (const vp of Object.keys(node.computedByVp).map(Number)) {
+      const cs = node.computedByVp[vp]; const bb = node.bboxByVp[vp];
+      if (!cs || !bb) continue;
+      if ((cs.display || "") === "none") continue;                    // not in flow here
+      const vis = cs.visibility || "visible";
+      if (vis !== "hidden" && vis !== "collapse") continue;           // only invisible-but-laid-out boxes
+      const pos = cs.position || "static";
+      if (pos !== "static" && pos !== "relative") continue;           // in-flow geometry only (not absolute/fixed)
+      if (bb.width > 0 && bb.height > 0) return true;                 // reserves real space
+    }
+    return false;
+  };
+  // Re-anchor a horizontally-translated TRACK container after pruning removed leading in-flow
+  // children. A settled loop carousel (Splide/Swiper/Slick) parks its track with a baked
+  // `translateX(-N)` and prepends invisible clone slides that occupy exactly [-N, 0]; the first REAL
+  // slide then paints at x=0. The visibility prune drops the off-screen clones but the baked
+  // translateX survives verbatim, so every kept slide sits N px offscreen-left (an empty band). When
+  // emission drops the leading in-flow children of such a translated track, subtract their aggregate
+  // outer width from the baked translateX per viewport so the first KEPT child lands where it was
+  // captured. NON-animated baked offsets only — animation-owned transforms are already neutralized to
+  // `none` upstream (neutralizeAnimatedTransforms), so a still-present translate here is a static bake.
+  const reanchorTrackTransform = (node: IRNode, elemKept: Array<{ child: IRNode; kept: boolean }>): void => {
+    if (elemKept.length === 0) return;
+    // Only act when a leading RUN of element children was dropped (the clone slides precede the reals).
+    const firstKeptIdx = elemKept.findIndex((e) => e.kept);
+    if (firstKeptIdx <= 0) return; // nothing dropped ahead of the first kept child (or nothing kept)
+    for (const vp of Object.keys(node.computedByVp).map(Number)) {
+      const cs = node.computedByVp[vp];
+      if (!cs || !cs.transform) continue;
+      const tx = translateXOf(cs.transform);
+      if (tx === null || tx === 0) continue; // no baked horizontal offset to re-anchor at this vp
+      // Aggregate the outer (margin-box) width of the dropped leading in-flow siblings at this vp.
+      let droppedW = 0;
+      for (let i = 0; i < firstKeptIdx; i++) {
+        const { child } = elemKept[i]!;
+        const ccs = child.computedByVp[vp]; const cb = child.bboxByVp[vp];
+        if (!ccs || !cb) continue;
+        if ((ccs.display || "") === "none") continue;
+        const cpos = ccs.position || "static";
+        if (cpos !== "static" && cpos !== "relative") continue; // out-of-flow slides don't advance the track
+        droppedW += cb.width + pfLen(ccs.marginLeft) + pfLen(ccs.marginRight);
+      }
+      if (droppedW === 0) continue;
+      // translateX is negative (track pulled left); dropping the leading clones that filled [tx, 0]
+      // means the reals shift right by droppedW → add it back. Re-anchor toward 0.
+      const next = tx + droppedW;
+      // Only re-anchor when it moves the track TOWARD the origin and doesn't overshoot past it — a
+      // guard so a partial mismatch can't push content the wrong way. Round to match capture precision.
+      if (Math.abs(next) >= Math.abs(tx)) continue;
+      cs.transform = setTranslateX(cs.transform, Math.round(next * 100) / 100);
+    }
   };
   const childHasVisible = (n: IRNode): boolean => {
     for (const c of n.children) {

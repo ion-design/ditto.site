@@ -313,8 +313,12 @@ function isValidRetag(srcTag: string, genTag: string): boolean {
   return genTag === "div" && /^(ul|ol|menu|dl|p|h[1-6])$/.test(srcTag); // content-model → div
 }
 
-function normHref(href: string, origin: string): string {
+export function normHref(href: string, origin: string): string {
   if (!href) return "";
+  // A `javascript:*` href is a script trigger, not a navigable URL. Generation emits an inert `#`
+  // for it (React blocks the literal), so treat every javascript: href — on either side — as `#`
+  // and let the two sides match instead of failing on the un-reproducible script string.
+  if (/^\s*javascript:/i.test(href)) return "#";
   if (href.startsWith("#")) return href;
   try {
     const u = new URL(href, origin);

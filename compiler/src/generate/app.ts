@@ -369,11 +369,20 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
       if (kept.length === 0) continue;
       value = kept.join(", ");
     } else if (key === "href") {
-      // Preserve in-page anchors. For multi-route sites a linkRewrite maps internal
-      // links to the generated clone routes (and collapsed-collection links to their
-      // representative); otherwise absolutize so it never 404s inside the clone
-      // (external navigation is allowed by the rubric).
-      if (!value.startsWith("#")) value = ctx?.linkRewrite ? ctx.linkRewrite(value) : resolveUrl(value, sourceUrl);
+      // A `javascript:*` href (announcement bars, JS-driven buttons authored as links) is a
+      // script trigger, not a navigable URL. React refuses to render one: it rewrites the
+      // attribute to a long `javascript:throw new Error('React has blocked a javascript: URL…')`
+      // string, which no longer matches the source href in the link gate. The behaviour is
+      // script we don't reproduce anyway, so emit an inert `#` and keep the anchor navigable-inert.
+      if (/^\s*javascript:/i.test(value)) {
+        value = "#";
+      } else if (!value.startsWith("#")) {
+        // Preserve in-page anchors. For multi-route sites a linkRewrite maps internal
+        // links to the generated clone routes (and collapsed-collection links to their
+        // representative); otherwise absolutize so it never 404s inside the clone
+        // (external navigation is allowed by the rubric).
+        value = ctx?.linkRewrite ? ctx.linkRewrite(value) : resolveUrl(value, sourceUrl);
+      }
     }
 
     let reactName = isCustom ? key : (ATTR_RENAME[key] ?? key);

@@ -349,3 +349,89 @@ describe("walker text-wrap capture", () => {
     assert.equal(p.computed.textWrap, "pretty", "text-wrap:pretty is captured");
   });
 });
+
+describe("walker shadow-DOM composed-tree serialization (FIX 1)", () => {
+  let browser: Browser;
+  let page: Page;
+  before(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  });
+  after(async () => {
+    await browser.close();
+  });
+
+  // Attach an OPEN shadow root to any host carrying data-shadow, injecting its data-shadow value as
+  // the shadow tree HTML. Runs in-page before collectPage so getComputedStyle/bbox see the composed tree.
+  const capture = async (html: string) => {
+    await page.setContent(html);
+    await page.evaluate(() => {
+      for (const host of Array.from(document.querySelectorAll("[data-shadow]"))) {
+        const markup = host.getAttribute("data-shadow") || "";
+        const sr = (host as HTMLElement).attachShadow({ mode: "open" });
+        sr.innerHTML = markup;
+      }
+    });
+    await page.evaluate("globalThis.__name = globalThis.__name || ((fn) => fn);");
+    return page.evaluate(collectPage);
+  };
+
+  it("serializes an open custom element's shadow tree as the host's children", async () => {
+    // A `<product-info>` web component renders its swatches/title/price INSIDE its shadow root; a
+    // childNodes-only walk captured it empty. The composed walk must surface the shadow content.
+    const snap = await capture(`
+      <product-info data-shadow="
+        <div class='pi-title'>Magnolia Shirt</div>
+        <span class='pi-price'>$78.00</span>
+      "></product-info>`);
+    const host = findByTag(snap.root, "product-info")!;
+    assert.ok(host, "the custom element host is present");
+    assert.equal(host.shadowHost, true, "the host is tagged as a shadow host");
+    assert.equal(textRun(host).replace(/\s+/g, " ").trim(), "Magnolia Shirt $78.00", "the shadow tree text is captured");
+    const title = findByClass(host, "pi-title")!;
+    assert.ok(title, "a shadow descendant node is serialized");
+    assert.equal(title.inShadow, true, "shadow descendants are tagged inShadow");
+    assert.ok(title.bbox.width > 0, "shadow nodes get real bboxes via getBoundingClientRect");
+  });
+
+  it("renders the FLATTENED tree: a <slot> is replaced by its assigned light-DOM nodes", async () => {
+    // The host's light child (the assigned node) renders at the slot position — once, and NOT tagged
+    // inShadow (it is the author's real content). Shadow chrome around the slot still appears.
+    const snap = await capture(`
+      <my-card data-shadow="
+        <div class='card-frame'><slot></slot></div>
+      "><h2 class='slotted'>Vintage Sunset T-Shirt</h2></my-card>`);
+    const host = findByTag(snap.root, "my-card")!;
+    const frame = findByClass(host, "card-frame")!;
+    assert.ok(frame, "the shadow frame around the slot is serialized");
+    assert.equal(frame.inShadow, true, "the shadow frame is tagged inShadow");
+    const slotted = findByClass(host, "slotted")!;
+    assert.ok(slotted, "the slotted light child renders at the slot position");
+    assert.equal(textRun(slotted).trim(), "Vintage Sunset T-Shirt");
+    assert.ok(!slotted.inShadow, "the slotted light child is NOT tagged inShadow (author content)");
+    // No double-serialization: exactly one node carries the slotted text.
+    let count = 0;
+    const countText = (n: RawNode): void => {
+      if (n.children.some((c) => isText(c) && c.text.includes("Vintage Sunset T-Shirt"))) count++;
+      for (const c of n.children) if (!isText(c)) countText(c as RawNode);
+    };
+    countText(host);
+    assert.equal(count, 1, "the slotted child is serialized exactly once");
+  });
+
+  it("uses <slot> fallback content when nothing is assigned", async () => {
+    const snap = await capture(`
+      <my-badge data-shadow="
+        <span class='badge'><slot>Default Label</slot></span>
+      "></my-badge>`);
+    const host = findByTag(snap.root, "my-badge")!;
+    assert.equal(textRun(host).replace(/\s+/g, " ").trim(), "Default Label", "unfilled slot falls back to its own content");
+  });
+
+  it("does not tag ordinary light-DOM nodes as shadow", async () => {
+    const snap = await capture(`<div class="plain"><p>light</p></div>`);
+    const plain = findByClass(snap.root, "plain")!;
+    assert.ok(!plain.shadowHost, "a plain div is not a shadow host");
+    assert.ok(!plain.inShadow, "plain light DOM is not tagged inShadow");
+  });
+});

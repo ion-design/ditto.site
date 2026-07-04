@@ -1,6 +1,24 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { letterSpacingEquivalent } from "../src/validate/gates.js";
+import { letterSpacingEquivalent, normHref } from "../src/validate/gates.js";
+
+// FIX 5 — the link gate must not fail a javascript: source href against the clone's sanitized value.
+// Generation emits an inert `#` for a `javascript:*` href (React blocks the literal), so normHref
+// collapses every javascript: href — on either side — to `#`, letting the two sides match.
+describe("normHref collapses javascript: hrefs to # (FIX 5)", () => {
+  const origin = "https://example.test";
+  it("normalizes a javascript: source href to #", () => {
+    assert.equal(normHref("Javascript:{}", origin), "#");
+    assert.equal(normHref("javascript:void(0)", origin), "#");
+  });
+  it("makes a javascript: source match the emitted # value", () => {
+    assert.equal(normHref("javascript:{}", origin), normHref("#", origin), "source and clone agree");
+  });
+  it("still distinguishes a real fragment from a full URL", () => {
+    assert.equal(normHref("#top", origin), "#top");
+    assert.equal(normHref("https://example.test/x/", origin), "https://example.test/x");
+  });
+});
 
 // Chromium serializes a computed `letter-spacing: 0` back as the keyword `normal`. The emitter, after
 // snapping a sub-0.1px authored tracking to 0, ships `letter-spacing: 0px` — which the CLONE then

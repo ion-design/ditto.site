@@ -11,6 +11,7 @@ import {
   PACKAGE_JSON_TW,
   PACKAGE_JSON_VITE,
   PACKAGE_JSON_VITE_TW,
+  propsList,
   type ComponentRegistry,
 } from "../src/generate/app.js";
 import { DITTO_WIRE_TSX, ACCORDION_TSX } from "../src/generate/interactive.js";
@@ -163,5 +164,36 @@ describe("lottie-web is declared when its import is emitted (fix 7)", () => {
       const deps = JSON.parse(injected).dependencies as Record<string, string>;
       assert.equal(deps["lottie-web"], "5.12.2", "lottie-web pinned to the harness version");
     }
+  });
+});
+
+// ---- FIX 5: javascript: hrefs are sanitized to an inert '#' ----
+// React refuses to render a `javascript:*` href verbatim — it rewrites it to a long
+// `javascript:throw new Error('React has blocked a javascript: URL…')` string that no longer matches
+// the source href in the link gate. Emit an inert `#` instead (the script behaviour isn't reproduced).
+describe("javascript: hrefs are emitted as an inert '#' (FIX 5)", () => {
+  const hrefOf = (n: IRNode): string | undefined => {
+    const p = propsList(n, new Map(), "https://example.test/").find(([k]) => k === "href");
+    return p ? JSON.parse(p[1]) : undefined;
+  };
+  it("rewrites a javascript: href to #", () => {
+    const a = node("n1", "a", computed());
+    a.attrs = { href: "Javascript:{}" };
+    assert.equal(hrefOf(a), "#", "a javascript: href is sanitized to #");
+  });
+  it("rewrites javascript:void(0) too (case-insensitive, with args)", () => {
+    const a = node("n1", "a", computed());
+    a.attrs = { href: "javascript:void(0)" };
+    assert.equal(hrefOf(a), "#");
+  });
+  it("leaves a normal in-page anchor href untouched", () => {
+    const a = node("n1", "a", computed());
+    a.attrs = { href: "#section" };
+    assert.equal(hrefOf(a), "#section", "a real fragment link is preserved");
+  });
+  it("leaves an ordinary external href resolved (not collapsed to #)", () => {
+    const a = node("n1", "a", computed());
+    a.attrs = { href: "https://example.test/products" };
+    assert.equal(hrefOf(a), "https://example.test/products");
   });
 });

@@ -48,6 +48,14 @@ export type RawNode = {
   // libraries, FontFaceObserver): absolutely positioned, parked far off-screen, and non-painting.
   // Never user-visible; excluded from emission so it doesn't ship as page markup.
   probe?: boolean;
+  // This element hosts an OPEN shadow root: its serialized children are the composed (flattened)
+  // shadow tree — the shadowRoot's children with each <slot> replaced by its assigned light-DOM
+  // nodes — NOT the host's light-DOM children. Custom elements (`<product-info>`) render all their
+  // swatches/title/price inside this shadow tree, so a childNodes-only walk captured them empty.
+  shadowHost?: boolean;
+  // This node was serialized from inside a shadow tree (a shadowRoot descendant, or the shadow
+  // subtree of a slotted light node). Tagged so generation can emit it as ordinary light DOM.
+  inShadow?: boolean;
   sizing?: RawSizing;
   before?: RawStyle;
   after?: RawStyle;
@@ -316,7 +324,7 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       || bbox.x >= OFFSCREEN_PROBE_PX + vpW || bbox.y >= OFFSCREEN_PROBE_PX + pageH;
   };
 
-  const serializeElement = (el: Element): RawNode | null => {
+  const serializeElement = (el: Element, inShadow = false): RawNode | null => {
     if (nodeCount >= MAX_NODES) { truncated = true; return null; }
     const tag = el.tagName.toLowerCase();
     nodeCount++;
@@ -445,6 +453,7 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       bbox,
       visible: isVisible(el, cs, bbox),
       ...(isProbe(cs, bbox) ? { probe: true } : {}),
+      ...(inShadow ? { inShadow: true } : {}),
       ...(sizing ? { sizing } : {}),
       children: [],
     };
@@ -488,8 +497,28 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     // code blocks with highlighted spans separated by newlines).
     const preserveWs = /^(pre|pre-wrap|break-spaces)/.test(cs.whiteSpace || "");
 
+    // Composed (flattened) child list — the tree the user actually sees, matching what
+    // getComputedStyle/getBoundingClientRect already report for every node:
+    //   - An open shadow HOST renders its shadow tree, not its light children: iterate the
+    //     shadowRoot's children and tag them (and the host) so generation emits them as light DOM.
+    //   - A <slot> is a placeholder for the light-DOM nodes distributed into it: replace it with its
+    //     assignedNodes (or its own fallback children when nothing is assigned). Assigned nodes are
+    //     the author's real light content, so they are NOT tagged inShadow — only genuine shadow
+    //     descendants are. Walking the shadow tree (never the host's raw light children) means a
+    //     slotted child is serialized once, at the slot position, with no double-emission.
+    const sr = (el as HTMLElement).shadowRoot; // open roots only; closed roots are null here
+    let childInShadow = inShadow;
+    let childNodes: Node[];
+    if (sr) {
+      node.shadowHost = true;
+      childInShadow = true;
+      childNodes = Array.from(sr.childNodes);
+    } else {
+      childNodes = Array.from(el.childNodes);
+    }
+
     // Recurse children (elements + text nodes), preserving order.
-    for (const child of Array.from(el.childNodes)) {
+    for (const child of childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
         const t = child.textContent || "";
         if (preserveWs && t.length > 0) {
@@ -509,8 +538,28 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       }
       if (child.nodeType !== Node.ELEMENT_NODE) continue;
       const childEl = child as Element;
-      if (SKIP_TAGS.has(childEl.tagName.toLowerCase())) continue;
-      const sn = serializeElement(childEl);
+      const childTag = childEl.tagName.toLowerCase();
+      if (SKIP_TAGS.has(childTag)) continue;
+      // A slot nested deeper inside a shadow tree: expand its assigned light nodes in place. The
+      // assigned nodes are light DOM (author content), so they drop back to inShadow=false.
+      if (childTag === "slot" && childInShadow) {
+        const assigned = (childEl as HTMLSlotElement).assignedNodes({ flatten: true });
+        const slotKids = assigned.length ? assigned : Array.from(childEl.childNodes);
+        for (const sk of slotKids) {
+          if (sk.nodeType === Node.TEXT_NODE) {
+            const t = sk.textContent || "";
+            if (t.trim().length > 0) node.children.push({ text: t });
+            continue;
+          }
+          if (sk.nodeType !== Node.ELEMENT_NODE) continue;
+          const skEl = sk as Element;
+          if (SKIP_TAGS.has(skEl.tagName.toLowerCase())) continue;
+          const skn = serializeElement(skEl, assigned.length ? false : true);
+          if (skn) node.children.push(skn);
+        }
+        continue;
+      }
+      const sn = serializeElement(childEl, childInShadow);
       if (sn) node.children.push(sn);
     }
 

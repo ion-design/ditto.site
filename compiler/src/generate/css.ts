@@ -1034,7 +1034,16 @@ function isCircularShrinkSlide(node: IRNode, parentNode: IRNode | undefined, vie
       const cpos = ccs.position || "static";
       if (cpos === "absolute" || cpos === "fixed") continue;                // out of flow → no width contribution
       const csz = c.sizingByVp?.[vp];
-      if (csz && csz.wFill === true && csz.wAuto === false) { fillChildren++; continue; } // fills the slide → derives width from it
+      // A block-level in-flow box (block/flex/grid/table/list-item) takes its width FROM its
+      // container by definition: its `width:auto` computed size IS the fill size, so the probe
+      // reports wAuto AND wFill both true — indistinguishable from a genuine content-sized source.
+      // Such a child still DERIVES its width from the slide (it never establishes one), so it must
+      // count as a fill child, not veto the circular case. Only wFill matters for a block child;
+      // wAuto is redundant with it. Inline / inline-block children (whose auto width is genuinely
+      // content-derived and can size the slide) keep the strict wFill && !wAuto test.
+      const cDisp = ccs.display || "";
+      const blockLevel = /^(block|flex|grid|table|list-item|flow-root)$/.test(cDisp);
+      if (csz && csz.wFill === true && (blockLevel || csz.wAuto === false)) { fillChildren++; continue; } // fills/derives width from the slide
       return false;                                                         // a genuine in-flow width source → not circular
     }
     if (fillChildren === 0) return false;
