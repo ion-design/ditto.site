@@ -517,10 +517,102 @@ async function captureVideoStills(page: import("playwright").Page): Promise<Vide
 }
 
 /**
- * Full-page screenshot with robustness for heavy/animated pages. The default 30s
- * timeout is exceeded by tall SaaS pages (Playwright also waits for web fonts);
- * use a long timeout, freeze animations (also improves determinism), and retry.
- * As a last resort take a viewport-only shot so the file exists (the capture gate
+ * Stage 2 — canvas raster fallback. A visible <canvas> (animated background, chart,
+ * WebGL scene) is a runtime-drawn surface the clone cannot reproduce as DOM, so it
+ * would render as an empty box. Rasterize each meaningful canvas to a PNG still under
+ * a synthetic URL (the normal asset pipeline rewrites it to a local file); the node is
+ * then marked with a `src` attr so generation emits the still as an <img> filling the
+ * canvas's box. `toDataURL` is exact but THROWS for tainted canvases and for WebGL
+ * contexts without preserveDrawingBuffer — those return a shot plan for the node-side
+ * element-screenshot fallback (composited pixels, works regardless). A WebGL canvas may
+ * also toDataURL to a blank image when the drawing buffer was already presented; that
+ * blank is accepted as-is (detecting blankness would be heuristic, not deterministic).
+ * The in-page part is exported for the fixture tests (page.evaluate'd directly).
+ */
+export type CanvasStillPlan = { stills: Array<{ url: string; dataUrl: string; sel: string }>; shots: Array<{ url: string; sel: string }> };
+export function captureCanvasStillsInPage(): CanvasStillPlan {
+  const stills: CanvasStillPlan["stills"] = [];
+  const shots: CanvasStillPlan["shots"] = [];
+  const hash = (s: string): string => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); };
+  const canvases = Array.from(document.querySelectorAll("canvas"));
+  let i = 0;
+  for (const c of canvases) {
+    const r = c.getBoundingClientRect();
+    if (r.width < 48 || r.height < 48) continue; // not a meaningful painted surface
+    const cs = getComputedStyle(c);
+    if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") < 0.05) continue;
+    const idx = i++;
+    c.setAttribute("data-clone-canvas", String(idx));
+    const sel = `canvas[data-clone-canvas="${idx}"]`;
+    const url = `https://clone-canvas.local/${idx}-${hash(c.id + "|" + c.width + "|" + c.height + "|" + idx)}.png`;
+    let ok = false;
+    try {
+      const dataUrl = c.toDataURL("image/png"); // throws if tainted / WebGL buffer unreadable
+      if (dataUrl.startsWith("data:image/png")) { stills.push({ url, dataUrl, sel }); ok = true; }
+    } catch { /* fall through to the element-screenshot plan */ }
+    if (!ok) shots.push({ url, sel });
+  }
+  return { stills, shots };
+}
+
+async function captureCanvasStills(page: import("playwright").Page): Promise<CanvasStillPlan> {
+  try {
+    return await Promise.race([
+      page.evaluate(captureCanvasStillsInPage),
+      new Promise<CanvasStillPlan>((res) => setTimeout(() => res({ stills: [], shots: [] }), 12_000)),
+    ]);
+  } catch {
+    return { stills: [], shots: [] };
+  }
+}
+
+// Chromium refuses/truncates screenshots past a texture-size cap; keep clip dimensions
+// under a conservative bound so captureFullPageViaCDP fails cleanly (→ Playwright fallback)
+// instead of returning a truncated image on pathologically tall pages.
+const CDP_MAX_SHOT_DIMENSION = 16_384;
+
+/**
+ * Full-page screenshot via CDP `Page.captureScreenshot` with `captureBeyondViewport:true`.
+ * Unlike Playwright's `fullPage:true` (which scroll-stitches — scrolling the page to render
+ * each band, FIRING scroll events that drive scroll-linked animations, e.g. IX2 grow-on-scroll
+ * or WAAPI scroll-timelines), CDP renders the whole page in ONE shot WITHOUT scrolling and
+ * never fires scroll events. So the resulting still is the genuine at-rest (unscrolled) page,
+ * matching the DOM snapshot the walk grades. Writes a PNG to `path`. Throws on any failure so
+ * the caller can fall back to the Playwright path.
+ */
+export async function captureFullPageViaCDP(page: import("playwright").Page, path: string): Promise<void> {
+  const client = await page.context().newCDPSession(page);
+  try {
+    const metrics = await client.send("Page.getLayoutMetrics") as {
+      cssContentSize?: { width: number; height: number };
+      contentSize?: { width: number; height: number };
+    };
+    const size = metrics.cssContentSize ?? metrics.contentSize;
+    if (!size || !(size.width > 0) || !(size.height > 0)) throw new Error("cdp: empty content size");
+    const width = Math.ceil(size.width);
+    const height = Math.ceil(size.height);
+    if (width > CDP_MAX_SHOT_DIMENSION || height > CDP_MAX_SHOT_DIMENSION) {
+      throw new Error(`cdp: content ${width}x${height} exceeds max shot dimension`);
+    }
+    const shot = await client.send("Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width, height, scale: 1 },
+    }) as { data: string };
+    if (!shot?.data) throw new Error("cdp: no screenshot data");
+    writeBytes(path, Buffer.from(shot.data, "base64"));
+  } finally {
+    await client.detach().catch(() => { /* ignore */ });
+  }
+}
+
+/**
+ * Full-page screenshot with robustness for heavy/animated pages. Prefers CDP capture
+ * (captureFullPageViaCDP — no scroll-stitch, so scroll-linked animations aren't scrubbed
+ * and the still is the true at-rest page). On ANY CDP failure, falls back to Playwright's
+ * `fullPage:true` (which scroll-stitches but freezes animations); the default 30s timeout
+ * is exceeded by tall pages (Playwright also waits for web fonts), so use a long timeout and
+ * retry. As a last resort take a viewport-only shot so the file exists (the capture gate
  * checks presence; a partial image still beats none).
  */
 async function captureScreenshot(
@@ -529,6 +621,13 @@ async function captureScreenshot(
   vw: number,
   log: (e: Record<string, unknown>) => void,
 ): Promise<void> {
+  try {
+    await captureFullPageViaCDP(page, path);
+    log({ event: "screenshot_cdp", viewport: vw });
+    return;
+  } catch (eCdp) {
+    log({ event: "screenshot_cdp_fallback", viewport: vw, error: String(eCdp).slice(0, 200) });
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await page.screenshot({ path, fullPage: true, timeout: 90_000, animations: "disabled" });
@@ -920,6 +1019,47 @@ export async function captureSite(opts: {
         // Element screenshots scroll the target into view; restore scroll 0 so the
         // canonical DOM walk + screenshot match the generated app's default render.
         if (plan.shots.length) {
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await page.waitForTimeout(80);
+        }
+
+        // Stage 2: canvas raster fallback — same synthetic-URL mechanism as the video
+        // stills above (captureCanvasStills). Bytes ride the normal asset pipeline; the
+        // canvas node gets a `src` attr (whitelisted → survives the IR) that generation
+        // reads to emit the still as an <img> carrying the canvas's cid/box. The attr is
+        // stamped only AFTER bytes are stored, so a failed capture leaves the canvas
+        // rendering as an empty box, same as before.
+        const cplan = await captureCanvasStills(page);
+        const stampCanvasSrc = (sel: string, u: string): Promise<void> =>
+          page.evaluate(({ s, u: uu }) => { document.querySelector(s)?.setAttribute("src", uu); }, { s: sel, u }).catch(() => { /* ignore */ });
+        for (const s of cplan.stills) {
+          const comma = s.dataUrl.indexOf(",");
+          if (comma < 0) continue;
+          try {
+            const buf = Buffer.from(s.dataUrl.slice(comma + 1), "base64");
+            recordAsset(s.url, "image", "image/png", 200, "canvas-still");
+            storeBytes(s.url, "image", buf);
+            await stampCanvasSrc(s.sel, s.url);
+            log({ event: "canvas_still", viewport: vw, sel: s.sel });
+          } catch { /* ignore */ }
+        }
+        for (const s of cplan.shots) {
+          // Same reveal discipline as the video shots: a hidden canvas (entrance
+          // animation not yet fired) would time out locator.screenshot's visibility wait.
+          try {
+            await page.evaluate(forceRevealForShot, s.sel);
+            const buf = await page.locator(s.sel).first().screenshot({ type: "png", timeout: 5000, animations: "disabled" });
+            recordAsset(s.url, "image", "image/png", 200, "canvas-still");
+            storeBytes(s.url, "image", buf);
+            await stampCanvasSrc(s.sel, s.url);
+            log({ event: "canvas_still", viewport: vw, sel: s.sel });
+          } catch (e) {
+            log({ event: "canvas_still_error", viewport: vw, sel: s.sel, error: String(e).slice(0, 200) });
+          } finally {
+            await page.evaluate(restoreRevealForShot).catch(() => { /* ignore */ });
+          }
+        }
+        if (cplan.shots.length) {
           await page.evaluate(() => window.scrollTo(0, 0));
           await page.waitForTimeout(80);
         }

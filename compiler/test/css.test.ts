@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { IR, IRNode, IRChild, StyleMap, BBox } from "../src/normalize/ir.js";
 import type { RawSizing } from "../src/capture/walker.js";
-import { generateCss, collectNodeRules } from "../src/generate/css.js";
+import { generateCss, collectNodeRules, RESET_CSS } from "../src/generate/css.js";
 
 const VPS = [375, 1280];
 const CANONICAL = 1280;
@@ -615,6 +615,32 @@ describe("collectNodeRules lottie mount height pin", () => {
     const nr = rules.get("n1")!;
     const all = [nr.base.get("height"), ...nr.bands.map((b) => b.decls.get("height"))].filter(Boolean).join(";");
     assert.ok(!/227px/.test(all), `without the mount flag the varying height should flow, got: ${all}`);
+  });
+});
+
+// The reset ships a rule that forces the lottie runtime svg/canvas to fit its overlay box. The
+// player re-mounts its media into an absolute overlay that fills the host's pinned (per-viewport)
+// height; without this rule an aspect-mismatched viewBox (a portrait animation in a shorter,
+// letterboxed source box) inflates past that height. Scoped to the runtime-marked host only, so it
+// is inert when a page has no lottie.
+describe("RESET_CSS lottie runtime-fit rule", () => {
+  it("constrains the runtime svg/canvas to the overlay box, scoped to the marked host", () => {
+    assert.match(RESET_CSS, /\[data-ditto-lottie\]\s*>\s*div\s*>\s*svg/);
+    assert.match(RESET_CSS, /\[data-ditto-lottie\]\s*>\s*div\s*>\s*canvas/);
+    // the rule must pin both dimensions so height:100% resolves against the definite overlay
+    const m = RESET_CSS.match(/\[data-ditto-lottie\][^{]*\{([^}]*)\}/);
+    assert.ok(m, "the data-ditto-lottie rule must be present");
+    assert.match(m![1], /width:\s*100%/);
+    assert.match(m![1], /height:\s*100%/);
+  });
+
+  it("does not affect the pre-swap placeholder (a direct-child svg, not nested under a div)", () => {
+    // The selector targets `> div > svg` (the runtime overlay), never a `> svg` placeholder, so the
+    // captured placeholder keeps its own pinned classes and pre/post-swap geometry stays identical.
+    assert.ok(
+      !/\[data-ditto-lottie\]\s*>\s*svg\b/.test(RESET_CSS),
+      "the rule must not target a direct-child placeholder svg",
+    );
   });
 });
 

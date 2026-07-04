@@ -138,12 +138,19 @@ export default function DittoLottie({ spec }: { spec: LottieSpec }) {
           // Mount the live animation into an OVERLAY child, keeping the captured placeholder
           // frame in the DOM until lottie signals a successful load — a failed load (bad JSON,
           // network) then leaves the placeholder intact instead of erasing the container to blank.
+          // The overlay stays position:absolute;inset:0 for its WHOLE life (not just pre-swap):
+          // the host box carries the captured per-viewport height, and only an absolutely-filled
+          // overlay inherits that definite box. A static-flow overlay has indefinite height, so
+          // the player's svg (style height:100%) collapses to auto and inflates to the source
+          // aspect (a portrait viewBox then oversizes far past the captured, letterboxed box).
           const mount = document.createElement("div");
           mount.style.position = "absolute";
           mount.style.inset = "0";
           mount.style.opacity = "0";
           const cs = getComputedStyle(el);
           if (cs.position === "static") el.style.position = "relative";
+          // Mark the host so emitted CSS can force the runtime svg/canvas to fit the pinned box.
+          el.setAttribute("data-ditto-lottie", "");
           el.appendChild(mount);
           const anim = lottie.loadAnimation({
             container: mount,
@@ -171,8 +178,9 @@ export default function DittoLottie({ spec }: { spec: LottieSpec }) {
               const rendered = mount.querySelector("svg, canvas");
               if (rendered) rendered.setAttribute("data-cid", placeholderCid);
             }
-            mount.style.position = "";
-            mount.style.inset = "";
+            // Do NOT clear position/inset: the overlay must keep filling the host's pinned box
+            // (see above). Stripping them reverts it to static flow → indefinite height → the
+            // player's height:100% svg inflates to its aspect and escapes the captured bbox.
           };
           // DOMLoaded fires only after the JSON parsed and the first frame rendered — the
           // right moment to reveal the live render and drop the placeholder. data_failed

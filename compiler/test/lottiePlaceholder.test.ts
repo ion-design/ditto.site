@@ -37,6 +37,33 @@ describe("DittoLottie placeholder retention", () => {
     assert.match(DITTO_LOTTIE_TSX, /data_failed/);
   });
 
+  // Sizing: the host box carries the captured per-viewport height; only an absolutely-filled overlay
+  // inherits that definite box. If the reveal reverted the overlay to static flow, the player's svg
+  // (style height:100%) would collapse to auto and inflate to the source aspect (a portrait viewBox
+  // then oversizes far past the captured, letterboxed box). So the overlay must STAY absolute/inset
+  // for its whole life, and the reveal must NOT clear those styles.
+  it("mounts the overlay as an absolute, inset-0 layer", () => {
+    assert.match(DITTO_LOTTIE_TSX, /mount\.style\.position\s*=\s*["']absolute["']/);
+    assert.match(DITTO_LOTTIE_TSX, /mount\.style\.inset\s*=\s*["']0["']/);
+  });
+
+  it("keeps the overlay absolute after the swap (never reverts it to static flow)", () => {
+    // The reveal must not strip the overlay's positioning — a `mount.style.position = ""` (or inset)
+    // un-pins it from the host's captured height and lets the runtime svg inflate by aspect.
+    assert.ok(
+      !/mount\.style\.position\s*=\s*["']["']/.test(DITTO_LOTTIE_TSX),
+      "reveal must not clear mount.style.position (would un-pin the overlay → aspect inflation)",
+    );
+    assert.ok(
+      !/mount\.style\.inset\s*=\s*["']["']/.test(DITTO_LOTTIE_TSX),
+      "reveal must not clear mount.style.inset (would un-pin the overlay → aspect inflation)",
+    );
+  });
+
+  it("marks the host with data-ditto-lottie so emitted CSS can force the runtime svg to fit", () => {
+    assert.match(DITTO_LOTTIE_TSX, /setAttribute\(\s*["']data-ditto-lottie["']/);
+  });
+
   // The player creates its <svg>/<canvas> at runtime WITHOUT a data-cid, so the DOM/media gate can't
   // map it back to the captured node. The reveal must forward the discarded placeholder's data-cid
   // onto the runtime-rendered element (validation-agnostic; no gate special-casing).

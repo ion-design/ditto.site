@@ -5,6 +5,7 @@ import { join, extname, normalize } from "node:path";
 import { spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 import { collectPage, type PageSnapshot } from "../capture/walker.js";
+import { captureFullPageViaCDP } from "../capture/capture.js";
 import { ensureDir, writeJSONCompact } from "../util/fsx.js";
 
 const ESBUILD_SHIM =
@@ -255,8 +256,17 @@ export async function renderApp(opts: {
         });
         const snapshot = await page.evaluate(collectPage);
         writeJSONCompact(join(opts.renderedDir, "dom", `dom-${vw}.json`), snapshot);
+        // Screenshot via CDP (captureBeyondViewport, no scroll-stitch) to match the SOURCE
+        // channel exactly — both sides must measure the same at-rest state. Fall back to
+        // Playwright's fullPage stitch if CDP fails. The clone is static so scroll-stitch
+        // matters less here, but symmetric capture is the requirement.
         try {
-          await page.screenshot({ path: join(opts.renderedDir, "screenshots", `${vw}.png`), fullPage: true, timeout: 90_000, animations: "disabled" });
+          const shotPath = join(opts.renderedDir, "screenshots", `${vw}.png`);
+          try {
+            await captureFullPageViaCDP(page, shotPath);
+          } catch {
+            await page.screenshot({ path: shotPath, fullPage: true, timeout: 90_000, animations: "disabled" });
+          }
         } catch { /* ignore */ }
         return { viewport: vw, snapshot, runtimeErrors, failedResources: [...failedResources], httpStatus };
       } finally {

@@ -32,6 +32,11 @@ button, input, select, textarea, optgroup { font: inherit; color: inherit; backg
 button { cursor: pointer; }
 table { border-collapse: separate; border-spacing: 0; }
 img, picture, video, canvas, svg { display: inline-block; }
+/* Lottie runtime fit: the player re-mounts its svg/canvas into an absolute overlay that fills
+   the host's captured (per-viewport, definite) box. Force that runtime media to fit the box so
+   an aspect-mismatched viewBox (e.g. a portrait animation in a shorter, letterboxed source box)
+   can't inflate past the pinned height. Scoped to the runtime-marked host only. */
+[data-ditto-lottie] > div > svg, [data-ditto-lottie] > div > canvas { width: 100%; height: 100%; display: block; }
 h1, h2, h3, h4, h5, h6, p, figure, blockquote, dl, dd { margin: 0; }
 /* Neutralize UA text defaults to inherit so the generator's default-skipping is
    correct: a property equal to its inherited value is simply not emitted. */

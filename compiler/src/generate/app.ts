@@ -391,6 +391,10 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
 
   if (isVideo && !videoLocal && !props.some(([k]) => k === "preload")) props.push(["preload", JSON.stringify("none")]);
 
+  // A canvas emitted as its raster still (<img> — see resolveTag) is decorative
+  // painted surface with no captured alt text; emit alt="" so the img is valid.
+  if (node.tag === "canvas" && node.attrs.src && !props.some(([k]) => k === "alt")) props.push(["alt", JSON.stringify("")]);
+
   if (node.rawHTML && node.tag === "svg") {
     // Strip the Stage-4 capture-id (`data-cid-cap`) the interaction pass stamps on
     // elements: it's internal instrumentation, render-inert, and would otherwise
@@ -557,6 +561,12 @@ export function resolveTag(node: IRNode, insideInteractive: boolean, insideTable
   // children inside <iframe> are unrendered fallback content, so emit a <div> container
   // carrying the iframe's box/styles (CSS is keyed by cid, so the geometry is identical).
   if (tag === "iframe" && node.children.some((c) => !isTextChild(c))) tag = "div";
+  // A canvas is runtime-drawn surface the clone cannot reproduce; when capture
+  // rasterized it (canvas-still synthetic URL stamped as `src` — see
+  // captureCanvasStillsInPage) emit the still as an <img> filling the canvas's box
+  // (CSS is keyed by cid, so the geometry is identical). A canvas with no still
+  // keeps rendering as an empty <canvas> box, same as before.
+  if (tag === "canvas" && node.attrs.src) tag = "img";
   if (TABLE_SCOPED.has(tag) && !insideTable) tag = "div"; // orphan table element → neutral box
   if (violatesContentModel(node, tag)) tag = "div";
   return tag;
