@@ -1,5 +1,5 @@
 import type { IR, IRNode } from "../normalize/ir.js";
-import { isTextChild } from "../normalize/ir.js";
+import { isTextChild, irContentExtent } from "../normalize/ir.js";
 import type { PageSnapshot } from "../capture/walker.js";
 import type { GenNode } from "./render.js";
 import { indexByCid } from "./render.js";
@@ -119,10 +119,29 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   let blocking = capture.dismissal?.blocking ?? false;
   for (const pv of capture.perViewport) { overlaysRemaining = Math.max(overlaysRemaining, pv.overlaysRemaining ?? 0); blocking = blocking || !!pv.blocking; }
   let minHeightRatio = Infinity;
+  let maxHeightRatio = 0;
   for (const pv of capture.perViewport) {
-    if (pv.height > 0) minHeightRatio = Math.min(minHeightRatio, pv.scrollHeight / pv.height);
+    if (pv.height > 0) {
+      const ratio = pv.scrollHeight / pv.height;
+      minHeightRatio = Math.min(minHeightRatio, ratio);
+      maxHeightRatio = Math.max(maxHeightRatio, ratio);
+    }
   }
   if (!Number.isFinite(minHeightRatio)) minHeightRatio = 1;
+
+  // Scroll-locked-capture contradiction: an email-capture/promo popup that sets
+  // body{overflow:hidden;height:100vh} collapses `document.scrollHeight` to EXACTLY the viewport
+  // height at EVERY width (ratio ~1.0 across the board) — yet the real page's IN-FLOW content
+  // (the IR's sections) still lays out several viewports tall. A genuine one-screen landing page
+  // has content extent ~= its scrollHeight, so this only fires when the two disagree: captured
+  // scrollHeight pinned to one viewport WHILE the IR content spans multiple. That is a
+  // scroll-locked, polluted capture — the overlay detector should have caught it, so fail loudly.
+  let maxContentRatio = 0;
+  for (const pv of capture.perViewport) {
+    if (pv.height > 0) maxContentRatio = Math.max(maxContentRatio, irContentExtent(ir.root, pv.viewport) / pv.height);
+  }
+  // scrollHeight never exceeds ~1 viewport at any width, but the IR content is 2+ viewports tall.
+  const scrollLockedContradiction = maxHeightRatio > 0 && maxHeightRatio < 1.15 && maxContentRatio >= 2;
 
   // Degenerate signals. Calibrated against real captures: an egress/bot wall is
   // ~3 nodes / ~24 chars; the most minimal legitimate page in the suite
@@ -131,6 +150,7 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   if (wall && nodeCount < 220) issues.push("bot/egress wall text on a small page");
   if (textChars < 60 && nodeCount < 50) issues.push(`near-empty page: ${textChars} visible text chars, ${nodeCount} nodes`);
   if (blocking) issues.push("a full-viewport modal still scroll-locks the page after dismissal");
+  if (scrollLockedContradiction) issues.push(`scroll-locked capture: scrollHeight pinned to ~1 viewport at every width while IR content spans ${round2(maxContentRatio)} viewports`);
 
   return {
     gate: "pollution",
@@ -138,6 +158,7 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
     metrics: {
       nodeCount, visibleTextChars: textChars, wallTextDetected: wall,
       overlaysRemaining, blocking, minScrollHeightRatio: round2(minHeightRatio),
+      maxScrollHeightRatio: round2(maxHeightRatio), maxContentExtentRatio: round2(maxContentRatio),
       dismissedCount: capture.dismissal?.dismissed.length ?? 0,
       overlaysRemoved: capture.dismissal?.removed ?? 0,
       videoStills: capture.dismissal?.videoStills ?? 0,

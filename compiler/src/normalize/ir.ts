@@ -84,6 +84,33 @@ export function isTextChild(c: IRChild): c is IRTextNode {
 }
 
 /**
+ * In-flow content extent at a viewport: the largest border-box bottom (`bbox.y + bbox.height`)
+ * over every VISIBLE, IN-FLOW descendant. This is the true height the real page laid out to,
+ * independent of a scroll-lock that clips the root to one viewport (a popup vendor that sets
+ * `body{overflow:hidden;height:100vh}` collapses `document.scrollHeight` to the viewport, but
+ * the in-flow sections still carry their real coordinates). Out-of-flow (absolute/fixed) and
+ * floated boxes are excluded — a fixed overlay/footer badge or a floated aside is not part of
+ * the document flow that determines page height. Pure + deterministic (reads only the IR).
+ */
+export function irContentExtent(root: IRNode, vp: number): number {
+  let maxBottom = 0;
+  const visit = (n: IRNode): void => {
+    for (const c of n.children) {
+      if (isTextChild(c)) continue;
+      const cs = c.computedByVp[vp];
+      const bb = c.bboxByVp[vp];
+      if (!cs || !bb || !c.visibleByVp[vp]) { visit(c); continue; }
+      const pos = cs.position || "static";
+      const inFlow = pos !== "absolute" && pos !== "fixed" && (cs.float || "none") === "none";
+      if (inFlow) maxBottom = Math.max(maxBottom, bb.y + bb.height);
+      visit(c);
+    }
+  };
+  visit(root);
+  return maxBottom;
+}
+
+/**
  * Recover lazy-loaded CSS backgrounds dropped by uneven per-viewport capture.
  * If an element has exactly one URL background at some sampled widths and
  * `none`/missing at the rest, treat the gaps as lazy-load misses rather than a
@@ -175,9 +202,24 @@ const NOISE_TAGS = new Set(["next-route-announcer"]);
 // width where capture happened to read it open → an empty 400×700 white rectangle at 2xl). Drop
 // the whole subtree so it never reaches generation.
 const THIRD_PARTY_OVERLAY = /(?:^|[\s_-])(?:intercom|drift-|hubspot-messages|zendesk|zd-|onetrust|ot-sdk-|usercentrics|grecaptcha|crisp-client|tawk-|livechat|helpscout|beacon-container|cookiebot|cky-)/;
+
+/**
+ * Email-capture / promo POPUP overlay containers (Attentive, Wunderkind/Bounce Exchange,
+ * Justuno, Privy, Omnisend, Sailthru, Wisepops, etc.). These vendors inject a full-viewport
+ * fixed overlay + backdrop that scroll-locks the page — third-party chrome, not site content.
+ *
+ * CAUTION: these vendors ALSO ship inline, embedded signup forms that ARE real page content
+ * and are deliberately grafted (see iframeGraft tests). So this matches ONLY the OVERLAY
+ * CONTAINER markers each vendor uses for its popup (`attentive_overlay`, `bx-wrapper` /
+ * `wk-`, `justuno`-`container`, `privy-`popup, …) — never a bare vendor name that an inline
+ * form embed would also carry. Overlay-container tokens only.
+ */
+export const POPUP_OVERLAY_CONTAINER =
+  /(?:^|[\s_-])(?:attentive_overlay|attentive_creative|attn-|bx-wrapper|bx-window|bounce-?exchange|wknd-|wunderkind|justuno_container|jw-overlay|privy-popup|privy-container|klaviyo-form-.*overlay|sailthru-overlay|wisepops-root|recart-popup|recart-modal)/;
 function isThirdPartyOverlay(raw: RawNode): boolean {
   const idClass = `${raw.attrs?.id ?? ""} ${raw.attrs?.class ?? ""}`.toLowerCase();
   if (THIRD_PARTY_OVERLAY.test(idClass)) return true;
+  if (POPUP_OVERLAY_CONTAINER.test(idClass)) return true;
   // INT_MAX band: overlay libraries stack above everything. Real content should not reach here,
   // so this cannot swallow site chrome under normal captures.
   const zi = parseInt(raw.computed?.zIndex ?? "", 10);

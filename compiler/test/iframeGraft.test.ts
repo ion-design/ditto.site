@@ -72,6 +72,23 @@ describe("planForFrameUrl", () => {
     assert.equal(planForFrameUrl("https://static-forms.klaviyo.com/forms/abc"), "graft");
     assert.equal(planForFrameUrl("http://127.0.0.1:4001/iframe-embed.html"), "graft");
   });
+
+  it("SKIPS full-viewport promo POPUP CREATIVE hosts (Attentive/Recart/Wunderkind overlays)", () => {
+    // These vendor hosts serve a full-viewport interstitial creative — grafting pours the
+    // popup's copy into the DOM/text channel and paints the modal over the real page.
+    assert.equal(planForFrameUrl("https://creatives.attn.tv/creative/12345"), "skip");
+    assert.equal(planForFrameUrl("https://creative.attn.tv/loader/x"), "skip");
+    assert.equal(planForFrameUrl("https://app.recart.com/popup/abc"), "skip");
+    assert.equal(planForFrameUrl("https://tag.wunderkind.co/creative"), "skip");
+    assert.equal(planForFrameUrl("https://api.bounceexchange.com/creative"), "skip");
+  });
+
+  it("STILL grafts INLINE embed hosts even for the same vendors (inline forms are a feature)", () => {
+    // Caution guard: a deliberately-grafted inline signup form must never be caught by the
+    // popup-creative skip list. Inline-form hosts differ from overlay-creative hosts.
+    assert.equal(planForFrameUrl("https://static-forms.klaviyo.com/forms/abc"), "graft");
+    assert.equal(planForFrameUrl("https://manage.kmail-lists.com/subscriptions/subscribe"), "graft");
+  });
 });
 
 describe("graftFrameIntoSnapshot", () => {

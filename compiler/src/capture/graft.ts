@@ -29,8 +29,14 @@ export const MIN_FRAME_DIM = 48;
 export type FramePlan = "skip" | "still" | "graft";
 
 // Ad/analytics/consent plumbing frames render nothing a visitor values — skip entirely.
+// The trailing group is email-capture / promo POPUP CREATIVE hosts: a vendor whose creative
+// iframe IS a full-viewport interstitial ("Enjoy 15% off" over a dimmed backdrop). Grafting it
+// pours the popup's copy into the DOM/text channel and paints the modal over the real page.
+// CAUTION: these hosts serve OVERLAY creatives, distinct from the vendor's INLINE-form embed
+// hosts (e.g. static-forms.klaviyo.com), which stay graftable — inline signup forms are a
+// deliberately-grafted feature (see iframeGraft tests). Match creative/overlay hosts only.
 const FRAME_SKIP_RE =
-  /(?:doubleclick\.net|googlesyndication\.com|googletagmanager\.com|google-analytics\.com|googleadservices\.com|adservice\.google|facebook\.com\/tr|connect\.facebook\.net|\brecaptcha\b|hcaptcha\.com|challenges\.cloudflare\.com|adsrvr\.org|amazon-adsystem\.com)/i;
+  /(?:doubleclick\.net|googlesyndication\.com|googletagmanager\.com|google-analytics\.com|googleadservices\.com|adservice\.google|facebook\.com\/tr|connect\.facebook\.net|\brecaptcha\b|hcaptcha\.com|challenges\.cloudflare\.com|adsrvr\.org|amazon-adsystem\.com|creatives?\.attn\.tv|\.attentivemobile\.com|bounceexchange\.com|bouncex\.net|\.wunderkind\.co|wknd\.ai|cdn\.justuno\.com\/mkjs|privy\.com\/.*popup|widget\.privy\.com|\.recart\.com|recart\.io)/i;
 // Media players are JS-built canvases/videos whose DOM graft is meaningless; an element
 // screenshot (the poster frame + play chrome) is the faithful static paint.
 const FRAME_STILL_RE =

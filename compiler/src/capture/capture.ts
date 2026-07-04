@@ -261,64 +261,102 @@ export type DismissResult = { dismissed: string[]; overlaysRemaining: number; re
  * Removal of a stuck overlay happens later (finalizeOverlays) AFTER a settle, so a
  * just-clicked dialog has time to close and unlock scrolling before we judge it.
  */
+/**
+ * In-page dismissal click pass (exported for fixture tests). Runs in ONE document — the main
+ * page OR a cross-origin frame (Attentive/Recart/Klaviyo creatives host their Decline/× inside
+ * an iframe, so the caller runs this in every `page.frames()`). Traverses open shadow roots
+ * (Recart mounts its popup in a shadow tree) when scanning both containers and buttons.
+ */
+export function clickDismissInPage(): string[] {
+  const dismissed: string[] = [];
+  // Deep collector across open shadow roots.
+  const deepEls = (root: ParentNode, sel: string): Element[] => {
+    const out: Element[] = [];
+    const walk = (r: ParentNode): void => {
+      let hits: Element[] = [];
+      try { hits = Array.from(r.querySelectorAll(sel)); } catch { /* invalid selector */ }
+      out.push(...hits);
+      for (const el of Array.from(r.querySelectorAll("*"))) {
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) walk(sr);
+      }
+    };
+    walk(root);
+    return out;
+  };
+  const vis = (el: Element): boolean => {
+    const cs = getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
+    const r = (el as HTMLElement).getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const click = (el: Element): void => { try { (el as HTMLElement).click(); } catch { /* ignore */ } };
+
+  // 1) Known consent-framework / generic close affordances, in priority order.
+  const KNOWN = [
+    "#onetrust-accept-btn-handler", "#accept-recommended-btn-handler", ".onetrust-close-btn-handler",
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
+    "#truste-consent-button", ".osano-cm-accept-all", ".osano-cm-dialog__close",
+    "[data-testid='uc-accept-all-button']", "[data-testid='uc-deny-all-button']",
+    "#didomi-notice-agree-button", ".didomi-continue-without-agreeing",
+    ".qc-cmp2-summary-buttons button[mode='primary']", "button[aria-label='Consent']",
+    ".cc-allow", ".cookie-consent-accept", "#hs-eu-confirmation-button", "#gdpr-consent-tool-wrapper button",
+  ];
+  for (const sel of KNOWN) {
+    for (const el of deepEls(document, sel)) {
+      if (vis(el)) { click(el); dismissed.push(sel); break; }
+    }
+  }
+
+  // 2) Scoped text-button pass: only inside overlay-ish containers (dialogs, or id/class naming
+  //    cookie/consent/modal/popup/newsletter/overlay/ccpa/privacy) so we never click an ordinary
+  //    page button. ACCEPT now also covers email-capture DECLINE affordances ("decline",
+  //    "no thanks", "not now", …) — a popup's own opt-out is the surest deterministic close.
+  const ACCEPT = new Set([
+    "accept", "accept all", "accept all cookies", "accept cookies", "accept & close",
+    "i accept", "i agree", "agree", "agree and continue", "allow all", "allow cookies",
+    "allow all cookies", "got it", "ok", "okay", "continue", "no thanks", "no, thanks",
+    "dismiss", "close", "got it!", "understood", "yes, i agree",
+    "decline", "no, thank you", "not now", "maybe later", "no thank you", "skip", "reject all",
+  ]);
+  const containerSel =
+    "[role='dialog'],[aria-modal='true'],[id*='cookie' i],[class*='cookie' i],[id*='consent' i]," +
+    "[class*='consent' i],[class*='gdpr' i],[id*='gdpr' i],[class*='modal' i],[class*='popup' i]," +
+    "[class*='newsletter' i],[class*='interstitial' i],[class*='overlay' i],[id*='overlay' i]," +
+    "[class*='ccpa' i],[id*='ccpa' i],[class*='privacy' i],[id*='pop' i]";
+  const containers = deepEls(document, containerSel);
+  for (const c of containers) {
+    if (!vis(c)) continue;
+    // Text/value-matched accept/decline buttons.
+    const btns = deepEls(c, "button,[role='button'],a,input[type='button'],input[type='submit']");
+    let clicked = false;
+    for (const b of btns) {
+      const t = (b.textContent || (b as HTMLInputElement).value || "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (t && ACCEPT.has(t) && vis(b)) { click(b); dismissed.push("text:" + t); clicked = true; break; }
+    }
+    if (clicked) continue;
+    // aria-label / title close affordance (icon-only ×, no text content to match).
+    const closers = deepEls(c, "[aria-label*='close' i],[aria-label*='dismiss' i],[title*='close' i],button.close,.close-button,[class*='close' i][role='button']");
+    for (const x of closers) {
+      if (vis(x)) { click(x); dismissed.push("close:" + ((x.getAttribute("aria-label") || x.getAttribute("title") || "x")).slice(0, 24)); break; }
+    }
+  }
+  return dismissed;
+}
+
 async function clickDismiss(page: import("playwright").Page): Promise<string[]> {
-  try {
-    return await Promise.race([
-      page.evaluate(() => {
-        const dismissed: string[] = [];
-        const vis = (el: Element): boolean => {
-          const cs = getComputedStyle(el);
-          if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
-          const r = (el as HTMLElement).getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        };
-        const click = (el: Element): void => { try { (el as HTMLElement).click(); } catch { /* ignore */ } };
-
-        // 1) Known consent-framework / generic close affordances, in priority order.
-        const KNOWN = [
-          "#onetrust-accept-btn-handler", "#accept-recommended-btn-handler", ".onetrust-close-btn-handler",
-          "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
-          "#truste-consent-button", ".osano-cm-accept-all", ".osano-cm-dialog__close",
-          "[data-testid='uc-accept-all-button']", "[data-testid='uc-deny-all-button']",
-          "#didomi-notice-agree-button", ".didomi-continue-without-agreeing",
-          ".qc-cmp2-summary-buttons button[mode='primary']", "button[aria-label='Consent']",
-          ".cc-allow", ".cookie-consent-accept", "#hs-eu-confirmation-button", "#gdpr-consent-tool-wrapper button",
-        ];
-        for (const sel of KNOWN) {
-          try {
-            for (const el of Array.from(document.querySelectorAll(sel))) {
-              if (vis(el)) { click(el); dismissed.push(sel); break; }
-            }
-          } catch { /* invalid selector in this browser */ }
-        }
-
-        // 2) Scoped text-button pass: only inside overlay-ish containers (dialogs,
-        //    or id/class naming cookie/consent/modal/popup/newsletter) so we never
-        //    click an ordinary page button.
-        const ACCEPT = new Set([
-          "accept", "accept all", "accept all cookies", "accept cookies", "accept & close",
-          "i accept", "i agree", "agree", "agree and continue", "allow all", "allow cookies",
-          "allow all cookies", "got it", "ok", "okay", "continue", "no thanks", "no, thanks",
-          "dismiss", "close", "got it!", "understood", "yes, i agree",
-        ]);
-        const containerSel =
-          "[role='dialog'],[aria-modal='true'],[id*='cookie' i],[class*='cookie' i],[id*='consent' i]," +
-          "[class*='consent' i],[class*='gdpr' i],[id*='gdpr' i],[class*='modal' i],[class*='popup' i]," +
-          "[class*='newsletter' i],[class*='interstitial' i]";
-        let containers: Element[] = [];
-        try { containers = Array.from(document.querySelectorAll(containerSel)); } catch { /* ignore */ }
-        for (const c of containers) {
-          if (!vis(c)) continue;
-          const btns = Array.from(c.querySelectorAll("button,[role='button'],a,input[type='button'],input[type='submit']"));
-          for (const b of btns) {
-            const t = (b.textContent || (b as HTMLInputElement).value || "").replace(/\s+/g, " ").trim().toLowerCase();
-            if (t && ACCEPT.has(t) && vis(b)) { click(b); dismissed.push("text:" + t); break; }
-          }
-        }
-        return dismissed;
-      }),
+  // Run the click pass in the main document AND every frame — cross-origin popup creatives
+  // (Attentive/Recart/…) host their Decline/close controls inside an iframe that the top
+  // document cannot reach, but Playwright can evaluate inside each frame from Node.
+  const runOne = (frame: import("playwright").Frame): Promise<string[]> =>
+    Promise.race([
+      frame.evaluate(clickDismissInPage).catch(() => [] as string[]),
       new Promise<string[]>((res) => setTimeout(() => res([]), 6000)),
     ]);
+  try {
+    const frames = page.frames();
+    const results = await Promise.all(frames.map((f) => runOne(f).catch(() => [] as string[])));
+    return results.flat();
   } catch {
     return [];
   }
@@ -334,57 +372,168 @@ async function clickDismiss(page: import("playwright").Page): Promise<string[]> 
  * sticky chrome is never stripped. Reports `blocking` = a scroll-locking overlay we
  * could not clear (the pollution gate keys off this, not mere overlay presence).
  */
-async function finalizeOverlays(page: import("playwright").Page): Promise<{ overlaysRemaining: number; removed: number; blocking: boolean; removedLabels: string[] }> {
+export type FinalizeOverlaysResult = { overlaysRemaining: number; removed: number; blocking: boolean; removedLabels: string[] };
+
+/**
+ * In-page overlay finalizer (exported so fixture tests can page.evaluate it directly).
+ * Detects any full-viewport, fixed/sticky BLOCKING layer still present and — when the page
+ * is scroll-locked (a state legit pages never enter) — removes it. Key robustness rules:
+ *
+ *  (a) EFFECTIVE z-index: an element with `z-index:auto` inherits its stacking position from
+ *      the nearest positioned/opacity/transform ancestor that establishes a stacking context.
+ *      A vendor popup iframe is z:auto but sits inside a z=INT_MAX wrapper, so per-element
+ *      `parseInt("auto")` under-reads it — resolve z through the ancestor chain instead.
+ *  (b) LOCK relaxes the z gate: on a scroll-locked page, ANY fixed/sticky full-viewport layer
+ *      is blocking regardless of z (catches a z:auto creative and a z=50 CCPA dialog). Off a
+ *      locked page we keep the z>=100 floor to avoid stripping legit fixed content.
+ *  (c) OVERLAY UNIT: a 0-size (height:0) max-z wrapper whose descendant is a full-viewport
+ *      fixed iframe is ONE overlay — the wrapper carries the z, the iframe carries the pixels.
+ *      Detecting either means removing BOTH (climb from a removable iframe to its high-z
+ *      wrapper ancestor; and treat a max-z 0-size wrapper as an overlay via its full-viewport
+ *      descendant). Neither alone passes the area+z gate, so they must be grouped.
+ *  (d) LOUD FAILURE: if the lock persists after removal (or was locked with nothing detected),
+ *      report blocking=true so the pollution gate fails rather than shipping a polluted capture.
+ */
+export function finalizeOverlaysInPage(): FinalizeOverlaysResult {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  // Deep element walk that descends into OPEN shadow roots. A shadow host reports 0 light-DOM
+  // children, so a popup mounted inside a shadow tree (Recart's `#recart-popup-root`) is invisible
+  // to a plain `querySelectorAll("*")` — its full-viewport fixed layer would never be detected and
+  // would paint into every screenshot. Traverse `element.shadowRoot` (open only; closed roots are
+  // unreachable — the host itself is still caught by the geometry gate below and removed whole).
+  const deepEls = (root: ParentNode): Element[] => {
+    const out: Element[] = [];
+    const push = (r: ParentNode): void => {
+      for (const el of Array.from(r.querySelectorAll("*"))) {
+        out.push(el);
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) push(sr);
+      }
+    };
+    push(root);
+    return out;
+  };
+  const isLocked = (): boolean => {
+    const b = document.body, h = document.documentElement;
+    const bs = getComputedStyle(b), hs = getComputedStyle(h);
+    return bs.overflow === "hidden" || hs.overflow === "hidden" ||
+      bs.overflowY === "hidden" || hs.overflowY === "hidden" ||
+      bs.position === "fixed" || bs.position === "absolute";
+  };
+  // Effective z-index: climb to the nearest ancestor that both is positioned/creates a stacking
+  // context AND reports a numeric z-index. `z-index:auto` on a positioned child paints in its
+  // parent stacking context, so the parent's z is the layer's true stacking rank.
+  const effectiveZ = (el: Element): number => {
+    let cur: Element | null = el;
+    let hops = 0;
+    while (cur && hops < 20) {
+      const cs = getComputedStyle(cur);
+      const zi = parseInt(cs.zIndex || "", 10);
+      const positioned = cs.position !== "static";
+      if (Number.isFinite(zi) && positioned) return zi;
+      cur = cur.parentElement;
+      hops++;
+    }
+    return 0;
+  };
+  const rectOf = (el: Element) => (el as HTMLElement).getBoundingClientRect();
+  const fullViewport = (r: DOMRect): boolean => r.width >= vw * 0.7 && r.height >= vh * 0.5 && (r.width * r.height) / (vw * vh) >= 0.5;
+  const painting = (cs: CSSStyleDeclaration): boolean =>
+    cs.display !== "none" && cs.visibility !== "hidden" && parseFloat(cs.opacity || "1") !== 0;
+
+  const locked = isLocked();
+
+  // Candidate blocking layers. A layer qualifies when it is fixed/sticky, painting, and either
+  // (1) itself full-viewport, or (2) a 0-size/high-z wrapper whose descendant is full-viewport
+  // (the overlay-unit case — the wrapper holds the z, an inner iframe holds the pixels).
+  // Full-viewport descendant test that pierces shadow roots (Recart mounts the covering layer
+  // inside the host's shadow tree, so a light-DOM `querySelectorAll` would find nothing).
+  const hasFullDescendant = (el: Element): boolean => {
+    const scope: ParentNode = (el as HTMLElement).shadowRoot ?? el;
+    return deepEls(scope).some((d) => { const dcs = getComputedStyle(d); return painting(dcs) && (dcs.position === "fixed" || dcs.position === "sticky" || dcs.position === "absolute") && fullViewport(rectOf(d)); });
+  };
+  const bigOverlays = (): HTMLElement[] => {
+    const out: HTMLElement[] = [];
+    for (const el of deepEls(document.body)) {
+      const cs = getComputedStyle(el);
+      const isShadowHost = !!(el as HTMLElement).shadowRoot;
+      // A shadow host is usually position:static with a fixed layer INSIDE its root; still test it
+      // (via its shadow descendants) so the whole host can be removed as one overlay unit.
+      if (cs.position !== "fixed" && cs.position !== "sticky" && !isShadowHost) continue;
+      if (!painting(cs)) continue;
+      const r = rectOf(el);
+      const z = effectiveZ(el);
+      // Off a locked page keep the z>=100 floor; on a locked page any full-viewport fixed
+      // layer is blocking (rule b). A max-z wrapper is a blocking layer even at 0 size when it
+      // wraps a full-viewport descendant (rule c) — legit chrome never reaches the INT_MAX band.
+      const positioned = cs.position === "fixed" || cs.position === "sticky";
+      const selfFull = positioned && fullViewport(r);
+      const wrapsFull = (isShadowHost || r.width < 4 || r.height < 4) && (isShadowHost || z >= 100) && hasFullDescendant(el);
+      if (!selfFull && !wrapsFull) continue;
+      const zPass = locked || z >= 100 || (wrapsFull && isShadowHost);
+      if (zPass) out.push(el as HTMLElement);
+    }
+    // Keep outermost only (a wrapper subsumes its inner full-viewport iframe — the overlay unit).
+    // `Node.contains` does NOT cross shadow boundaries, so also treat a candidate that lives inside
+    // another candidate's shadow tree as contained — otherwise a shadow host AND its inner layer
+    // both survive and we double-remove (or leave the inner layer behind).
+    const shadowContains = (host: Element, node: Element): boolean => {
+      let cur: Node | null = node;
+      while (cur) {
+        const rootNode = cur.getRootNode();
+        if (rootNode instanceof ShadowRoot) {
+          if (rootNode.host === host || host.contains(rootNode.host)) return true;
+          cur = rootNode.host;
+        } else break;
+      }
+      return false;
+    };
+    return out.filter((el) => !out.some((o) => o !== el && (o.contains(el) || shadowContains(o, el))));
+  };
+
+  // A scroll-locked page behind a full-viewport overlay IS a blocking modal by definition
+  // (legit pages don't scroll-lock). Remove ANY such overlay that isn't page chrome — many
+  // modals/drawers carry no consent/modal keyword and an icon-only close, so a keyword/aria
+  // allowlist misses them. PROTECTED guards real chrome (header/nav/footer) only.
+  const PROTECTED = /header|navbar|nav-|site-nav|topbar|masthead|footer/i;
+  const sig = (el: HTMLElement): string => `${el.id} ${el.className}`.toString();
+
+  const removedLabels: string[] = [];
+  let removed = 0;
+  let remaining = bigOverlays();
+  if (remaining.length && locked) {
+    for (const el of remaining) {
+      const s = sig(el);
+      const z = effectiveZ(el);
+      // Scroll-locked + full-viewport ⇒ blocking modal; remove unless it's page chrome. Always
+      // remove iframes (cross-origin close, unclickable), max-z wrappers, and the overlay unit:
+      // when the layer IS or CONTAINS a full-viewport fixed iframe, remove the whole subtree
+      // (rule c — the 0-size wrapper + its iframe come out together as one node).
+      const isShadowHost = !!(el as HTMLElement).shadowRoot;
+      const containsIframe = el.tagName === "IFRAME" || !!el.querySelector("iframe") ||
+        (isShadowHost && !!(el as HTMLElement).shadowRoot!.querySelector("iframe"));
+      const removable = !PROTECTED.test(s) || el.getAttribute("aria-modal") === "true" ||
+        containsIframe || isShadowHost || z >= 100;
+      if (removable) { el.remove(); removed++; removedLabels.push((el.id || el.className || el.tagName).toString().slice(0, 40)); }
+    }
+    if (removed) {
+      document.body.style.overflow = "visible"; document.documentElement.style.overflow = "visible";
+      document.body.style.overflowY = "visible"; document.documentElement.style.overflowY = "visible";
+      document.body.style.position = "static";
+    }
+    remaining = bigOverlays();
+  }
+  // Loud failure (rule d): a persisting lock is blocking whether or not a specific overlay was
+  // still detectable — a scroll-locked capture is polluted, so surface it to the pollution gate.
+  const stillLocked = isLocked();
+  return { overlaysRemaining: remaining.length, removed, blocking: stillLocked && (remaining.length > 0 || locked), removedLabels };
+}
+
+async function finalizeOverlays(page: import("playwright").Page): Promise<FinalizeOverlaysResult> {
   try {
     return await Promise.race([
-      page.evaluate(() => {
-        const vw = window.innerWidth, vh = window.innerHeight;
-        const bigOverlays = (): HTMLElement[] => {
-          const out: HTMLElement[] = [];
-          for (const el of Array.from(document.body.querySelectorAll("*"))) {
-            const cs = getComputedStyle(el);
-            if (cs.position !== "fixed" && cs.position !== "sticky") continue;
-            if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) continue;
-            const r = (el as HTMLElement).getBoundingClientRect();
-            const z = parseInt(cs.zIndex || "0", 10) || 0;
-            const area = (r.width * r.height) / (vw * vh);
-            if (area >= 0.5 && z >= 100 && r.width >= vw * 0.7 && r.height >= vh * 0.5) out.push(el as HTMLElement);
-          }
-          return out.filter((el) => !out.some((o) => o !== el && o.contains(el)));
-        };
-        const isLocked = (): boolean => {
-          const b = document.body, h = document.documentElement;
-          return getComputedStyle(b).overflow === "hidden" || getComputedStyle(h).overflow === "hidden" ||
-            getComputedStyle(b).position === "fixed";
-        };
-        // A scroll-locked page behind a full-viewport overlay IS a blocking modal by
-        // definition (legit pages don't scroll-lock). So remove ANY such overlay that
-        // isn't page chrome — many modals/drawers carry no consent/modal keyword and
-        // an icon-only close, so a keyword/aria allowlist misses them (ruggable's
-        // z-[1001] drawer). PROTECTED guards real chrome (header/nav/footer) only.
-        const PROTECTED = /header|navbar|nav-|site-nav|topbar|masthead|footer/i;
-        const sig = (el: HTMLElement): string => `${el.id} ${el.className}`.toString();
-
-        const removedLabels: string[] = [];
-        let removed = 0;
-        let remaining = bigOverlays();
-        if (remaining.length && isLocked()) {
-          for (const el of remaining) {
-            const s = sig(el);
-            const z = parseInt(getComputedStyle(el).zIndex || "0", 10) || 0;
-            // Scroll-locked + full-viewport ⇒ blocking modal; remove unless it's page
-            // chrome. Always remove iframes (cross-origin close, unclickable) and the
-            // max-z-index popup trick.
-            const removable = !PROTECTED.test(s) || el.getAttribute("aria-modal") === "true" ||
-              el.tagName === "IFRAME" || z >= 2_000_000_000;
-            if (removable) { el.remove(); removed++; removedLabels.push((el.id || el.className || el.tagName).toString().slice(0, 40)); }
-          }
-          if (removed) { document.body.style.overflow = "visible"; document.documentElement.style.overflow = "visible"; document.body.style.position = "static"; }
-          remaining = bigOverlays();
-        }
-        return { overlaysRemaining: remaining.length, removed, blocking: remaining.length > 0 && isLocked(), removedLabels };
-      }),
-      new Promise<{ overlaysRemaining: number; removed: number; blocking: boolean; removedLabels: string[] }>((res) => setTimeout(() => res({ overlaysRemaining: 0, removed: 0, blocking: false, removedLabels: [] }), 6000)),
+      page.evaluate(finalizeOverlaysInPage),
+      new Promise<FinalizeOverlaysResult>((res) => setTimeout(() => res({ overlaysRemaining: 0, removed: 0, blocking: false, removedLabels: [] }), 6000)),
     ]);
   } catch {
     return { overlaysRemaining: 0, removed: 0, blocking: false, removedLabels: [] };
@@ -1206,6 +1355,15 @@ export async function captureSite(opts: {
       // let scroll-linked effects settle so the snapshot records the genuine at-rest values.
       await settleScrollTopBeforeSnapshot(page);
 
+      // Late-mounting dialogs (a CCPA opt-out that opens between the canonical and last
+      // viewport; a Recart/Attentive promo that fires on a timer) mount AFTER the load /
+      // post-scroll passes and would otherwise pollute this viewport's DOM snapshot. Re-run
+      // the dismissal pass immediately before the walk. Cheap when nothing matches — the
+      // settle only runs when a control was actually clicked or an overlay removed.
+      await applyDismiss("pre-snapshot");
+      dismissUnion.overlaysRemaining = Math.max(dismissUnion.overlaysRemaining, overlaysRemaining);
+      dismissUnion.blocking = dismissUnion.blocking || blocking;
+
       // Bound the in-page DOM walk: page.evaluate has no default timeout, so a
       // pathologically large/animated DOM (e.g. asana.com) could hang forever.
       const snapshot: PageSnapshot = await Promise.race([
@@ -1254,6 +1412,13 @@ export async function captureSite(opts: {
       // Persist DOM snapshot, and (unless skipped for a production clone) the full-page screenshot.
       writeJSONCompact(join(captureDir, `dom-${vw}.json`), snapshot);
       if (opts.screenshots !== false) {
+        // A promo popup can mount in the window between the DOM walk and the screenshot (Recart
+        // fires into a shadow root on a short timer). The screenshot is the ground-truth channel
+        // the perceptual gate compares against, so re-run dismissal right before it — otherwise a
+        // late popup paints over every shot even though the DOM snapshot came out clean. Cheap
+        // when nothing matches.
+        await applyDismiss("pre-screenshot");
+        dismissUnion.blocking = dismissUnion.blocking || blocking;
         // Normalize every video to frame 0 (paused) at THIS viewport before the shot — the clone is
         // always at frame 0, so pinning the source there too makes the two channels comparable
         // regardless of the playback time the viewport happened to catch.

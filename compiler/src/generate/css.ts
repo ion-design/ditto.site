@@ -1,5 +1,5 @@
 import type { IR, IRNode, StyleMap } from "../normalize/ir.js";
-import { isTextChild } from "../normalize/ir.js";
+import { isTextChild, irContentExtent } from "../normalize/ir.js";
 import type { TokenResolver } from "../infer/tokens.js";
 
 /** Finalize a decls map: reference design tokens (var(--…)) where the value is tokenized
@@ -2447,14 +2447,20 @@ function declsForViewport(
   // intro — body/html { height:100vh; overflow-y:scroll|hidden } — can be captured in
   // that transient state, pinning the root to one viewport so it CLIPS its overflowing
   // content; the clone's document.scrollHeight then collapses to one viewport and the
-  // page renders truncated (paco.me). The lock is provably transient when the source's
-  // OWN captured scrollHeight exceeds the pinned height (the real document scrolled
-  // taller) — unlike a genuine internal-scroll shell, whose scrollHeight matches. Drop
-  // the clamp (height + clipping overflow-y) so the root grows to its content.
+  // page renders truncated (paco.me). Two independent signals prove the lock is transient:
+  //   • captured scrollHeight exceeds the pinned height (the real document scrolled taller); OR
+  //   • the IR's own IN-FLOW content extent (max descendant border-box bottom) exceeds the clamp.
+  // The SECOND signal is essential for an email-capture popup that scroll-LOCKS the page: the
+  // lock collapses `document.scrollHeight` down to the viewport (== clamp), so the scrollHeight
+  // test can never fire in exactly the worst case — but the in-flow sections still carry their
+  // real coordinates, so the content extent (5000px+ on a real homepage) still betrays the clamp.
+  // A genuine internal-scroll shell has matching content extent AND scrollHeight, so neither fires.
   const clampH = parseFloat(cs.height || "");
+  const contentExtent = (tag === "body" || tag === "html") ? irContentExtent(node, vp) : 0;
   const rootUnclamp =
     (tag === "body" || tag === "html") &&
-    !!rootScrollHeight && clampH > 0 && rootScrollHeight > clampH + 4 &&
+    clampH > 0 &&
+    ((!!rootScrollHeight && rootScrollHeight > clampH + 4) || contentExtent > clampH + 4) &&
     /^(scroll|hidden|auto|clip)$/.test(cs.overflowY || cs.overflow || "visible");
   // A pure-text leaf's height is fully content-derived (padding/border + lines × line-height).
   // We reproduce the font, line-height, padding and width, so its height auto-resolves to the
@@ -2622,8 +2628,20 @@ function declsForViewport(
   }
 
   // Root un-clamp: relax the clipping vertical overflow so the document scrolls at the
-  // window level (no spurious scrollbar gutter) and grows to its content height.
-  if (rootUnclamp) out.set("overflow-y", "visible");
+  // window level (no spurious scrollbar gutter) and grows to its content height. Popup
+  // vendors also inject `position:absolute|fixed` + `overflow:hidden` on <body> to freeze
+  // the page under their modal; that lock state gets captured as the body's computed style
+  // and, unstripped, hard-clips the clone to one screen (it can't scroll). Strip both — the
+  // real body is `position:static; overflow:visible` — so the un-clamped root scrolls normally.
+  if (rootUnclamp) {
+    out.set("overflow-y", "visible");
+    out.set("overflow-x", "visible");
+    out.delete("overflow");
+    out.delete("height");
+    const posV = out.get("position");
+    if (posV === "absolute" || posV === "fixed") out.delete("position");
+    for (const side of ["top", "right", "bottom", "left"]) out.delete(side);
+  }
 
   // Fluid grid columns (fr) replace the baked per-viewport px tracks so the grid scales.
   if (gridCols !== undefined) out.set("grid-template-columns", gridCols);

@@ -49,6 +49,42 @@ function baseRule(css: string, id: string): string {
   return m?.[1] ?? "";
 }
 
+// Root scroll-lock un-clamp: a popup vendor locks the page with
+// body{position:absolute;overflow:hidden;height:100vh}, which the capture bakes as the body's
+// computed style AND collapses document.scrollHeight down to the clamp (so the captured-scrollHeight
+// trigger can never fire). The IR's in-flow CONTENT EXTENT (a footer laid out at y=5000) still
+// exceeds the clamp, so the un-clamp must fire off that signal and strip the lock.
+describe("generateCss root scroll-lock un-clamp (content-extent trigger)", () => {
+  it("drops the body height/position/overflow lock when IR content extent exceeds the clamp", () => {
+    const footer = node("n1", "footer", computed());
+    // Footer sits far below the one-viewport clamp at every viewport.
+    for (const vp of VPS) footer.bboxByVp[vp] = { x: 0, y: 4000, width: vp, height: 1000 }; // bottom = 5000
+    const bodyCs = computed({ position: "absolute", overflow: "hidden", overflowY: "hidden", height: "812px", top: "0px", left: "0px" });
+    const root = node("n0", "body", bodyCs, [footer]);
+    for (const vp of VPS) root.bboxByVp[vp] = { x: 0, y: 0, width: vp, height: 812 };
+    // perViewport.scrollHeight stays collapsed to 800 (the lock's doing) — so ONLY the content
+    // extent can trigger the un-clamp.
+    const css = generateCss(irWith(root), new Map());
+    const body = baseRule(css, "n0");
+    assert.ok(!/height:812px/.test(body), `body height clamp dropped (got: ${body})`);
+    assert.ok(!/position:absolute/.test(body), `body position:absolute stripped (got: ${body})`);
+    assert.ok(/overflow-y:visible/.test(body), `overflow-y forced visible (got: ${body})`);
+    assert.ok(!/overflow:hidden/.test(body), `overflow:hidden not emitted (got: ${body})`);
+  });
+
+  it("does NOT un-clamp a genuine one-screen page (content extent within the clamp)", () => {
+    const inner = node("n1", "div", computed());
+    for (const vp of VPS) inner.bboxByVp[vp] = { x: 0, y: 0, width: vp, height: 700 };
+    const bodyCs = computed({ overflow: "hidden", overflowY: "hidden", height: "800px" });
+    const root = node("n0", "body", bodyCs, [inner]);
+    for (const vp of VPS) root.bboxByVp[vp] = { x: 0, y: 0, width: vp, height: 800 };
+    const css = generateCss(irWith(root), new Map());
+    const body = baseRule(css, "n0");
+    // The clamp is legitimate (content fits) — height kept, overflow not forced to visible.
+    assert.ok(/height:800px/.test(body), `legit body height preserved (got: ${body})`);
+  });
+});
+
 describe("generateCss list markers", () => {
   it("re-establishes list-style on a <ul> whose disc equals the parent's initial value", () => {
     // list-style-type's initial value is `disc` on EVERY element, so a real <ul disc>

@@ -117,6 +117,34 @@ describe("IR drops font-metric probe nodes (fix 4)", () => {
   });
 });
 
+describe("IR drops popup-vendor OVERLAY containers, keeps inline embedded forms", () => {
+  it("drops an email-capture popup overlay container (vendor overlay id) but keeps a real section", () => {
+    const overlay = raw("div", { id: "attentive_overlay" }, [
+      raw("iframe", { id: "attentive_creative", src: "https://creatives.attn.tv/x" }),
+    ]);
+    const real = raw("section", { class: "hero" }, [raw("h1", {}, [{ text: "Real content" }])]);
+    const body = raw("body", {}, [real, overlay]);
+
+    const root = buildFixtureIR(body);
+    const kept = root.children.filter((c) => !isTextChild(c)).map((c) => (c as IRNode).tag);
+    assert.deepEqual(kept, ["section"], "the attentive overlay subtree is dropped");
+    assert.equal(findByTag(root, "iframe"), null, "the popup creative iframe never reaches the IR");
+  });
+
+  it("does NOT drop an INLINE embedded signup form that merely carries a vendor name (feature, not popup)", () => {
+    // A deliberately-grafted inline Klaviyo form: a real, sized form embedded in page content. Its
+    // class names the vendor but is NOT an overlay-container marker, so it must survive.
+    const inlineForm = raw("div", { class: "klaviyo-form klaviyo-form-inline" }, [
+      raw("form", { id: "email-signup" }, [raw("input", { type: "email" })]),
+    ]);
+    const body = raw("body", {}, [inlineForm]);
+
+    const root = buildFixtureIR(body);
+    assert.ok(findByTag(root, "form"), "the inline signup form survives the prune");
+    assert.ok(findByTag(root, "input"), "its input survives too");
+  });
+});
+
 // Defect C (normalize side) — an infinite CSS animation gated to a breakpoint (a Webflow `max-lg`
 // marquee) is `animation:none` at the widths it does not run, but the browser still reports the last
 // FROZEN translateX there. `neutralizeAnimatedTransforms` zeroes the transform at EVERY viewport
