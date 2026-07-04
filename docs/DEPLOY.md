@@ -16,7 +16,15 @@ Postgres and S3-compatible storage. The recommended OSS-friendly stack:
    ```bash
    DATABASE_URL='postgres://...neon.../ditto_site?sslmode=require' npm run db:migrate
    ```
-   Run this on every deploy that changes `packages/db/migrations`.
+   Run this on every deploy that changes `packages/db/migrations`. Drizzle tracks
+   applied migrations in the database, so re-running is a no-op for anything
+   already applied. (Alternatively, apply a single migration by piping its SQL
+   through `psql`/the Neon CLI — but prefer `db:migrate`, which also records the
+   journal entry so future runs stay consistent.)
+
+   Current migrations: `0000` core tables, `0001` signup tokens,
+   `0002` `job_events` (structured clone-progress events behind
+   `GET /v1/clones/:id/events`).
 
 ## 2. Blob storage (R2 / S3)
 

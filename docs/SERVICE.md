@@ -24,11 +24,19 @@ packages/
 
 Two run modes, same HTTP surface:
 
-- **In-memory (no `DATABASE_URL`)** — the API runs single-page clones **inline** and
-  holds results in memory. Handy for a quick local demo.
+- **In-memory (no `DATABASE_URL`)** — `POST` enqueues (202) and runs the clone in the
+  background within the API process, holding results in memory. Handy for a quick
+  local demo; same poll-to-completion contract as production.
 - **DB + queue (`DATABASE_URL` set)** — `POST` enqueues a job (202); a separate
   **worker** process consumes the queue, runs the clone, stores artifacts, and the
   client polls to completion. This is the production mode.
+
+In both modes the job emits structured progress events (stage transitions such as
+`capture`, `generate`, `verify`) as it runs. Poll `GET /v1/clones/:id/events?after=N`
+with the last sequence number you have seen; each event is `{seq, t, ...payload}`.
+In production mode events persist in the `job_events` table (migration
+`0002_productive_wallflower.sql`), so they survive worker restarts and remain
+readable after completion.
 
 ## Local development
 
@@ -84,7 +92,9 @@ POST   /v1/signup/request         { email } → 202 {message}                 (s
 POST   /v1/signup/verify          { token } → 201 {apiKey,message}          (consume email token)
 GET    /v1/clones                  → list (metadata)
 GET    /v1/clones/:id              → status + metadata (fileCount, totalBytes, capture, timings)
+GET    /v1/clones/:id/events?after=N → structured progress events since seq N (poll while running)
 GET    /v1/clones/:id/result       → the eager CloneResult (text files inline; binaries by URL)
+GET    /v1/clones/:id/app-preview/*  → serve the clone's built static export when present (404 until built)
 GET    /v1/clones/:id/files/*      → stream one file
 GET    /v1/clones/:id/bundle?format=tgz|zip  → the whole app as one archive (302 → S3 when configured)
 DELETE /v1/clones/:id              → purge artifacts
