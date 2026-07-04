@@ -15,7 +15,7 @@ import { generateCss, RESET_CSS } from "../generate/css.js";
 import { generateInteractionCss } from "../generate/interactionCss.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, interactionRejectedSet } from "../generate/interactive.js";
 import { buildLottieSpec, lottieHasContent, lottieWireJsx, dittoLottieImportPath, DITTO_LOTTIE_TSX } from "../generate/lottie.js";
-import { renderChildrenJsx, renderAttrs, buildComponentRegistry, componentPreamble, componentFiles, componentImports, componentDataDecls, summarizeComponents, fileBase, generateViteConfig, generateViteIndexHtml, viteGlobalsCss, cnImportLine, CN_UTILS_MODULE, PACKAGE_JSON, PACKAGE_JSON_TW, PACKAGE_JSON_VITE, PACKAGE_JSON_VITE_TW, TSCONFIG_JSON, TSCONFIG_JSON_VITE, NEXT_CONFIG, injectLottieDep, type AppFramework, type LinkRewrite, type ExtractedComponent, type RenderCtx } from "../generate/app.js";
+import { renderChildrenJsx, renderAttrs, buildComponentRegistry, componentPreamble, componentFiles, componentImports, componentDataDecls, summarizeComponents, fileBase, generateViteConfig, generateViteIndexHtml, viteGlobalsCss, cnImportLine, resolveHtmlBg, htmlBgRule, CN_UTILS_MODULE, PACKAGE_JSON, PACKAGE_JSON_TW, PACKAGE_JSON_VITE, PACKAGE_JSON_VITE_TW, TSCONFIG_JSON, TSCONFIG_JSON_VITE, NEXT_CONFIG, injectLottieDep, type AppFramework, type LinkRewrite, type ExtractedComponent, type RenderCtx } from "../generate/app.js";
 import { buildTailwind, tailwindGlobalsCss, createColorInterner, colorDefsCssOf, type TailwindOutput } from "../generate/tailwind.js";
 import type { InteractionCapture } from "../capture/interactions.js";
 import type { IRChild } from "../normalize/ir.js";
@@ -91,10 +91,10 @@ function unionFontCss(routes: RouteArtifact[]): string {
 
 /** Shared page-base bits (entry html background + overflow-x clip) — same rationale as
  *  single-page generation; used by both the plain-CSS and Tailwind globals. */
-function pageBaseOf(entry: RouteArtifact): { htmlBg: string; clip: string } {
+function pageBaseOf(entry: RouteArtifact): { htmlBg: string | null; clip: string } {
   const cw = entry.ir.doc.canonicalViewport;
   const pv = entry.ir.doc.perViewport[cw];
-  const htmlBg = pv?.htmlBg && pv.htmlBg !== "rgba(0, 0, 0, 0)" ? pv.htmlBg : (pv?.bodyBg ?? "#ffffff");
+  const htmlBg = resolveHtmlBg(pv);
   const noHScroll = Object.entries(entry.ir.doc.perViewport).every(([vp, d]) => d.scrollWidth <= Number(vp) * 1.03);
   return { htmlBg, clip: noHScroll ? "\nhtml, body { overflow-x: clip; }" : "" };
 }
@@ -112,8 +112,7 @@ ${paletteCss}
 ${tokensToCss(entry.tokens, true)}
 
 /* page base */
-html { background: ${htmlBg}; }
-body { font-family: ${SYSTEM_FALLBACK}; }${clip}
+${htmlBgRule(htmlBg)}body { font-family: ${SYSTEM_FALLBACK}; }${clip}
 `;
 }
 

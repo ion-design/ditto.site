@@ -2250,10 +2250,36 @@ ${head}      <body${bodyAttrs}>
 `;
 }
 
+const TRANSPARENT_BG = "rgba(0, 0, 0, 0)";
+
+/** Decide what background (if any) the clone's `html` element should paint.
+ *
+ * Per CSS 2.1 §14.2, when `html` is transparent the `body` background propagates
+ * to the canvas and paints *beneath* every descendant — including negative-z-index
+ * layers (full-bleed hero video/image/canvas backdrops). The moment `html` paints
+ * an opaque background, `body` stops propagating and paints its own in-flow block
+ * background, which sits *above* negative-z descendants and buries them.
+ *
+ * So we only give `html` a background when the SOURCE `html` actually painted one.
+ * A transparent source `html` stays transparent (returns null → no rule emitted), so
+ * the captured body background propagates to the canvas exactly as in the source.
+ * The white fallback applies only when BOTH html and body are transparent, otherwise
+ * the UA-default canvas would show through. Deterministic: pure function of the IR. */
+export function resolveHtmlBg(pv: { htmlBg?: string; bodyBg?: string } | undefined): string | null {
+  const srcHtmlBg = pv?.htmlBg && pv.htmlBg !== TRANSPARENT_BG ? pv.htmlBg : null;
+  const srcBodyBg = pv?.bodyBg && pv.bodyBg !== TRANSPARENT_BG ? pv.bodyBg : null;
+  return srcHtmlBg ?? (srcBodyBg ? null : "#ffffff");
+}
+
+/** `html { background: … }` rule, or empty string when html should stay transparent. */
+export function htmlBgRule(htmlBg: string | null): string {
+  return htmlBg !== null ? `html { background: ${htmlBg}; }\n` : "";
+}
+
 function generateGlobalsCss(ir: IR, fontGraph: FontGraph, tokensCss: string): string {
   const cw = ir.doc.canonicalViewport;
   const pv = ir.doc.perViewport[cw];
-  const htmlBg = pv?.htmlBg && pv.htmlBg !== "rgba(0, 0, 0, 0)" ? pv.htmlBg : (pv?.bodyBg ?? "#ffffff");
+  const htmlBg = resolveHtmlBg(pv);
   // If the SOURCE page never scrolls horizontally (its scrollWidth fits the
   // viewport at every captured width), neither should the clone. JS-driven
   // widgets (custom-element carousels, sliders) position children off-axis via
@@ -2271,8 +2297,7 @@ ${fontGraph.css}
 ${tokensCss}
 
 /* page base */
-html { background: ${htmlBg}; }
-body { font-family: ${SYSTEM_FALLBACK}; }${clip}
+${htmlBgRule(htmlBg)}body { font-family: ${SYSTEM_FALLBACK}; }${clip}
 `;
 }
 
@@ -2643,7 +2668,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   if (tw) {
     const cw = ir.doc.canonicalViewport;
     const pv = ir.doc.perViewport[cw];
-    const htmlBg = pv?.htmlBg && pv.htmlBg !== "rgba(0, 0, 0, 0)" ? pv.htmlBg : (pv?.bodyBg ?? "#ffffff");
+    const htmlBg = resolveHtmlBg(pv);
     const noHScroll = Object.entries(ir.doc.perViewport).every(([vp, d]) => d.scrollWidth <= Number(vp) * 1.03);
     const clip = noHScroll ? "\nhtml, body { overflow-x: clip; }" : "";
     const globals = tailwindGlobalsCss({

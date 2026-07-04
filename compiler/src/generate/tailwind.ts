@@ -1273,7 +1273,7 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
  *  + breakpoint bindings, our token :root, and our reset/fonts/page-base inside @layer base
  *  so utilities override them. */
 export function tailwindGlobalsCss(opts: {
-  reset: string; fontCss: string; tokensCss: string; htmlBg: string; bodyFont: string;
+  reset: string; fontCss: string; tokensCss: string; htmlBg: string | null; bodyFont: string;
   clip: string; colorTokens: string[]; viewports: number[]; canonical: number;
 }): string {
   const screens = [
@@ -1301,8 +1301,7 @@ ${opts.tokensCss}
 ${opts.reset}
 /* fonts */
 ${opts.fontCss}
-html { background: ${opts.htmlBg}; }
-body { font-family: ${opts.bodyFont}; }${opts.clip}
+${opts.htmlBg !== null ? `html { background: ${opts.htmlBg}; }\n` : ""}body { font-family: ${opts.bodyFont}; }${opts.clip}
 }
 `;
 }
