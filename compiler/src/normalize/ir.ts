@@ -6,7 +6,10 @@ import type { InteractionCapture } from "../capture/interactions.js";
 /**
  * Normalized Render IR. Merges the per-viewport capture snapshots into a single
  * tree whose structure comes from the canonical (1280) capture; each node carries
- * per-viewport computed styles, bounding boxes, and visibility. This is the single
+ * per-viewport computed styles, bounding boxes, and visibility. Children that exist
+ * ONLY at non-canonical viewports are grafted in as siblings (visible only in their
+ * source bands); a container whose children are a wholly different set at some width
+ * is recorded as content drift instead (see childDriftVps). This is the single
  * source of truth for section/token inference, generation, and validation.
  */
 
@@ -40,6 +43,14 @@ export type IRNode = {
   // ::placeholder computed style (input/textarea with placeholder text) — emitted as a
   // `::placeholder` rule so form controls keep their authored placeholder color.
   placeholderByVp?: Record<number, StyleMap>;
+  // Band viewports where this container's element children were a DIFFERENT SET than the
+  // canonical capture's (mutual whole-set mismatch — the source deterministically served
+  // different content at that width, e.g. a rotator picking other items per breakpoint).
+  // Policy: FAITHFUL-AT-CANONICAL — emission shows the canonical children there (it skips
+  // the display:none band it would otherwise emit for a child with no counterpart) instead
+  // of rendering an empty shell; the other set is NOT grafted (no duplication). Surfaced in
+  // the manifest via doc.contentDrift.
+  childDriftVps?: number[];
   children: IRChild[];
 };
 
@@ -75,6 +86,11 @@ export type IRDoc = {
   // re-emit the keyframes that the per-node `animation-name` declarations reference —
   // without these the animation properties are inert (the half-plumbed pre-Stage-5 gap).
   keyframes: string[];
+  // Containers whose children diverged as a WHOLE SET at some band viewport(s) (see
+  // IRNode.childDriftVps). Recorded post-renumber so ids are final; carried into the
+  // generated manifest as a fidelity note ("the source served different content there").
+  // Omitted when no drift was detected.
+  contentDrift?: Array<{ id: string; tag: string; viewports: number[] }>;
 };
 
 export type IR = {
@@ -419,6 +435,39 @@ function alignChildren(canon: RawNode[], other: RawNode[]): (RawNode | undefined
   return out;
 }
 
+/** True when this raw node or any element descendant painted at its capture viewport. */
+function rawSubtreeVisible(n: RawNode): boolean {
+  if (n.visible) return true;
+  for (const c of elementChildren(n)) if (rawSubtreeVisible(c)) return true;
+  return false;
+}
+
+/** Most frequent tag in a sibling group (ties broken alphabetically — deterministic). */
+function dominantTag(nodes: RawNode[]): string {
+  const counts = new Map<string, number>();
+  for (const n of nodes) counts.set(n.tag, (counts.get(n.tag) ?? 0) + 1);
+  let best = "", bestC = -1;
+  for (const [t, c] of [...counts.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (c > bestC) { best = t; bestC = c; }
+  }
+  return best;
+}
+
+// A sibling appearing ONLY at non-canonical viewport(s) is grafted into the IR (visible only in
+// its source band(s)). Cap per parent per viewport so a pathological capture (a virtualized list
+// re-keying hundreds of rows) can't balloon the tree; the whole-set drift path below covers the
+// legitimate large-mismatch case.
+const GRAFT_MAX_PER_VP = 24;
+// Whole-set content-identity drift: at least this many children UNMATCHED on BOTH sides before a
+// container is treated as "the source served different content at this width" (vs a couple of
+// responsive-only extras, which are grafted instead).
+const DRIFT_MIN_UNMATCHED = 3;
+
+/** A per-parent graft group: one non-canonical-only child, matched across the non-canonical
+ *  viewports it appears at. `rep` is the raw node from the LOWEST viewport (structural identity
+ *  for aligning later viewports into the group). */
+type GraftGroup = { rep: RawNode; rawByVp: Record<number, RawNode> };
+
 /** Capture-ids of recognized-pattern panels/regions to force-keep through pruning
  *  (they are display:none in the inactive/collapsed base state). Empty when no
  *  interactions were captured, so non-interactive runs prune exactly as before. */
@@ -449,6 +498,9 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
   }
   const canonical = viewports.includes(1280) ? 1280 : viewports[Math.floor(viewports.length / 2)]!;
   const canonSnap = snapshots[canonical]!;
+  // Deterministic iteration order for the cross-viewport graft grouping below.
+  const vpsAsc = [...viewports].sort((a, b) => a - b);
+  const bandVpSet = new Set(bandVps);
 
   // Stage 4: recognized interactive panels (tabs/accordion) are often display:none
   // at base (the inactive/collapsed state). Their subtrees must survive pruning so
@@ -519,25 +571,131 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       const canonKids = elementChildren(raw);
       // Align this node's canonical element children to each viewport's children.
       const aligned: Record<number, (RawNode | undefined)[]> = {};
+      const kidsByVp: Record<number, RawNode[]> = {};
       for (const vw of viewports) {
         if (vw === canonical) continue;
         const m = matched[vw];
         const vwKids = m && m.tag === raw.tag ? elementChildren(m) : [];
+        kidsByVp[vw] = vwKids;
         aligned[vw] = alignChildren(canonKids, vwKids);
       }
+
+      // ---- Per-viewport DOM divergence (canonical-rooted subtrees only) ----
+      // Two inverse gaps closed here:
+      //  • GRAFT: a child that exists ONLY at non-canonical viewport(s) (destroyed/never built at
+      //    the canonical width) would otherwise never enter the IR — the clone then misses it at
+      //    the widths where the source shows it (e.g. mobile-only carousel pagination bullets).
+      //    Graft it as a sibling at its source position, carrying per-viewport data ONLY for the
+      //    viewports it appeared at; emission hides it at base and reveals it in its band(s).
+      //  • DRIFT: when a container's children at some viewport are a DIFFERENT SET on BOTH sides
+      //    (mutual whole-set mismatch — the source deterministically served other content there),
+      //    grafting would duplicate the component. Prefer faithful-at-canonical: record the drift
+      //    so emission shows the canonical children there instead of banding them all display:none
+      //    (an empty shell). Recorded in childDriftVps → doc.contentDrift → the manifest.
+      const driftVps = new Set<number>();
+      const graftsByAnchor = new Map<number, GraftGroup[]>();
+      if (matched[canonical]) {
+        for (const vw of vpsAsc) {
+          if (vw === canonical) continue;
+          const vwKids = kidsByVp[vw]!;
+          if (vwKids.length === 0) continue;
+          const matchedOther = new Set<RawNode>();
+          for (const mo of aligned[vw]!) if (mo) matchedOther.add(mo);
+          const unmatchedCanon = canonKids.filter((_, i) => !aligned[vw]![i]);
+          const unmatchedOther = vwKids.filter((k) => !matchedOther.has(k));
+          // Whole-set identity drift: many unmatched on BOTH sides, few matched, and both leftover
+          // groups are the same kind of element (same dominant tag — one component family serving
+          // different items, not a structurally different widget swapped in at this width).
+          if (
+            unmatchedCanon.length >= DRIFT_MIN_UNMATCHED &&
+            unmatchedOther.length >= DRIFT_MIN_UNMATCHED &&
+            matchedOther.size * 2 < Math.min(canonKids.length, vwKids.length) &&
+            dominantTag(unmatchedCanon) === dominantTag(unmatchedOther)
+          ) {
+            driftVps.add(vw);
+            continue; // faithful-at-canonical: do NOT graft the other set (no duplication)
+          }
+          if (unmatchedOther.length === 0 || unmatchedOther.length > GRAFT_MAX_PER_VP) continue;
+          // Graft position: each unmatched child anchors AFTER the last canonical child matched
+          // before it in this viewport's sibling order (-1 = before every canonical child).
+          const canonIdxOf = new Map<RawNode, number>();
+          aligned[vw]!.forEach((mo, i) => { if (mo) canonIdxOf.set(mo, i); });
+          let lastCanonIdx = -1;
+          const newByAnchor = new Map<number, RawNode[]>();
+          for (const k of vwKids) {
+            const ci = canonIdxOf.get(k);
+            if (ci !== undefined) { lastCanonIdx = ci; continue; }
+            let list = newByAnchor.get(lastCanonIdx);
+            if (!list) newByAnchor.set(lastCanonIdx, (list = []));
+            list.push(k);
+          }
+          // Merge this viewport's unmatched children into the anchor's existing graft groups by
+          // structural signature (the same node present at several widths becomes ONE graft with
+          // per-viewport data), preserving sibling order; leftovers open new groups in order.
+          for (const [anchor, newcomers] of [...newByAnchor.entries()].sort((a, b) => a[0] - b[0])) {
+            const groups = graftsByAnchor.get(anchor) ?? [];
+            const al = alignChildren(groups.map((g) => g.rep), newcomers);
+            const groupOfNew = new Map<RawNode, number>();
+            al.forEach((r, idx) => { if (r) groupOfNew.set(r, idx); });
+            const merged: GraftGroup[] = [];
+            let gi = 0;
+            for (const k of newcomers) {
+              const gIdx = groupOfNew.get(k);
+              if (gIdx !== undefined) {
+                while (gi <= gIdx) merged.push(groups[gi++]!);
+                groups[gIdx]!.rawByVp[vw] = k;
+              } else {
+                merged.push({ rep: k, rawByVp: { [vw]: k } });
+              }
+            }
+            while (gi < groups.length) merged.push(groups[gi++]!);
+            graftsByAnchor.set(anchor, merged);
+          }
+        }
+      }
+      // Materialize graft groups → IR nodes. Keep only groups that actually PAINT at a band
+      // viewport (a graft visible solely at a dense sample width could never be shown — bands are
+      // emitted only at the standard breakpoints — so it would be dead markup).
+      const graftedByAnchor = new Map<number, IRNode[]>();
+      for (const [anchor, groups] of [...graftsByAnchor.entries()].sort((a, b) => a[0] - b[0])) {
+        const out: IRNode[] = [];
+        for (const g of groups) {
+          const graftVps = Object.keys(g.rawByVp).map(Number).sort((a, b) => a - b);
+          if (!graftVps.some((vw) => bandVpSet.has(vw) && rawSubtreeVisible(g.rawByVp[vw]!))) continue;
+          const gm: Record<number, RawNode | undefined> = {};
+          for (const vw of viewports) gm[vw] = g.rawByVp[vw];
+          const gn = convert(g.rawByVp[graftVps[0]!]!, gm);
+          if (gn) out.push(gn);
+        }
+        if (out.length) graftedByAnchor.set(anchor, out);
+      }
+      if (driftVps.size) {
+        const bandDrift = [...driftVps].filter((v) => bandVpSet.has(v)).sort((a, b) => a - b);
+        if (bandDrift.length) node.childDriftVps = bandDrift;
+      }
+
       let ei = 0;
+      let pushedLeading = false;
+      const pushGrafts = (anchor: number): void => {
+        for (const gn of graftedByAnchor.get(anchor) ?? []) node.children.push(gn);
+      };
       for (const c of raw.children) {
         if ((c as IRTextNode).text !== undefined) {
           node.children.push({ text: (c as IRTextNode).text });
           continue;
         }
+        if (!pushedLeading) { pushGrafts(-1); pushedLeading = true; }
         const child = c as RawNode;
         const childMatched: Record<number, RawNode | undefined> = {};
-        for (const vw of viewports) childMatched[vw] = vw === canonical ? child : aligned[vw]![ei];
-        ei++;
+        // A grafted subtree has no canonical counterpart: its own children must not be treated as
+        // canonical-matched either (they carry data only at the graft's source viewports).
+        for (const vw of viewports) childMatched[vw] = vw === canonical ? (matched[canonical] ? child : undefined) : aligned[vw]![ei];
         const converted = convert(child, childMatched);
         if (converted) node.children.push(converted);
+        pushGrafts(ei);
+        ei++;
       }
+      if (!pushedLeading) pushGrafts(-1);
     }
     return node;
   };
@@ -667,6 +825,16 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
   };
   renumber(root);
 
+  // Content-identity drift notes (containers whose children were a different set at some band
+  // viewport — see childDriftVps). Collected AFTER renumbering so the recorded ids are final;
+  // deterministic (pre-order walk of the pruned tree).
+  const contentDrift: NonNullable<IRDoc["contentDrift"]> = [];
+  const collectDrift = (n: IRNode): void => {
+    if (n.childDriftVps?.length) contentDrift.push({ id: n.id, tag: n.tag, viewports: [...n.childDriftVps] });
+    for (const c of n.children) if (!isTextChild(c)) collectDrift(c);
+  };
+  collectDrift(root);
+
   const perViewport: IRDoc["perViewport"] = {};
   for (const vw of viewports) {
     const d = snapshots[vw]!.doc;
@@ -696,6 +864,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     // benchmark + all multi-page, which don't capture motion) ⇒ none emitted, so the
     // clone stays byte-identical to the pre-Stage-5 frozen output.
     keyframes: opts?.motion ? [...new Set(canonSnap.keyframes ?? [])].sort() : [],
+    ...(contentDrift.length ? { contentDrift } : {}),
   };
 
   // Repair transient root scroll-locks. A site that locks scrolling during an intro

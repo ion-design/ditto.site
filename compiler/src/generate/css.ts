@@ -3375,7 +3375,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
   // per line so the line's free space — and thus sibling positions — is unchanged.
   const autoWidthFlex = new Set<string>();
 
-  const walk = (node: IRNode, parentNode: IRNode | undefined, parentFluid: boolean, layoutParent: IRNode | undefined, cbAncestor: IRNode | undefined, parentDefiniteHeight: boolean): void => {
+  const walk = (node: IRNode, parentNode: IRNode | undefined, parentFluid: boolean, layoutParent: IRNode | undefined, cbAncestor: IRNode | undefined, parentDefiniteHeight: boolean, standInVps: ReadonlySet<number> | null = null): void => {
     // Full-bleed fluidity propagates as a CONTIGUOUS chain from the root: a node is fluid
     // only if its containing block is also fluid — otherwise width:auto fills a fixed-width
     // ancestor instead of the viewport (a full-bleed row inside a fixed 1280 wrapper would
@@ -3618,7 +3618,23 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // gated to a breakpoint owns the transform only where it runs, but freezes a mid-scroll offset
     // at the OTHER bands — suppress those frozen deltas at every width).
     const animOwned = animOwnedProps(node, [baseVp, ...bands.map((b) => b.vp)]);
-    const baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform, sourceFixedHeight), tokenResolver);
+    let baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform, sourceFixedHeight), tokenResolver);
+    // A node GRAFTED into the IR from a non-canonical capture (it does not exist in the canonical
+    // DOM, so it has no computed style at the base viewport → declsForViewport yields nothing).
+    // Its base rule must take it out of layout entirely; each band where it WAS observed then
+    // emits its full per-viewport decls as the delta (display is always emitted, so the band
+    // override both reveals and lays it out — the inverse of the canonical-only display:none band).
+    const absentAtBase = !node.computedByVp[baseVp];
+    if (absentAtBase) baseDecls = new Map([["display", "none"]]);
+    // Viewports where this node STANDS IN for divergent source content (content-identity drift on
+    // an ancestor): it has no captured data there, but the drift policy shows the canonical subtree
+    // instead of an empty shell — so its per-band hide must be skipped at those widths, and the
+    // stand-in state propagates to its descendants (they lack per-viewport data there too).
+    let driftStandIn: Set<number> | null = standInVps ? new Set([...standInVps].filter((vp) => !node.computedByVp[vp])) : null;
+    for (const vp of parentNode?.childDriftVps ?? []) {
+      if (!node.computedByVp[vp]) (driftStandIn ??= new Set()).add(vp);
+    }
+    if (driftStandIn && driftStandIn.size === 0) driftStandIn = null;
     const nr: NodeRule = { base: baseDecls, bands: [] };
 
     // Per-band overrides (delta vs base), using the parent's value AT THAT viewport.
@@ -3626,7 +3642,17 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       if (!b.media) continue;
       // Node was not in the observed DOM at this width (responsive conditional
       // rendering): hide it so the clone matches the source at this viewport.
-      if (!node.computedByVp[b.vp]) { nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) }); continue; }
+      if (!node.computedByVp[b.vp]) {
+        // Grafted node: the base rule is already display:none — no per-band hide needed.
+        if (absentAtBase) continue;
+        // Content-identity drift (an ancestor's children were a wholly different set at this
+        // width): banding every canonical child display:none would render an EMPTY shell where
+        // the source showed content. Faithful-at-canonical: skip the hide and let the base
+        // (canonical) subtree stand in for the divergent set (recorded in doc.contentDrift).
+        if (driftStandIn?.has(b.vp)) continue;
+        nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+        continue;
+      }
       // The node isn't PAINTED at this width. HOW it is hidden decides what to emit, because only
       // `display:none` takes the box out of layout — a `visibility:hidden` box still occupies space
       // and can extend the scrollable area. The base rule bakes CANONICAL geometry unconditionally,
@@ -3772,7 +3798,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     }
     rules.set(node.id, nr);
 
-    for (const c of node.children) if (!isTextChild(c)) walk(c, node, childFluid, childLayoutParent, childCb, childDefiniteHeight);
+    for (const c of node.children) if (!isTextChild(c)) walk(c, node, childFluid, childLayoutParent, childCb, childDefiniteHeight, driftStandIn);
   };
   // The root's containing block is the viewport-filling <html>, so it starts the fluid chain.
   walk(ir.root, undefined, true, undefined, undefined, false);
