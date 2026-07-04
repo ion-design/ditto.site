@@ -37,7 +37,16 @@ export async function processCloneJob(deps: ProcessDeps, jobId: string): Promise
     const options = (job.options ?? {}) as CloneOptions;
     // Provision the isolated harness only when this job actually verifies (build).
     const harnessDir = (options.verify || options.asyncVerify) && deps.harnessProvider ? await deps.harnessProvider() : undefined;
-    const result = await deps.runJob({ url: job.url, options, runsDir: base, harnessDir, tier: deps.tier, captureCacheDir: deps.captureCacheDir || undefined, captureCacheTtlMs: deps.cacheTtlMs });
+    const result = await deps.runJob({
+      url: job.url,
+      options,
+      runsDir: base,
+      harnessDir,
+      tier: deps.tier,
+      captureCacheDir: deps.captureCacheDir || undefined,
+      captureCacheTtlMs: deps.cacheTtlMs,
+      log: (e) => { void repo.appendJobEvent(db, jobId, e); },
+    });
 
     const manifest = await store.putClone(jobId, result.files);
     const envelope = { files: manifest.files, routes: result.routes, bundleKey: manifest.bundleKey };

@@ -1,319 +1,164 @@
-<p align="center">
-  <img src="docs/assets/ditto.svg" alt="ditto.site logo" width="112" />
-</p>
+# ishaans-ditto-site
 
-# [ditto.site](https://ditto.site)
+[![CI](https://github.com/devteamaegis/ishaans-ditto-site/actions/workflows/ci.yml/badge.svg)](https://github.com/devteamaegis/ishaans-ditto-site/actions/workflows/ci.yml)
+[![License: MIT](LICENSE)](LICENSE)
+[![Node](.nvmrc)](.nvmrc)
 
-[![CI](https://github.com/ion-design/ditto.site/actions/workflows/ci.yml/badge.svg)](https://github.com/ion-design/ditto.site/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](.nvmrc)
+Deterministic website compiler fork of [ditto.site](https://github.com/ion-design/ditto.site). A public URL becomes a self-contained TypeScript app: capture what the browser actually rendered, then emit a byte-stable Next.js App Router project (or Vite React when requested).
 
-ditto.site turns a public URL into a self-contained TypeScript app. It captures
-what the browser actually rendered, then emits a deterministic Next.js App
-Router project by default, or Vite React when requested.
+The compiler is not an LLM page author. It is a capture-to-code pipeline — same frozen `source/` in, byte-identical `generated/` out.
 
-The compiler is not an LLM page author. It is a capture-to-code pipeline: same
-frozen capture in, byte-stable app out.
+Read the evaluation method in [docs/METHODOLOGY.md](docs/METHODOLOGY.md) and the July 2026 debug bench in [docs/debug-bench-2026-07-03.md](docs/debug-bench-2026-07-03.md).
 
-> **"Cloning" here means generating a codebase from a live URL — not `git clone`.**
-> You don't need an existing repository, and you don't need the site's source. Point
-> ditto.site at a public URL and it writes you a fresh project from what the page
-> renders in a browser.
+## What's different from upstream ditto.site
 
-Read the public development and evaluation method in
-[docs/METHODOLOGY.md](docs/METHODOLOGY.md). For a map of all the docs, see
-[docs/README.md](docs/README.md).
+| Capability | Description |
+|------------|-------------|
+| **Dual deliverable** | Generated Next.js app at `/` plus static HTML mirror at `/static/` |
+| **Frozen live witness** | `source/evidence/live-witness/` — HTML, DOM, screenshots captured once; gates never re-hit production |
+| **Extended gates** | HTML witness (2b), DOM witness triangle (3b/3c), manifest hash (6b), responsive probes, visual audit |
+| **Lottie replay** | Captured animation JSON → `DittoLottie` client component; static frame for gates |
+| **Layout repair** | Post-gate loop recentres fixed columns with uniform horizontal drift (`layout-repair.json`) |
+| **Pattern catalog** | SHA256-pinned `compiler/data/pattern-catalog.json` drives capture recipes and generation fix bundles |
+| **Benchmark profiles** | `profiles/` for cropin.com, onni.com, everlastingcomfort.com acceptance tiers |
 
 ## Usage
-
-- REST API: `https://api.ditto.site`
-- MCP server: `https://api.ditto.site/mcp`
-
-Get a hosted key at `https://www.ditto.site/api-key`, or call the verified-email
-signup flow directly:
-
-```bash
-curl -sS -X POST "https://api.ditto.site/v1/signup/request" \
-  -H "content-type: application/json" \
-  -d '{"email":"you@example.com"}'
-```
-
-The emailed verification link lands on `/api-key?token=...`, which calls
-`POST /v1/signup/verify` and displays the new `dtto_live_...` key once.
-
-> **Keys are secrets.** Put your key in an environment variable (`export
-> DITTO_API_KEY=dtto_live_...`) and reference `$DITTO_API_KEY` in every command —
-> never paste the raw key inline, where it lands in shell history, logs, or a chat.
-> Don't commit it. You can rotate a key anytime from the dashboard.
-
-### REST API
-
-Start a clone job:
-
-```bash
-export DITTO_API_URL="https://api.ditto.site"
-export DITTO_API_KEY="ditto_live_example"
-
-curl -sS -X POST "$DITTO_API_URL/v1/clones" \
-  -H "authorization: Bearer $DITTO_API_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "url": "https://example.com/",
-    "options": {
-      "mode": "single",
-      "styling": "tailwind",
-      "framework": "next"
-    }
-  }'
-```
-
-The service returns either a queued job or an inline result. A finished result
-is a file map — every generated file keyed by its app-relative path:
-
-```json
-{
-  "jobId": "job_123",
-  "status": "succeeded",
-  "files": {
-    "package.json": { "type": "text", "content": "{ ... }", "bytes": 812, "sha256": "..." },
-    "src/app/page.tsx": { "type": "text", "content": "export default ...", "bytes": 2048, "sha256": "..." },
-    "public/assets/logo.png": { "type": "binary", "url": ".../files/public/assets/logo.png", "bytes": 5123, "sha256": "..." }
-  }
-}
-```
-
-**Turn that JSON into a project on disk** with the official unpacker — from a
-checked-out `ditto.site` repo with dependencies installed, pipe the response
-straight in with no temp file:
-
-```bash
-curl -sS -X POST "$DITTO_API_URL/v1/clones" \
-  -H "authorization: Bearer $DITTO_API_KEY" \
-  -H "content-type: application/json" \
-  -d '{"url":"https://example.com/","options":{"mode":"single"}}' \
-  | npm run --silent unpack -- - ./out
-```
-
-`npm run unpack -- <clone.json|-> <out-dir>` writes the text files inline and
-materializes binary assets (inline base64, or fetched from their `url` using
-`$DITTO_API_URL` / `$DITTO_API_KEY`). The CLI package is repo-local until the
-npm distribution story is ready, so do not use `npx ditto` yet. See
-[`packages/cli`](packages/cli/README.md) for options.
-
-If you got back a queued job (`{ "jobId": "job_123", "status": "queued" }`),
-poll it, then unpack the finished result — or download the whole app as one
-archive:
-
-```bash
-JOB_ID="job_123"
-
-# poll status, then unpack the finished file map
-curl -sS -H "authorization: Bearer $DITTO_API_KEY" \
-  "$DITTO_API_URL/v1/clones/$JOB_ID/result" \
-  | npm run --silent unpack -- - ./out
-
-# ...or grab the whole app as a single archive
-curl -L -H "authorization: Bearer $DITTO_API_KEY" \
-  "$DITTO_API_URL/v1/clones/$JOB_ID/bundle?format=tgz" \
-  -o ditto-clone.tgz
-```
-
-Useful options:
-
-| Option | Values | Default |
-| --- | --- | --- |
-| `mode` | `single`, `multi` | `single` |
-| `styling` | `tailwind`, `css` | `tailwind` |
-| `framework` | `next`, `vite` | `next` |
-| `verify` | `true`, `false` | `false` |
-| `asyncVerify` | `true`, `false` | `false` |
-| `maxRoutes` | number | service default |
-
-REST endpoints:
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/v1/clones` | Start a clone |
-| `GET` | `/v1/clones/:id` | Read job status and metadata |
-| `GET` | `/v1/clones/:id/result` | Read the eager file map |
-| `GET` | `/v1/clones/:id/files/*` | Stream one generated file |
-| `GET` | `/v1/clones/:id/bundle?format=tgz` | Download the whole app |
-| `DELETE` | `/v1/clones/:id` | Delete a clone and its artifacts |
-
-### MCP
-
-Connect an MCP client to the hosted Streamable HTTP endpoint:
-
-```json
-{
-  "mcpServers": {
-    "ditto": {
-      "url": "https://api.ditto.site/mcp",
-      "headers": {
-        "Authorization": "Bearer ${DITTO_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-The MCP server is designed for agents. It returns job ids, metadata, manifests,
-and file references first, then lets the agent read only the files it needs.
-
-Core MCP tools:
-
-| Tool | Purpose |
-| --- | --- |
-| `clone_website` | Start a clone and return `{ jobId, status }` |
-| `get_clone_status` | Poll job progress |
-| `get_clone_result` | Read result metadata without file contents |
-| `list_clone_files` | List generated file paths, sizes, and hashes |
-| `read_clone_files` | Read selected text files or binary URLs |
-| `get_clone_bundle` | Get a download URL for the generated app |
-
-Example agent prompt:
-
-```text
-Use the ditto MCP server to clone https://example.com as a Next.js app.
-Wait for the job to finish, list the generated files, then read package.json,
-src/app/page.tsx, and src/app/ditto.css.
-```
 
 ### Local CLI
 
 ```bash
-# this git clone gets the ditto.site tool itself — the URL you clone into a
-# codebase comes later, as the argument to `npm run clone`.
-git clone https://github.com/ion-design/ditto.site.git
-cd ditto.site
+git clone https://github.com/devteamaegis/ishaans-ditto-site.git
+cd ishaans-ditto-site
 
 npm ci
 npx playwright install chromium
+cd compiler/.harness && npm ci && cd ../..
 
-npm run clone -- https://example.com/ --out=./output
+CATALOG_ONLY_HINTS=true npm run typecheck
+CATALOG_ONLY_HINTS=true npm test
 ```
 
-The generated app lands under `output/<site>/app`. On success the CLI prints a
-copy-paste-safe summary — a single quoted `cd … && npm install && npm run dev`
-line and pointers to the safe-to-edit files (`src/app/content.ts`,
-`src/app/components/`; the app's `AGENTS.md` has the full guide).
-
-To skip the copy-paste entirely and go straight to a running preview:
+Clone a site (capture + generate + optional validate):
 
 ```bash
-npm run clone -- https://example.com/ --serve        # clone, npm install, npm run dev
-npm run clone -- https://example.com/ --open         # ...and open the browser too
+cd compiler
+CATALOG_ONLY_HINTS=true npm run clone -- https://example.com/ --runs=../runs --viewports=1280 --validate
 ```
 
-Common local variants:
+Output lands under `runs/<host>/<timestamp>/generated/app/`.
+
+Common variants:
 
 ```bash
-npm run clone -- https://example.com/ --mode=multi
-npm run clone -- https://example.com/ --styling=css
-npm run clone -- https://example.com/ --framework=vite
-npm run validate-site -- runs/site-example.com/<timestamp>
+npm run clone -- https://example.com/ --viewports=375,768,1280,1920 --interactions --motion --validate
+npm run regen -- ../runs/example.com/<timestamp>   # regenerate from frozen capture
+npm run bench -- --tier=easy --limit=3 --runs=../runs/bench
 ```
 
-Without `--out`, runs land under `runs/<site>/<timestamp>/` and a stable
-`runs/<site>/latest` symlink always points at the newest clone, so scripts and
-`cd` targets don't depend on the timestamp.
+### Local REST API + UI
 
-### Local REST And MCP Service
-
-Quick inline mode, with no database:
+Quick inline mode (no database):
 
 ```bash
 npm ci
 npx playwright install chromium
 
-SSRF_ALLOW_LOOPBACK=true npm run dev:api
+PORT=8899 npm run dev:api
 ```
 
-Then call the local REST API:
+Open `http://localhost:8899/` for the clone UI, or call the REST API:
 
 ```bash
-curl -sS -X POST "http://localhost:8787/v1/clones" \
+curl -sS -X POST "http://localhost:8899/v1/clones" \
   -H "content-type: application/json" \
-  -d '{"url":"https://example.com/","options":{"mode":"single"}}'
+  -d '{"url":"https://example.com/","options":{"mode":"single","styling":"tailwind","framework":"next"}}'
 ```
 
-For the queued service with Postgres and MinIO:
+Poll progress:
+
+```bash
+curl -sS "http://localhost:8899/v1/clones/<jobId>/events?after=0"
+curl -sS "http://localhost:8899/v1/clones/<jobId>"
+```
+
+Browse the built clone: `http://localhost:8899/v1/clones/<jobId>/app-preview/`
+
+### Queued service (Postgres + worker)
 
 ```bash
 docker compose up -d
 cp .env.example .env
 
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ditto_site \
-  npm run db:migrate
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ditto_site npm run db:migrate
 
 npm run dev:api
 npm run dev:worker
 ```
 
-The local MCP endpoint is `http://localhost:8787/mcp`.
+The worker persists pipeline events to `job_events` and serves them via `GET /v1/clones/:id/events`.
 
-## What You Get
+## REST endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/clones` | Start a clone |
+| `GET` | `/v1/clones/:id` | Job status and metadata |
+| `GET` | `/v1/clones/:id/events` | Pipeline progress events |
+| `GET` | `/v1/clones/:id/result` | Eager file map |
+| `GET` | `/v1/clones/:id/files/*` | Stream one generated file |
+| `GET` | `/v1/clones/:id/app-preview/*` | Browsable built clone |
+| `GET` | `/v1/clones/:id/bundle?format=tgz` | Download the whole app |
+| `DELETE` | `/v1/clones/:id` | Delete clone artifacts |
+
+MCP endpoint (when enabled): `http://localhost:8899/mcp`
+
+## What you get
 
 A generated app includes:
 
-- a runnable Next.js or Vite React project,
-- reconstructed pages and route modules,
-- captured assets, fonts, icons, manifest files, and metadata,
-- `robots`, `sitemap`, `llms.txt`, and JSON-LD when discoverable,
-- small `ditto` runtime helpers for recognized interactions and motion,
-- generated `AGENTS.md` and `ARCHITECTURE.md` handoff docs.
+- Runnable Next.js or Vite React project with Tailwind utilities (default) or semantic CSS
+- Reconstructed pages, optional extracted components, and section modules
+- Captured assets, fonts, icons, robots/sitemap/llms.txt, JSON-LD when discoverable
+- `ditto/` runtime helpers: tabs, accordions, menus, `DittoMotion`, `DittoLottie`
+- Static mirror at `/static/` for diff-friendly HTML
+- Generated `AGENTS.md` and `ARCHITECTURE.md` handoff docs
 
-Delivery output is under `generated/app/` during validation and under
-`<out>/<site>/app` for CLI delivery.
+Delivery output: `generated/app/` during validation; `runs/<site>/<timestamp>/generated/app` for CLI runs.
 
-## How It Works
+## How it works
 
-```text
-URL
-  -> browser capture
-  -> normalized render IR
-  -> deterministic inference
-  -> app generation
-  -> asset materialization
-  -> optional validation
+```
+Live URL
+  → capture (Playwright, settle recipe, lazy sweep, Lottie/motion/interactions)
+  → normalize IR + frozen evidence/live-witness/
+  → infer (sections, tokens, recipes, pattern catalog)
+  → generate (Next.js + mirror, optional components)
+  → validate (gates 0–6 + witness + perceptual + layout repair loop)
+  → service layer (REST + UI + optional Postgres queue)
 ```
 
-Capture records DOM, computed styles, layout boxes, source metadata, CSS, fonts,
-assets, screenshots, interaction states, and reproducible motion where it can be
-observed safely. Unsupported app logic, auth, payments, personalization, and
-arbitrary third-party JavaScript are not replayed.
+**Determinism contract:** same frozen `source/` ⇒ byte-identical `generated/` (Gate 6). No `Date.now` / `Math.random` in generate/infer. Validation never re-fetches live URLs.
 
-For the detailed service API, see [docs/SERVICE.md](docs/SERVICE.md). For
-deployment, see [docs/DEPLOY.md](docs/DEPLOY.md). For the development method
-behind the compiler, see [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
+For service API details see [docs/SERVICE.md](docs/SERVICE.md). For deployment see [docs/DEPLOY.md](docs/DEPLOY.md).
 
-Hosted deployments should keep `/v1/clones*` and `/mcp` behind API-key auth.
-When `SIGNUP_ENABLED=true` in DB mode, the Resend-backed
-`POST /v1/signup/request` and `POST /v1/signup/verify` flow can publicly mint
-`dtto_live_...` keys from verified email links while storing only key hashes.
-Keep `SIGNUP_DIRECT_ENABLED=false` in production unless direct unauthenticated
-minting is intentional.
-
-## Repository Map
+## Repository map
 
 | Path | Purpose |
-| --- | --- |
-| `compiler/` | deterministic capture, inference, generation, and validation |
-| `packages/core/` | compiler adapter and file-map helpers |
-| `packages/cli/` | `ditto` CLI — unpack a clone result JSON into a project tree |
-| `packages/api/` | Hono REST API and MCP server |
-| `packages/db/` | Drizzle schema, migrations, repository, and queue wrapper |
-| `packages/storage/` | local and S3/R2 artifact storage |
-| `packages/worker/` | queued clone runner and optional verification |
-| `docs/` | methodology, service, deployment, release, and responsible-use docs |
-| `examples/` | benchmark results and visual evidence |
+|------|---------|
+| `compiler/` | Capture, inference, generation, validation, benchmarks |
+| `packages/core/` | Compiler adapter, clone job runner, app preview |
+| `packages/api/` | Hono REST API, MCP, web UI |
+| `packages/db/` | Drizzle schema, migrations, repository, queue |
+| `packages/storage/` | Local and S3/R2 artifact storage |
+| `packages/worker/` | Queued clone runner |
+| `docs/` | Methodology, service, deployment, debug benches |
+| `profiles/` | Site-specific acceptance profiles |
+| `examples/` | Benchmark results and visual evidence |
+| `docker/` | Compose stack for Postgres + MinIO + api/worker |
 
-## Responsible Use
+## Responsible use
 
-Use ditto.site only where you have the right to inspect, copy, transform, and
-operate on the target content. Do not use it for phishing, impersonation,
-credential capture, bypassing access controls, or high-volume third-party
-capture without permission.
+Use only where you have the right to inspect, copy, transform, and operate on the target content. Do not use for phishing, impersonation, credential capture, or bypassing access controls.
 
 See [docs/RESPONSIBLE_USE.md](docs/RESPONSIBLE_USE.md).
 
@@ -322,21 +167,15 @@ See [docs/RESPONSIBLE_USE.md](docs/RESPONSIBLE_USE.md).
 ```bash
 npm ci
 npx playwright install chromium
-npm run typecheck
-npm test
+cd compiler/.harness && npm ci && cd ../..
+CATALOG_ONLY_HINTS=true npm run typecheck
+CATALOG_ONLY_HINTS=true npm test
 ```
 
-Browser tests require Chromium. Postgres-backed tests use `TEST_DATABASE_URL` or
-the local compose stack. Changes that alter compiler output should include a
-focused fixture or benchmark note.
+Browser tests require Chromium. Postgres-backed tests use `TEST_DATABASE_URL` or the local compose stack. Changes that alter compiler output should include a focused fixture or benchmark note.
 
-The repository is MIT-licensed open source. The npm workspaces are intentionally
-marked `private` until the package boundaries are ready for public npm
-publishing.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md),
-[SUPPORT.md](SUPPORT.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 
-[MIT](LICENSE) © ion-design and contributors.
+MIT © ion-design and contributors. See [LICENSE](LICENSE).

@@ -30,6 +30,10 @@ export function readJSON<T = unknown>(file: string): T {
   return JSON.parse(readFileSync(file, "utf8")) as T;
 }
 
+export function readText(file: string): string {
+  return readFileSync(file, "utf8");
+}
+
 export function fileExists(file: string): boolean {
   return existsSync(file);
 }

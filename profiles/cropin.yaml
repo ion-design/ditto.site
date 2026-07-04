@@ -1,0 +1,9 @@
+# Onboarding acceptance profile — cropin.com (Elementor + Lottie)
+site: https://cropin.com/
+tier: onboarding
+gate2_strict: true
+visual_threshold: 0.16
+mirror_mount: /static
+routes:
+  - /
+allowed_skips: []

@@ -41,16 +41,7 @@ export type RevealSpec = {
   cap: string; // data-cid-cap of a scroll-revealed element
   opacity: string; // its hidden (pre-reveal) opacity, e.g. "0"
   transform: string; // its hidden transform (slide/scale offset), or "none"
-  transition: string; // the transition to animate the reveal with ("" for the visibility family)
-  // visibility+entrance-class family (Elementor/WOW/AOS): hidden via `visibility:hidden`
-  // pre-scroll, revealed by a class swap that applies a keyframe animation. The clone
-  // re-hides with visibility (JS-applied, so non-JS/SSR still shows content) and replays
-  // the named animation when scrolled into view.
-  visibility?: "hidden";
-  animationName?: string; // entrance @keyframes name in the revealed state (e.g. fadeInUp)
-  animationDuration?: string; // e.g. "1.25s"
-  animationDelay?: string; // e.g. "0s"
-  animationTiming?: string; // e.g. "ease" / "cubic-bezier(...)"
+  transition: string; // the transition to animate the reveal with
 };
 
 export type MarqueeSpec = {
@@ -71,41 +62,26 @@ export type MotionCapture = {
 };
 
 /**
- * Stage 5 (scroll reveals) — pre-scroll probe. Scroll-triggered reveals start hidden and
- * animate in when scrolled into view; by the time the settled snapshot is taken (after
- * the reveal-settling pass has walked the page) they are already revealed, so their
- * hidden state must be sampled BEFORE the first scroll. Records, on `window.__cloneReveal`,
- * two candidate families over tagged elements — the set `captureMotion` later confirms
- * (kept only if the element ends up visible):
- *   - **transition** — opacity≈0 with a real opacity/transform transition (the reveal
- *     animates via the transition already on the element);
- *   - **visibility** — `visibility:hidden` with a real box (Elementor `.elementor-invisible`,
- *     WOW/AOS wrappers), revealed by a class swap that APPLIES a keyframe animation. The
- *     entrance animation only exists post-swap, so `captureMotion` reads it at confirm
- *     time from the revealed computed style. Only the OUTERMOST hidden element is recorded
- *     (visibility inherits — descendants are covered by the wrapper's reveal).
- * Idempotent; call once at the canonical width, after settle, before the first scroll.
+ * Stage 5 (scroll reveals) — pre-scroll probe. Scroll-triggered reveals start hidden
+ * (opacity:0 / transform offset) and animate in when scrolled into view; by the time the
+ * settled snapshot is taken (after `autoScroll` has walked the page) they are already
+ * revealed, so their hidden state must be sampled BEFORE the first scroll. Records, on
+ * `window.__cloneReveal`, the pre-scroll opacity/transform/transition of every tagged
+ * element that is hidden-but-boxed with a real transition — the candidate reveal set
+ * `captureMotion` later confirms (kept only if the element ends up visible). Idempotent;
+ * call once at the first viewport, after settle, before `autoScroll`.
  */
 export async function probeReveals(page: Page): Promise<void> {
   try {
     await page.evaluate(() => {
-      const out: Record<string, { opacity: string; transform: string; transition: string; family?: "visibility" }> = {};
+      const out: Record<string, { opacity: string; transform: string; transition: string }> = {};
       for (const el of Array.from(document.querySelectorAll("[data-cid-cap]"))) {
         const cap = el.getAttribute("data-cid-cap"); if (!cap) continue;
         let cs: CSSStyleDeclaration; try { cs = getComputedStyle(el); } catch { continue; }
-        const r = (el as HTMLElement).getBoundingClientRect();
-        if (r.width < 8 || r.height < 8) continue; // must occupy real space (not a 0-box hidden node)
-        if (cs.visibility === "hidden") {
-          // visibility family: record only the reveal ROOT (parent not also hidden).
-          const p = (el as HTMLElement).parentElement;
-          let parentHidden = false;
-          try { parentHidden = !!p && getComputedStyle(p).visibility === "hidden"; } catch { /* ignore */ }
-          if (parentHidden) continue;
-          out[cap] = { opacity: cs.opacity || "1", transform: "none", transition: "", family: "visibility" };
-          continue;
-        }
         const op = parseFloat(cs.opacity || "1");
         if (op > 0.05) continue; // only currently-hidden elements are reveal candidates
+        const r = (el as HTMLElement).getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue; // must occupy real space (not a 0-box hidden node)
         // must have a transition on opacity/transform/all (so the reveal animates, not snaps)
         const tp = (cs.transitionProperty || "").toLowerCase();
         const td = cs.transitionDuration || "0s";
@@ -335,41 +311,17 @@ export async function captureMotion(page: Page, opts?: { observeMs?: number; log
 
         // ---- Scroll reveals: confirm the pre-scroll candidates (probeReveals) that are
         // NOW visible — those genuinely revealed on scroll (vs. elements that stayed hidden).
-        const reveals: Array<{
-          cap: string; opacity: string; transform: string; transition: string;
-          visibility?: "hidden"; animationName?: string; animationDuration?: string; animationDelay?: string; animationTiming?: string;
-        }> = [];
+        const reveals: Array<{ cap: string; opacity: string; transform: string; transition: string }> = [];
         try {
-          const probed = (window as unknown as { __cloneReveal?: Record<string, { opacity: string; transform: string; transition: string; family?: "visibility" }> }).__cloneReveal || {};
-          // First value of a comma-joined animation longhand; timing functions carry inner
-          // commas (cubic-bezier/steps), so take the whole leading function when present.
-          const first = (v: string): string => (/^\s*(cubic-bezier\([^)]*\)|steps\([^)]*\)|[^,]+)/.exec(v || "")?.[1] ?? "").trim();
+          const probed = (window as unknown as { __cloneReveal?: Record<string, { opacity: string; transform: string; transition: string }> }).__cloneReveal || {};
           for (const cap of Object.keys(probed)) {
             const el = document.querySelector(`[data-cid-cap="${cap}"]`);
             if (!el) continue;
             const cs = getComputedStyle(el);
-            const p = probed[cap]!;
+            if (parseFloat(cs.opacity || "1") <= 0.05) continue; // still hidden → not a reveal, just hidden
             const r = (el as HTMLElement).getBoundingClientRect();
             if (r.width < 8 || r.height < 8) continue;
-            if (p.family === "visibility") {
-              if (cs.visibility === "hidden") continue; // never revealed → genuinely hidden content
-              // Revealed via class swap. The swap's entrance animation is now in the computed
-              // style (libraries keep the animated class); record it for replay.
-              const name = first(cs.animationName || "none");
-              reveals.push({
-                cap, opacity: p.opacity, transform: "none", transition: "",
-                visibility: "hidden",
-                ...(name && name !== "none" ? {
-                  animationName: name,
-                  animationDuration: first(cs.animationDuration) || "1s",
-                  animationDelay: first(cs.animationDelay) || "0s",
-                  animationTiming: first(cs.animationTimingFunction) || "ease",
-                } : {}),
-              });
-              continue;
-            }
-            if (parseFloat(cs.opacity || "1") <= 0.05) continue; // still hidden → not a reveal, just hidden
-            reveals.push({ cap, opacity: p.opacity, transform: p.transform, transition: p.transition });
+            reveals.push({ cap, ...probed[cap]! });
           }
         } catch { /* ignore */ }
 
@@ -392,7 +344,6 @@ export async function captureMotion(page: Page, opts?: { observeMs?: number; log
     // Marquees run as a separate pass (scrolls each track into view to wake the paused
     // rAF ticker; kept after the rotator MutationObserver window so it can't add false text rotators).
     const marquees = await detectMarquees(page);
-    // Lottie: third-party JSON animations, captured separately (registry + static markup scan).
     const lottie = await captureLotties(page, { log });
     log({ event: "motion_captured", waapi: result.waapi.length, rotators: result.rotators.length, reveals: reveals.length, marquees: marquees.length, lotties: lottie.lotties.length, cssAnimated: result.cssAnimated });
     return { ...result, reveals, marquees, lotties: lottie.lotties, lottieInline: lottie.inline };

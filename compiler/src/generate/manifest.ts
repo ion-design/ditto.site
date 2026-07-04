@@ -5,7 +5,7 @@ import type { AssetGraph } from "../infer/assets.js";
 import type { FontGraph } from "../infer/fonts.js";
 import type { CaptureResult } from "../capture/capture.js";
 
-export const COMPILER_VERSION = "0.1.0";
+export const COMPILER_VERSION = "0.2.0";
 export const SCHEMA_VERSION = 1;
 
 export function buildManifest(args: {

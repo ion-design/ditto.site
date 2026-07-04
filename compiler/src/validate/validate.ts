@@ -9,6 +9,7 @@ import { detectSections } from "../infer/sections.js";
 import { buildAssetGraph } from "../infer/assets.js";
 import { buildFontGraph } from "../infer/fonts.js";
 import { generateAll } from "../generate/pipeline.js";
+import { detectUniformHorizontalOffset, writeLayoutRepairHints } from "../generate/layoutRepair.js";
 import { COMPILER_VERSION } from "../generate/manifest.js";
 import { interactionRejectedArtifact } from "../generate/interactive.js";
 import { buildApp, serveStatic, renderApp, measureProbeWidths, findRemoteRefs } from "./render.js";
@@ -17,6 +18,11 @@ import { driveMotionGate, motionExpected } from "./motionGate.js";
 import {
   gate1Capture, gate2Assets, gate3Dom, gate4Style, gate5Layout, gateResponsive, gatePollution, type GateResult,
 } from "./gates.js";
+import { gate2bHtmlWitness } from "../materialize/html-witness.js";
+import { gate3bIrVsWitness, gate3cCloneVsWitness } from "./domWitness.js";
+import { gate6bManifestHash } from "./manifestGate.js";
+import { pixelAuditGate } from "../audit/auditGate.js";
+import { MIRROR_MOUNT } from "../generate/mirror.js";
 
 /** Widths the capture never sampled — the midpoint of every adjacent captured pair (inside each
  *  media band) plus one beyond the widest. The responsive gate renders the clone here to catch
@@ -35,7 +41,7 @@ import type { CaptureResult } from "../capture/capture.js";
 const DEFAULT_HARNESS = fileURLToPath(new URL("../../.harness", import.meta.url));
 
 const DETERMINISM_FILES = [
-  "manifest.json", "sections.json", "tokens.json", "assets.json", "fonts.json", "components.json", "recipes.json", "recipes.md", "interaction-recipes.json", "interaction-recipes.md", "seo.json", "seo.md", "code-quality.json", "code-quality.md",
+  "manifest.json", "sections.json", "tokens.json", "assets.json", "fonts.json", "components.json", "patterns.json", "recipes.json", "recipes.md", "interaction-recipes.json", "interaction-recipes.md", "seo.json", "seo.md", "code-quality.json", "code-quality.md",
   "app/src/app/page.tsx", "app/src/app/ditto.css", "app/src/app/globals.css", "app/src/app/layout.tsx",
   "app/AGENTS.md", "app/ARCHITECTURE.md",
   "app/src/app/content.ts", // Stage 6 — present only when extraction promoted components
@@ -45,7 +51,7 @@ const DETERMINISM_FILES = [
 ];
 
 const VITE_DETERMINISM_FILES = [
-  "manifest.json", "sections.json", "tokens.json", "assets.json", "fonts.json", "components.json", "recipes.json", "recipes.md", "interaction-recipes.json", "interaction-recipes.md", "seo.json", "seo.md", "code-quality.json", "code-quality.md",
+  "manifest.json", "sections.json", "tokens.json", "assets.json", "fonts.json", "components.json", "patterns.json", "recipes.json", "recipes.md", "interaction-recipes.json", "interaction-recipes.md", "seo.json", "seo.md", "code-quality.json", "code-quality.md",
   "app/index.html", "app/vite.config.ts", "app/src/page.tsx", "app/src/main.tsx", "app/src/ditto.css", "app/src/globals.css",
   "app/AGENTS.md", "app/ARCHITECTURE.md",
   "app/src/content.ts",
@@ -125,6 +131,31 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
     } finally {
       await server.close();
     }
+    // Layout repair: uniform horizontal drift → mx-auto recentre, rebuild, re-render (≤3).
+    let outDir = build.outDir;
+    for (let li = 0; li < 3; li++) {
+      const probe = gate5Layout(ir, snapshots, sections, viewports, reflowOpt);
+      if (probe.pass) break;
+      const hints = detectUniformHorizontalOffset(ir, snapshots, viewports);
+      if (!hints) break;
+      writeLayoutRepairHints(sourceDir, hints);
+      generateAll({ sourceDir, capture, viewports, sampleViewports: capture.viewports, url, outDir: generatedDir });
+      const reb = buildApp(appDir, harnessDir);
+      if (!reb.ok || !reb.outDir) break;
+      outDir = reb.outDir;
+      const srv = await serveStatic(outDir);
+      try {
+        const r2 = await renderApp({ url: srv.url + "/", viewports, renderedDir });
+        snapshots = r2.snapshots;
+        runtimeErrors = r2.runtimeErrors;
+        httpStatus = r2.httpStatus;
+        failedResources = r2.failedResources;
+        probeSnaps = await measureProbeWidths({ url: srv.url + "/", widths: probeWidthsFor(viewports) });
+      } finally {
+        await srv.close();
+      }
+      log({ event: "layout_repair", iter: li + 1, cids: hints.forceCenterCids.length });
+    }
   }
   // Video/audio elements stream and their requests are aborted ("failed") when the
   // render snapshot is taken before the stream finishes — the file is materialized,
@@ -133,17 +164,19 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
     (f) => f.includes("/assets/") && !/\.(mp4|webm|mov|m4v|ogv|ogg|mp3|wav|m3u8)(\?|$)/i.test(f),
   );
   const artifactsPresent = ["manifest.json", "sections.json", "tokens.json", "assets.json", "fonts.json"].every((f) => fileExists(join(generatedDir, f)));
+  const mirrorPresent = fileExists(join(appDir, "public", "static", "index.html"));
   const gate0Issues: string[] = [];
   if (!build.ok) gate0Issues.push("build failed: " + build.stderr.split("\n").filter(Boolean).slice(-3).join(" | "));
   if (httpStatus !== 200) gate0Issues.push(`http status ${httpStatus}`);
   if (runtimeErrors.length) gate0Issues.push(`${runtimeErrors.length} runtime errors`);
   if (!artifactsPresent) gate0Issues.push("missing required artifacts");
+  if (!mirrorPresent) gate0Issues.push(`missing static mirror at ${MIRROR_MOUNT}/index.html`);
   // De-duplicate runtime errors and keep a sample so the report is debuggable.
   const uniqueErrors = [...new Set(runtimeErrors)].slice(0, 5);
   const gate0: GateResult = {
     gate: "build",
-    pass: build.ok && httpStatus === 200 && runtimeErrors.length === 0 && artifactsPresent,
-    metrics: { buildOk: build.ok, http200: httpStatus === 200, noRuntimeErrors: runtimeErrors.length === 0, artifactsPresent, buildMs: build.durationMs, runtimeErrorSample: uniqueErrors },
+    pass: build.ok && httpStatus === 200 && runtimeErrors.length === 0 && artifactsPresent && mirrorPresent,
+    metrics: { buildOk: build.ok, http200: httpStatus === 200, noRuntimeErrors: runtimeErrors.length === 0, artifactsPresent, mirrorPresent, mirrorMount: MIRROR_MOUNT, buildMs: build.durationMs, runtimeErrorSample: uniqueErrors },
     issues: gate0Issues,
   };
 
@@ -159,25 +192,38 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
   // ---- Gate 2: asset/font ----
   const remoteRefs = findRemoteRefs(snapshots);
   const gate2 = gate2Assets(assetGraph, fontGraph, { remoteRefs, failed404: assetFailed });
+  const gate2b = gate2bHtmlWitness(sourceDir, assetGraph, url, opts?.tier === "onboarding");
 
   // ---- Gates 3,4,5 ----
   const gate3 = gate3Dom(ir, snapshots, viewports, origin);
+  const gate3b = gate3bIrVsWitness(ir, sourceDir, viewports);
+  const gate3c = gate3cCloneVsWitness(snapshots, sourceDir, viewports);
   const gate4 = gate4Style(ir, snapshots, viewports);
   const gate5 = gate5Layout(ir, snapshots, sections, viewports, reflowOpt);
 
   // ---- Gate 6: determinism ----
   const gate6 = checkDeterminism(sourceDir, capture, viewports, url);
+  const gate6b = gate6bManifestHash(sourceDir, generatedDir);
 
-  // ---- Stage 2 gates: pollution + perceptual ----
+  // ---- Stage 2 gates: pollution + perceptual + visual audit ----
   const pollution = gatePollution(ir, capture, viewports);
   const perceptual = screenshotDiff(sourceDir, renderedDir, viewports, validationDir, opts?.tier);
+  const visualAudit = pixelAuditGate({
+    sourceDir,
+    renderedDir,
+    viewports,
+    outDir: join(validationDir, "audit"),
+    threshold: PERCEPTUAL_THRESHOLD[opts?.tier ?? "hard"] ?? 0.14,
+  });
 
   // ---- Responsive gate: fluidity/centering at non-captured widths (diagnostic; not in 0–6) ----
   const responsive = gateResponsive(ir, probeSnaps, viewports);
 
   const gates: Record<string, GateResult> = {
-    build: gate0, capture: gate1, asset_font: gate2, dom: gate3, style: gate4,
-    layout: gate5, determinism: gate6, pollution, perceptual, responsive, interaction: interactionGate, motion: motionGate,
+    build: gate0, capture: gate1, asset_font: gate2, html_witness: gate2b,
+    dom: gate3, dom_witness: gate3b, dom_clone_witness: gate3c,
+    style: gate4, layout: gate5, determinism: gate6, manifest_hash: gate6b,
+    pollution, perceptual, visual_audit: visualAudit, responsive, interaction: interactionGate, motion: motionGate,
   };
 
   const report = buildReport({ sourceUrl: url, tier: opts?.tier ?? "unknown", compilerVersion: COMPILER_VERSION, gates });

@@ -1,7 +1,11 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { IR, IRNode } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import type { MotionCapture } from "../capture/motion.js";
 import type { AssetGraph } from "../infer/assets.js";
+import { ensureDir, writeJSONCompact, writeText } from "../util/fsx.js";
+import { sha1_12 } from "../util/canonical.js";
 
 /**
  * Stage 5 motion controller — Lottie subset. lottie-web renders a JSON document into an
@@ -29,18 +33,89 @@ const capToCid = (ir: IR): Map<string, string> => {
   return m;
 };
 
+function findNode(root: IRNode, id: string): IRNode | null {
+  if (root.id === id) return root;
+  for (const c of root.children) {
+    if (isTextChild(c)) continue;
+    const hit = findNode(c, id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function firstSvgWithRaw(node: IRNode): IRNode | null {
+  if (node.tag === "svg" && node.rawHTML) return node;
+  for (const c of node.children) {
+    if (isTextChild(c)) continue;
+    const hit = firstSvgWithRaw(c);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Write the captured lottie placeholder SVG to public/assets so gates see a stable
+ *  frame via a lightweight `<img>` while DittoLottie replays the JSON at runtime. */
+export function materializeLottieFrameSvgs(
+  ir: IR,
+  motion: MotionCapture | undefined,
+  publicDir: string,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const map = capToCid(ir);
+  for (const s of motion?.lotties ?? []) {
+    const containerCid = map.get(s.cap);
+    if (!containerCid) continue;
+    const container = findNode(ir.root, containerCid);
+    if (!container) continue;
+    const svg = firstSvgWithRaw(container);
+    if (!svg?.rawHTML) continue;
+    const hash = sha1_12(svg.rawHTML);
+    const rel = `/assets/cloned/lottie/frame-${hash}.svg`;
+    const abs = join(publicDir, rel.slice(1));
+    if (!existsSync(abs)) {
+      ensureDir(join(publicDir, "assets", "cloned", "lottie"));
+      writeText(abs, svg.rawHTML);
+    }
+    out.set(svg.id, rel);
+  }
+  return out;
+}
+
 export type RTLottie = {
   cid: string;
   renderer: "svg" | "canvas";
   loop: boolean;
   autoplay: boolean;
-  path: string | null; // public-relative URL of the materialized .json (preferred)
-  animationData: unknown | null; // inline JSON, only when no fetchable URL existed
+  path: string; // public-relative URL of the materialized .json
   width: number;
   height: number;
 };
 
 export type LottieSpec = { items: RTLottie[] };
+
+/** Write inline lottie JSON (from capture) to public/assets/cloned/lottie/*.json so
+ *  generation never embeds multi-MB animationData in page.tsx / RSC flight. Returns
+ *  inlineKey → public path. Idempotent: same JSON → same hash filename. */
+export function materializeInlineLottieJson(
+  motion: MotionCapture | undefined,
+  publicDir: string,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const inline = motion?.lottieInline ?? {};
+  for (const s of motion?.lotties ?? []) {
+    if (!s.inlineKey || !Object.prototype.hasOwnProperty.call(inline, s.inlineKey)) continue;
+    const data = inline[s.inlineKey]!;
+    const hash = sha1_12(JSON.stringify(data));
+    const rel = `/assets/cloned/lottie/${hash}.json`;
+    const abs = join(publicDir, rel.slice(1));
+    if (!existsSync(abs)) {
+      ensureDir(join(publicDir, "assets", "cloned", "lottie"));
+      writeJSONCompact(abs, data);
+    }
+    out.set(s.inlineKey, rel);
+  }
+  return out;
+}
 
 /**
  * Resolve captured lottie specs (keyed by data-cid-cap, with a source URL or inline-data
@@ -53,11 +128,11 @@ export function buildLottieSpec(
   motion: MotionCapture | undefined,
   assetGraph: AssetGraph,
   include?: (cid: string) => boolean,
+  inlinePaths?: Map<string, string>,
 ): LottieSpec {
   const lotties = motion?.lotties ?? [];
   if (!lotties.length) return { items: [] };
   const map = capToCid(ir);
-  const inline = motion?.lottieInline ?? {};
   const ok = (cid: string | undefined): cid is string => !!cid && (!include || include(cid));
   const items: RTLottie[] = [];
 
@@ -70,11 +145,8 @@ export function buildLottieSpec(
       const entry = assetGraph.byUrl.get(s.src);
       if (entry && entry.classification === "downloaded" && entry.localPath) path = entry.localPath;
     }
-    let animationData: unknown | null = null;
-    if (!path && s.inlineKey && Object.prototype.hasOwnProperty.call(inline, s.inlineKey)) {
-      animationData = inline[s.inlineKey] ?? null;
-    }
-    if (!path && animationData == null) continue; // nothing reproducible
+    if (!path && s.inlineKey && inlinePaths?.has(s.inlineKey)) path = inlinePaths.get(s.inlineKey)!;
+    if (!path) continue; // nothing reproducible without a local .json path
 
     items.push({
       cid,
@@ -82,7 +154,6 @@ export function buildLottieSpec(
       loop: s.loop,
       autoplay: s.autoplay,
       path,
-      animationData,
       width: s.width,
       height: s.height,
     });
@@ -103,7 +174,8 @@ export function dittoLottieImportPath(depth: number): string {
 export function lottieWireJsx(spec: LottieSpec, indent: number): string {
   if (!lottieHasContent(spec)) return "";
   const pad = "  ".repeat(indent);
-  return `${pad}<DittoLottie spec={${JSON.stringify(spec)}} />`;
+  // Path-only wire — never embed animation JSON (keeps page.tsx + RSC flight small).
+  return `${pad}<DittoLottie items={${JSON.stringify(spec.items)}} />`;
 }
 
 export const DITTO_LOTTIE_TSX = `"use client";
@@ -114,26 +186,25 @@ type RTLottie = {
   renderer: "svg" | "canvas";
   loop: boolean;
   autoplay: boolean;
-  path: string | null;
-  animationData: unknown | null;
+  path: string;
   width: number;
   height: number;
 };
-export type LottieSpec = { items: RTLottie[] };
 
 const byCid = (cid: string): HTMLElement | null => document.querySelector('[data-cid="' + cid + '"]');
 
-export default function DittoLottie({ spec }: { spec: LottieSpec }) {
+export default function DittoLottie({ items }: { items: RTLottie[] }) {
   useEffect(() => {
     const stopped = (window as any).__dittoMotionStopped === true;
+    if (stopped) return; // gates grade the static img/svg frame baked into the SSR markup
     const anims: Array<{ destroy: () => void; goToAndStop: (value: number, isFrame?: boolean) => void }> = [];
     let cancelled = false;
     void (async () => {
       const lottie = (await import("lottie-web")).default;
       if (cancelled) return;
-      for (const it of spec.items) {
+      for (const it of items) {
         const el = byCid(it.cid);
-        if (!el) continue;
+        if (!el || !it.path) continue;
         // clear the captured placeholder frame so it never stacks with the live render
         el.innerHTML = "";
         try {
@@ -141,11 +212,10 @@ export default function DittoLottie({ spec }: { spec: LottieSpec }) {
             container: el,
             renderer: it.renderer === "canvas" ? "canvas" : "svg",
             loop: it.loop,
-            autoplay: it.autoplay && !stopped,
-            ...(it.path ? { path: it.path } : { animationData: it.animationData as object }),
+            autoplay: it.autoplay,
+            path: it.path,
             rendererSettings: { preserveAspectRatio: "xMidYMid meet" },
           });
-          if (stopped) { try { anim.goToAndStop(0, true); } catch {} }
           anims.push(anim);
         } catch {
           /* a single bad animation must not break the page */
@@ -153,7 +223,7 @@ export default function DittoLottie({ spec }: { spec: LottieSpec }) {
       }
     })().catch(() => {});
     return () => { cancelled = true; for (const a of anims) { try { a.destroy(); } catch {} } };
-  }, [spec]);
+  }, [items]);
   return null;
 }
 `;

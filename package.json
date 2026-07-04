@@ -1,13 +1,13 @@
 {
-  "name": "ditto.site",
-  "version": "0.1.0",
+  "name": "ishaans-ditto-site",
+  "version": "0.2.0",
   "private": true,
-  "description": "ditto.site deterministic website compiler: compile a public URL into a Next.js app from browser-captured evidence with a REST + MCP service layer.",
+  "description": "Deterministic website compiler fork: dual Next.js + /static/ mirror deliverables with frozen live-witness validation.",
   "license": "MIT",
-  "author": "ion-design",
+  "author": "ishaansamantray",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ion-design/ditto.site.git"
+    "url": "https://github.com/devteamaegis/ishaans-ditto-site.git"
   },
   "bugs": {
     "url": "https://github.com/ion-design/ditto.site/issues"
@@ -38,11 +38,11 @@
     "bench-site": "npm run bench-site --workspace clone-static --",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "dev:api": "npm run dev --workspace @cloner/api",
+    "dev:api": "npm run start --workspace @cloner/api",
+    "dev:api:watch": "npm run dev --workspace @cloner/api",
     "dev:worker": "npm run dev --workspace @cloner/worker",
     "db:generate": "npm run generate --workspace @cloner/db",
-    "db:migrate": "npm run migrate --workspace @cloner/db",
-    "unpack": "node packages/cli/bin/ditto.mjs unpack"
+    "db:migrate": "npm run migrate --workspace @cloner/db"
   },
   "devDependencies": {
     "tsx": "4.22.4",

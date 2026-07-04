@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 import { collectPage, type PageSnapshot } from "../capture/walker.js";
 import { ensureDir, writeJSONCompact } from "../util/fsx.js";
+import { scrollForLazyLoad, preScreenshotSettle } from "../settle/recipe.js";
 
 const ESBUILD_SHIM =
   "globalThis.__name = globalThis.__name || ((fn) => fn);" +
@@ -14,6 +15,10 @@ const ESBUILD_SHIM =
 const VIEWPORT_HEIGHTS: Record<number, number> = { 375: 812, 768: 1024, 1280: 800, 1920: 1080 };
 function viewportHeight(w: number): number { return VIEWPORT_HEIGHTS[w] ?? Math.round(w * 0.66); }
 
+/** The compiler's shared build harness (deps preinstalled). Exposed so the service
+ *  layer can build previews without duplicating the path convention. */
+export const DEFAULT_HARNESS_DIR = new URL("../../.harness", import.meta.url).pathname;
+
 export type BuildResult = {
   ok: boolean;
   outDir: string | null;
@@ -21,54 +26,9 @@ export type BuildResult = {
   durationMs: number;
 };
 
-/** Dependencies the app's package.json declares that are absent from the harness's
- *  preinstalled node_modules. The harness copies app SOURCE over its own tree but keeps its
- *  preinstalled node_modules/package.json (for speed + determinism), so a dep the generator
- *  injects for this clone but that the harness was never provisioned with (e.g. `lottie-web`,
- *  added by injectLottieDep only for clones with Lottie content) would be missing at build time
- *  → "Module not found" webpack error. Returns each such dep pinned to the app's exact version. */
-export function missingHarnessDeps(appDir: string, harnessDir: string): Array<{ name: string; version: string }> {
-  const pkgPath = join(appDir, "package.json");
-  if (!existsSync(pkgPath)) return [];
-  let deps: Record<string, string> = {};
-  try { deps = (JSON.parse(readFileSync(pkgPath, "utf8")).dependencies ?? {}) as Record<string, string>; }
-  catch { return []; }
-  const out: Array<{ name: string; version: string }> = [];
-  for (const [name, version] of Object.entries(deps)) {
-    // A dep is present iff its package.json resolves under the harness node_modules.
-    if (!existsSync(join(harnessDir, "node_modules", name, "package.json"))) {
-      out.push({ name, version: String(version).replace(/^[\^~]/, "") });
-    }
-  }
-  return out;
-}
-
-/** Install any app-declared dependency missing from the harness node_modules, pinned to the
- *  app's exact version. --no-save keeps the harness package.json/lockfile untouched (the install
- *  is per-clone and idempotent); returns an error string if the install failed (surfaced as a
- *  build-gate issue) or null on success/no-op. */
-function ensureHarnessDeps(appDir: string, harnessDir: string): string | null {
-  const missing = missingHarnessDeps(appDir, harnessDir);
-  if (!missing.length) return null;
-  const specs = missing.map((d) => `${d.name}@${d.version}`);
-  const res = spawnSync("npm", ["install", "--no-save", "--no-audit", "--no-fund", ...specs], {
-    cwd: harnessDir,
-    encoding: "utf8",
-    env: { ...process.env },
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: 180000,
-  });
-  if (res.status !== 0) {
-    return `harness dep install failed for ${specs.join(", ")}: ${(res.stderr || res.stdout || "").split("\n").filter(Boolean).slice(-3).join(" | ")}`;
-  }
-  return null;
-}
-
 /** Build the generated app inside the shared harness (deps preinstalled). */
 export function buildApp(appDir: string, harnessDir: string): BuildResult {
   const t0 = Date.now();
-  const depErr = ensureHarnessDeps(appDir, harnessDir);
-  if (depErr) return { ok: false, outDir: null, stderr: depErr, durationMs: Date.now() - t0 };
   const isVite = existsSync(join(appDir, "vite.config.ts")) || existsSync(join(appDir, "index.html"));
   if (isVite) {
     for (const entry of readdirSync(harnessDir, { withFileTypes: true })) {
@@ -229,13 +189,7 @@ export async function renderApp(opts: {
         const resp = await page.goto(opts.url, { waitUntil: "networkidle", timeout: 45000 });
         if (resp) httpStatus = resp.status();
         try { await page.evaluate(() => (document as Document).fonts?.ready); } catch { /* ignore */ }
-        // Scroll to settle any lazy effects, then back to top.
-        await page.evaluate(async () => {
-          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-          const max = document.documentElement.scrollHeight;
-          for (let y = 0; y < max; y += 800) { window.scrollTo(0, y); await sleep(30); }
-          window.scrollTo(0, 0); await sleep(120);
-        });
+        await scrollForLazyLoad(page, vh);
         // Stage 5: the shipped clone REPLAYS motion on load (CSS @keyframes / WAAPI), but
         // the gates grade the settled base. Cancel all running animations before the walk +
         // screenshot so each element falls back to its emitted base CSS — i.e. exactly the
@@ -252,10 +206,14 @@ export async function renderApp(opts: {
           // Cancel any remaining running animations (CSS @keyframes / WAAPI) so each element
           // shows its emitted base CSS = the source-captured settled frame the gates expect.
           try { for (const a of (document.getAnimations ? document.getAnimations() : [])) { try { a.cancel(); } catch { /* ignore */ } } } catch { /* ignore */ }
+          // Background videos ship their (local) src now — freeze them at frame 0 so
+          // snapshots stay deterministic, mirroring the animation cancellation above.
+          try { for (const v of Array.from(document.querySelectorAll("video"))) { try { v.pause(); v.currentTime = 0; } catch { /* ignore */ } } } catch { /* ignore */ }
         });
         const snapshot = await page.evaluate(collectPage);
         writeJSONCompact(join(opts.renderedDir, "dom", `dom-${vw}.json`), snapshot);
         try {
+          await preScreenshotSettle(page);
           await page.screenshot({ path: join(opts.renderedDir, "screenshots", `${vw}.png`), fullPage: true, timeout: 90_000, animations: "disabled" });
         } catch { /* ignore */ }
         return { viewport: vw, snapshot, runtimeErrors, failedResources: [...failedResources], httpStatus };

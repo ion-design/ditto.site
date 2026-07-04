@@ -13,6 +13,9 @@ import { buildCodeQualityReport, codeQualityReportToMarkdown, type CodeQualityRe
 import { interactionRejectedSet } from "./interactive.js";
 import { buildManifest } from "./manifest.js";
 import { buildSeoInventory, seoInventoryToMarkdown, type SeoInventory } from "./seo.js";
+import { generateMirror, MIRROR_MOUNT } from "./mirror.js";
+import { resolvePatternHints, type PatternHints } from "../knowledge/patternIndex.js";
+import { readLayoutRepairHints } from "./layoutRepair.js";
 import { writeJSON, writeText, readJSON, fileExists } from "../util/fsx.js";
 import type { CaptureResult } from "../capture/capture.js";
 
@@ -24,11 +27,14 @@ export type GenerateAllResult = {
   fontGraph: FontGraph;
   recipeReport: RecipeReport;
   interactionRecipeReport: InteractionRecipeReport;
+  patternHints: PatternHints;
   seoInventory: SeoInventory;
   codeQuality: CodeQualityReport;
   manifest: Record<string, unknown>;
   assetsCopied: number;
   assetsMissing: string[];
+  mirrorHtmlPath: string | null;
+  mirrorAssetsCopied: number;
 };
 
 /**
@@ -59,6 +65,8 @@ export function generateAll(opts: {
 
   const sections = detectSections(ir);
   const tokens = extractTokens(ir);
+  // Pattern hints: frozen-catalog signature scan over the IR (deterministic; Gate 6-listed).
+  const patternHints = resolvePatternHints(ir);
   const assetGraph = buildAssetGraph(capture);
   const fontGraph = buildFontGraph(capture.fontFaces, assetGraph, url);
   const seoInventory = buildSeoInventory(ir, assetGraph, capture);
@@ -69,7 +77,7 @@ export function generateAll(opts: {
   const tokensCss = (palette.css ? palette.css + "\n" : "") + tokensToCss(tokens, true);
   const tokenResolver = buildTokenResolver(tokens);
   const primitives = recognizePrimitives(ir);
-  const recipeReport = buildRecipeReport(ir, sections, primitives);
+  const recipeReport = buildRecipeReport(ir, sections, primitives, patternHints);
   const interactionRecipeReport = buildInteractionRecipeReport(ir, sections, capture.interaction);
   // Patterns the interaction gate previously rejected (don't reproduce) → left static.
   const rejPath = join(sourceDir, "interaction-rejected.json");
@@ -83,8 +91,27 @@ export function generateAll(opts: {
   const cloneOpts = fileExists(optPath) ? readJSON<{ components?: boolean; humanizeMode?: "tailwind" | "css"; framework?: AppFramework; reflow?: boolean }>(optPath) : {};
   const components = !!cloneOpts.components;
   const humanizeMode = cloneOpts.humanizeMode; // undefined → generateApp default ("tailwind")
-  const gen = generateApp({ ir, assetGraph, fontGraph, appDir, sourceDir, sourceUrl: url, seoInventory, colorVar: palette.varForColor, tokenResolver, primitives, recipeReport, interaction: capture.interaction, rejectedSpecs, components, humanizeMode, framework: cloneOpts.framework, motion: capture.motion, reflow: !!cloneOpts.reflow }, tokensCss);
+  const layoutRepair = readLayoutRepairHints(sourceDir);
+  const forceCenter = layoutRepair?.forceCenterCids?.length
+    ? new Set(layoutRepair.forceCenterCids)
+    : undefined;
+  const gen = generateApp({ ir, assetGraph, fontGraph, appDir, sourceDir, sourceUrl: url, seoInventory, colorVar: palette.varForColor, tokenResolver, primitives, recipeReport, interaction: capture.interaction, pseudoStates: capture.pseudoStates, rejectedSpecs, components, humanizeMode, framework: cloneOpts.framework, motion: capture.motion, reflow: !!cloneOpts.reflow, forceCenter }, tokensCss);
   const mat = materializeAssets(assetGraph, sourceDir, join(appDir, "public"));
+
+  // Static HTML mirror at /static/ (served from app/public/static/).
+  const mirrorPublicDir = join(appDir, "public", "static");
+  const mirror = generateMirror({
+    sourceDir,
+    assetGraph,
+    sourceUrl: url,
+    mirrorPublicDir,
+    canonicalViewport: viewports.includes(1280) ? 1280 : viewports[viewports.length - 1],
+  });
+  writeJSON(join(outDir, "mirror.json"), {
+    mount: MIRROR_MOUNT,
+    htmlPath: mirror.htmlPath.replace(appDir + "/", ""),
+    assetsCopied: mirror.assetsCopied,
+  });
 
   // Stage 4.5: record promoted components (empty when extraction is off).
   writeJSON(join(outDir, "extracted-components.json"), gen.components);
@@ -95,6 +122,7 @@ export function generateAll(opts: {
   writeJSON(join(outDir, "fonts.json"), fontGraph.entries);
   const inventory = inventoryOf(ir, primitives);
   writeJSON(join(outDir, "components.json"), inventory);
+  writeJSON(join(outDir, "patterns.json"), patternHints);
   writeJSON(join(outDir, "recipes.json"), recipeReport);
   writeText(join(outDir, "recipes.md"), recipeReportToMarkdown(recipeReport));
   writeJSON(join(outDir, "interaction-recipes.json"), interactionRecipeReport);
@@ -107,5 +135,5 @@ export function generateAll(opts: {
   const manifest = buildManifest({ ir, sections, tokens, assetGraph, fontGraph, capture, componentCount: inventory.count });
   writeJSON(join(outDir, "manifest.json"), manifest);
 
-  return { ir, sections, tokens, assetGraph, fontGraph, recipeReport, interactionRecipeReport, seoInventory, codeQuality, manifest, assetsCopied: mat.copied, assetsMissing: mat.missing };
+  return { ir, sections, tokens, assetGraph, fontGraph, recipeReport, interactionRecipeReport, patternHints, seoInventory, codeQuality, manifest, assetsCopied: mat.copied, assetsMissing: mat.missing, mirrorHtmlPath: mirror.htmlPath, mirrorAssetsCopied: mirror.assetsCopied };
 }

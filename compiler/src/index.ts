@@ -32,6 +32,14 @@ export type { GateResult } from "./validate/gates.js";
 export { buildIR } from "./normalize/ir.js";
 export type { IR } from "./normalize/ir.js";
 
+// ---- Pattern knowledge (frozen catalog; deterministic hints) ----
+export { resolvePatternHints, loadPatternIndex, assertPinnedCatalog, catalogOnlyHints } from "./knowledge/patternIndex.js";
+export type { PatternHints, PatternMatch, PatternDef, PatternCatalog } from "./knowledge/patternIndex.js";
+
+// ---- App build (shared harness; used by validation and service app-preview) ----
+export { buildApp, DEFAULT_HARNESS_DIR } from "./validate/render.js";
+export type { BuildResult } from "./validate/render.js";
+
 // ---- Capture surface + version ----
 export { captureSite, REQUIRED_VIEWPORTS } from "./capture/capture.js";
 export type { CaptureResult } from "./capture/capture.js";

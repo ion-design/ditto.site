@@ -9,12 +9,14 @@ import { normalizeCloneRequestOptions } from "@cloner/core";
 import type { Backend } from "./backend.js";
 import { createMcpServer } from "./mcp.js";
 import { apiKeyAuth, hashApiKey, rateLimit, type AuthConfig } from "./auth.js";
+import { UI_HTML } from "./ui.js";
 
 const OptionsSchema = z
   .object({
     mode: z.enum(["single", "multi"]).optional(),
     styling: z.enum(["tailwind", "css"]).optional(),
     framework: z.enum(["next", "vite"]).optional(),
+    preview: z.boolean().optional(),
     verify: z.boolean().optional(),
     asyncVerify: z.boolean().optional(),
     maxRoutes: z.number().int().positive().optional(),
@@ -105,6 +107,10 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  // Minimal dev/test UI (self-contained; talks to the same-origin /v1 API). The
+  // API surface itself stays the product — this page is a testing convenience.
+  app.get("/", (c) => c.html(UI_HTML));
 
   if (deps.signup) {
     const signup = deps.signup;
@@ -238,10 +244,12 @@ export function createApp(deps: AppDeps): Hono {
 
     try {
       const out = await backend.submit(url, opts);
-      if (out.status === "queued") return c.json({ jobId: out.jobId, status: "queued" }, 202);
+      if (out.status === "queued") return c.json({ jobId: out.jobId, status: "queued" }, out.httpStatus);
       return c.json(out.result, 200);
     } catch (e) {
-      return c.json({ status: "failed", error: String(e).slice(0, 500) }, 500);
+      const msg = String(e);
+      if (msg.startsWith("BUSY:")) return c.json({ error: msg.slice(5).trim() }, 429);
+      return c.json({ status: "failed", error: msg.slice(0, 500) }, 500);
     }
   });
 
@@ -281,6 +289,40 @@ export function createApp(deps: AppDeps): Hono {
     c.header("content-length", String(file.bytes.length));
     return c.body(file.bytes);
   });
+
+  // Pipeline progress events (poll every ~300ms while a clone runs).
+  app.get("/v1/clones/:id/events", async (c) => {
+    const after = Math.max(0, Number(c.req.query("after") ?? "0") || 0);
+    const events = backend.events ? await backend.events(c.req.param("id"), after) : null;
+    if (!events) return c.json({ error: "not found" }, 404);
+    return c.json({ jobId: c.req.param("id"), events });
+  });
+
+  // Browsable preview of the built clone (static export published by the preview
+  // build under public/app-preview/). References are relative, so the export works
+  // from this mount — the only requirement is a trailing slash on the root.
+  const previewFile = async (c: Context, sub: string) => {
+    const id = c.req.param("id") ?? "";
+    const tryPaths = sub.includes(".")
+      ? [`public/app-preview/${sub}`]
+      : [
+          `public/app-preview/${sub}`.replace(/\/$/, "") + "/index.html",
+          `public/app-preview/${sub}`,
+          `public/app-preview/${sub}.html`,
+        ];
+    for (const p of tryPaths) {
+      const file = await backend.file(id, p);
+      if (file) {
+        c.header("content-type", file.contentType);
+        c.header("content-length", String(file.bytes.length));
+        return c.body(file.bytes);
+      }
+    }
+    return c.json({ error: "no app preview for this clone (preview builds are on by default for single-page clones; pass options.preview=true otherwise)" }, 404);
+  };
+  app.get("/v1/clones/:id/app-preview", (c) => c.redirect(`/v1/clones/${c.req.param("id")}/app-preview/`, 302));
+  app.get("/v1/clones/:id/app-preview/", (c) => previewFile(c, "index.html"));
+  app.get("/v1/clones/:id/app-preview/:path{.+}", (c) => previewFile(c, c.req.param("path") ?? ""));
 
   app.delete("/v1/clones/:id", async (c) => {
     const ok = await backend.remove(c.req.param("id"));

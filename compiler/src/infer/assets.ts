@@ -96,9 +96,10 @@ export function materializeAssets(graph: AssetGraph, sourceDir: string, appPubli
   for (const e of graph.entries) {
     if (e.classification !== "downloaded" || !e.storedFile || !e.localPath) continue;
     if (e.type === "css") continue; // not served by the app
-    // Video files ARE copied: generation emits a local <video src>/<source src>
-    // whenever the file materialized (only streaming/undownloaded videos fall back
-    // to poster-only rendering).
+    // Videos ARE materialized: muted autoplay/loop background videos keep their
+    // local src in generation (foreground videos stay poster-only, and their file
+    // rides along unreferenced — the disk cost of not coupling this walk to
+    // per-node emission decisions).
     if (seenPublicPaths?.has(e.localPath)) continue;
     const src = join(storeDir, e.storedFile);
     const from = fileExists(src) ? src : join(cssDir, e.storedFile);

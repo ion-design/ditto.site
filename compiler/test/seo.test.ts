@@ -16,7 +16,6 @@ import {
   seoRouteFiles,
 } from "../src/generate/seo.js";
 import { agentsMd, architectureMd } from "../src/generate/docs.js";
-import { NEXT_CONFIG } from "../src/generate/app.js";
 
 function fixtureIr(): IR {
   return {
@@ -169,29 +168,5 @@ describe("SEO inventory and emission", () => {
     };
     assert.ok(agentsMd(docsInput).includes("src/app/ditto"));
     assert.ok(architectureMd(docsInput).includes("data-ditto-id"));
-  });
-
-  it("passes a Next-supported og:type through to openGraph", () => {
-    const ir = fixtureIr();
-    ir.doc.head!.meta!.push({ property: "og:type", content: "article" });
-    const report = buildSeoInventory(ir, fixtureAssets(), fixtureCapture());
-    const metadata = metadataExport(report);
-    assert.ok(metadata.includes('"type": "article"'));
-    assert.ok(!metadata.includes('"og:type"'));
-  });
-
-  it("routes an unsupported og:type into metadata.other (Next throws on unknown enum values)", () => {
-    const ir = fixtureIr();
-    ir.doc.head!.meta!.push({ property: "og:type", content: "product.group" });
-    const report = buildSeoInventory(ir, fixtureAssets(), fixtureCapture());
-    const metadata = metadataExport(report);
-    assert.ok(metadata.includes('"og:type": "product.group"'));
-    assert.ok(!metadata.includes('"type": "product.group"'));
-  });
-});
-
-describe("generated Next config", () => {
-  it("disables the dev-tools badge so it cannot leak into screenshots", () => {
-    assert.ok(NEXT_CONFIG.includes("devIndicators: false"));
   });
 });

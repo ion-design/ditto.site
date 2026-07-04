@@ -1,12 +1,11 @@
 #!/usr/bin/env -S npx tsx
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { captureSite, REQUIRED_VIEWPORTS, SAMPLE_VIEWPORTS, type CaptureResult } from "./capture/capture.js";
 import { fileURLToPath } from "node:url";
 import { generateAll } from "./generate/pipeline.js";
 import { refineSizing } from "./generate/refineSizing.js";
 import { writeJSON, writeText, ensureDir, readJSON, fileExists } from "./util/fsx.js";
-import { doneSummary, serveApp } from "./cliSummary.js";
 import type { AppFramework } from "./generate/app.js";
 
 export type CloneOptions = {
@@ -27,6 +26,8 @@ export type CloneOptions = {
                     // ON by default at the CLI (--no-reflow to disable); persisted per-run in clone-options.json.
   screenshots?: boolean; // capture per-viewport screenshots (default on); --no-screenshots skips them for a
                          // faster production clone (validation-only artifact — generation ignores pixels).
+  breakpoints?: boolean; // discover real responsive band edges via a viewport sweep (default on; evidence-only
+                         // today — single-viewport service clones skip it to save ~4s).
   log?: (event: Record<string, unknown>) => void;
 };
 
@@ -35,12 +36,6 @@ export type CloneResult = {
   sourceDir: string;
   appDir: string;
   sourceUrl: string;
-  /** A stable, timestamp-free path to the app (via the `runs/<site>/latest` symlink),
-   *  present in runs-layout mode when the symlink could be created. */
-  stableAppDir?: string;
-  /** Visual assets (image/svg/video) that could not be downloaded — those boxes render
-   *  as placeholders. Surfaced in the CLI summary; details in generated/assets.json. */
-  visualAssetsMissing?: number;
 };
 
 export function siteIdFromUrl(url: string): string {
@@ -167,8 +162,6 @@ export function stripDeliveryDataCids(appDir: string): { removed: number; kept: 
       for (const line of text.split("\n")) {
         if (line.includes("<DittoMotion")) {
           for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "motion");
-        } else if (line.includes("<DittoLottie")) {
-          for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "lottie");
         } else if (line.includes("<DittoWire") || line.includes("<Accordion")) {
           for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "interaction");
         } else if (line.includes("<DropdownMenu")) {
@@ -214,7 +207,7 @@ export function stripDeliveryDataCids(appDir: string): { removed: number; kept: 
     if (isCodeFile(f)) {
       next = rewriteDeliveryImportsAndMeta(next, componentsWithMetaAnchors);
       next = rewriteRuntimeAnchorQueries(next, basename(f));
-      if (/\bDittoMotion\b|\bDittoLottie\b/.test(next)) next = next.replace(/"cid":/g, '"anchor":');
+      if (/\bDittoMotion\b/.test(next)) next = next.replace(/"cid":/g, '"anchor":');
       next = next.replace(/\sdata-cid="([^"]+)"/g, (_full, cid: string) => {
         const anchor = anchors.get(cid)?.name;
         if (anchor) { kept++; return ` data-ditto-id="${anchor}"`; }
@@ -392,13 +385,13 @@ function pruneUnusedSvgDittoIds(files: string[]): void {
 }
 
 function rewriteRuntimeAnchorQueries(text: string, fileName: string): string {
-  if (!/^(?:DittoMotion|DittoLottie|DittoWire|DropdownMenu|Accordion)\.tsx$/.test(fileName)) return text;
+  if (!/^(?:DittoMotion|DittoWire|DropdownMenu|Accordion)\.tsx$/.test(fileName)) return text;
   let next = text
     .replace(/\bbyCid\b/g, "byDittoId")
     .replace(/const byDittoId = \(cid: string\): HTMLElement \| null => document\.querySelector\('\[data-cid="' \+ cid \+ '"\]'\);/g,
       `const byDittoId = (id: string): HTMLElement | null => document.querySelector('[data-ditto-id="' + id + '"]');`)
     .replace(/data-cid/g, "data-ditto-id");
-  if (fileName === "DittoMotion.tsx" || fileName === "DittoLottie.tsx") {
+  if (fileName === "DittoMotion.tsx") {
     next = next
       .replace(/\bcid: string/g, "anchor: string")
       .replace(/\.cid\b/g, ".anchor");
@@ -446,8 +439,12 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
     // For simplicity the IR is built from reuseSource and other artifacts written into runDir.
     copySourceRef(opts.reuseSource, sourceDir);
   } else {
-    capture = await captureSite({ url: opts.url, outDir: sourceDir, viewports: captureViewports, interactions: opts.interactions, motion: opts.motion, screenshots: opts.screenshots, log: logBoth });
+    capture = await captureSite({ url: opts.url, outDir: sourceDir, viewports: captureViewports, interactions: opts.interactions, motion: opts.motion, screenshots: opts.screenshots, breakpoints: opts.breakpoints, log: logBoth });
   }
+  // NOTE: distinct from captureSite's per-viewport `captured` events — this marks
+  // the END of all capture work (incl. asset fallback + SEO fetches + evidence
+  // freeze) and is what the service layer splits captureMs/generateMs on.
+  logBoth({ event: "capture_done", reused: !!opts.reuseSource });
 
   // Stage 4.5: persist the component-extraction choice in the source dir so every
   // generateAll for this run (deliverable + determinism/prune regens, possibly in a
@@ -458,8 +455,7 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
   const gen = generateAll({ sourceDir, capture, viewports, sampleViewports: captureViewports, url: opts.url, outDir: generatedDir });
   logBoth({ event: "ir_built", nodes: gen.ir.doc.nodeCount });
   logBoth({ event: "inferred", sections: gen.sections.length, assets: gen.assetGraph.entries.length, fonts: gen.fontGraph.entries.length });
-  const visualAssetsMissing = gen.assetGraph.entries.filter((e) => e.impact === "visual_missing").length;
-  logBoth({ event: "generated", assetsCopied: gen.assetsCopied, assetsMissing: gen.assetsMissing.length, visualAssetsMissing });
+  logBoth({ event: "generated", assetsCopied: gen.assetsCopied, assetsMissing: gen.assetsMissing.length });
 
   // When the source capture lacks native probe flags (this sandbox can't reach the
   // live site through the egress proxy), optionally iterate render→regen so the LOCAL clone-probe
@@ -472,41 +468,25 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
 
   writeText(join(runDir, "logs", "compiler.log.jsonl"), logEvents.map((e) => JSON.stringify(e)).join("\n") + "\n");
 
-  let stableAppDir: string | undefined;
   if (out) {
     // Publish the deliverable to <siteName>/app; keep working artifacts in .clone.
     exportApp(appDir, out.appDir);
     logBoth({ event: "exported", app: out.appDir });
   } else {
-    // latest pointer (runs/ layout, used by --reuse / regen) + a `latest` symlink so the
-    // app has a stable, timestamp-free path that survives copy-paste.
-    stableAppDir = writeLatestPointer(runsDir, siteId, runDir);
+    // latest pointer (runs/ layout, used by --reuse / regen)
+    writeJSON(join(runsDir, siteId, "latest.json"), { runDir, ts: timestamp() });
   }
 
-  return { runDir, sourceDir, appDir: out ? out.appDir : appDir, sourceUrl: opts.url, stableAppDir, visualAssetsMissing };
-}
-
-/** Record the newest run for a site in the runs layout: a `latest.json` breadcrumb (used by
- *  `--reuse`/regen) and a `latest` symlink → runDir. Returns the stable app path when the
- *  symlink was created (symlinks can be unavailable, e.g. Windows without privilege — non-fatal). */
-export function writeLatestPointer(runsDir: string, siteId: string, runDir: string): string | undefined {
-  writeJSON(join(runsDir, siteId, "latest.json"), { runDir, ts: timestamp() });
-  const link = join(runsDir, siteId, "latest");
-  try {
-    // Refresh an existing symlink; refuse (via non-recursive rm) to clobber a real directory.
-    rmSync(link, { force: true });
-    symlinkSync(runDir, link, "junction");
-    return join(link, "generated", "app");
-  } catch {
-    return undefined;
-  }
+  return { runDir, sourceDir, appDir: out ? out.appDir : appDir, sourceUrl: opts.url };
 }
 
 function copySourceRef(from: string, to: string): void {
-  // Symlink-free copy of the whole source dir for self-contained runs.
+  // Symlink-free copy of the whole source dir for self-contained runs. FICLONE
+  // makes it a copy-on-write clone on APFS/btrfs/XFS (heavy captures are >100MB)
+  // and silently falls back to a plain copy elsewhere.
   if (resolve(from) === resolve(to)) return;
   ensureDir(to);
-  cpSync(from, to, { recursive: true });
+  cpSync(from, to, { recursive: true, mode: fsConstants.COPYFILE_FICLONE });
 }
 
 /** Latest prior run's source/ dir for a URL (for --reuse: regenerate, skip capture). */
@@ -571,22 +551,12 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const url = args.find((a) => !a.startsWith("--"));
   if (!url) {
-    console.error("usage: clone-static <url> [--mode=single|multi] [--styling=tailwind|css] [--framework=next|vite] [--out=<dir>] [--serve] [--open]");
+    console.error("usage: clone-static <url> [--mode=single|multi] [--styling=tailwind|css] [--framework=next|vite] [--out=<dir>]");
     process.exit(1);
   }
   const mode = parseProductMode(args);
   const styling = parseProductStyling(args);
   const framework = parseProductFramework(args);
-  // --serve installs deps + starts the dev server after cloning; --open also launches the browser.
-  const open = hasAnyFlag(args, ["--open"]);
-  const serve = open || hasAnyFlag(args, ["--serve"]);
-  const finish = async (res: { appDir: string; stableAppDir?: string; visualAssetsMissing?: number }) => {
-    if (serve) {
-      await serveApp(res.appDir, { open });
-    } else {
-      process.stderr.write(doneSummary({ url, appDir: res.appDir, framework, stableAppDir: res.stableAppDir, visualAssetsMissing: res.visualAssetsMissing }));
-    }
-  };
   const vpArg = firstFlagValue(args, ["--dev-viewports", "--viewports"]);
   const runsArg = firstFlagValue(args, ["--dev-runs", "--runs"]);
   // --out=<dir>: clean <dir>/<siteName>/{app,.clone} layout (default: ./output when bare --out).
@@ -642,8 +612,7 @@ async function main(): Promise<void> {
       tier,
       log: (e) => console.log(JSON.stringify(e)),
     });
-    console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir, stableApp: res.stableAppDir }));
-    await finish(res);
+    console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir }));
     return;
   }
 
@@ -664,8 +633,7 @@ async function main(): Promise<void> {
     reuseSource,
     log: (e) => console.log(JSON.stringify(e)),
   });
-  console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir, stableApp: res.stableAppDir }));
-  await finish(res);
+  console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir }));
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

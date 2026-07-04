@@ -1,0 +1,17 @@
+# Onboarding acceptance profile — everlastingcomfort.com (Shopify)
+site: https://everlastingcomfort.com/
+tier: onboarding
+gate2_strict: true
+visual_threshold: 0.14
+mirror_mount: /static
+routes:
+  - /
+  - /collections/all
+  - /pages/about-us
+  - /pages/contact
+  - /pages/faq
+allowed_skips:
+  - checkout
+  - cart
+  - search
+  - newsletter

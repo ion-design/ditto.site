@@ -14,8 +14,8 @@ import { writeText, readJSON, fileExists } from "../util/fsx.js";
 import { generateCss, RESET_CSS } from "../generate/css.js";
 import { generateInteractionCss } from "../generate/interactionCss.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, interactionRejectedSet } from "../generate/interactive.js";
-import { buildLottieSpec, lottieHasContent, lottieWireJsx, dittoLottieImportPath, DITTO_LOTTIE_TSX } from "../generate/lottie.js";
 import { renderChildrenJsx, renderAttrs, buildComponentRegistry, componentPreamble, componentFiles, componentImports, componentDataDecls, summarizeComponents, fileBase, generateViteConfig, generateViteIndexHtml, viteGlobalsCss, PACKAGE_JSON, PACKAGE_JSON_TW, PACKAGE_JSON_VITE, PACKAGE_JSON_VITE_TW, TSCONFIG_JSON, TSCONFIG_JSON_VITE, NEXT_CONFIG, injectLottieDep, type AppFramework, type LinkRewrite, type ExtractedComponent, type RenderCtx } from "../generate/app.js";
+import { buildLottieSpec, lottieHasContent, lottieWireJsx, dittoLottieImportPath, materializeInlineLottieJson, materializeLottieFrameSvgs, DITTO_LOTTIE_TSX } from "../generate/lottie.js";
 import { buildTailwind, tailwindGlobalsCss, createColorInterner, colorDefsCssOf, type TailwindOutput } from "../generate/tailwind.js";
 import type { InteractionCapture } from "../capture/interactions.js";
 import type { IRChild } from "../normalize/ir.js";
@@ -267,9 +267,7 @@ export function generateSiteApp(opts: {
     };
   };
 
-  // Shared scaffold (written once).
-  // package.json is written after the route loop (below) so the lottie-web dependency can be
-  // added when any route actually replays a Lottie animation.
+  // Shared scaffold (package.json deferred until route loop — lottie-web injected when needed).
   writeText(join(appDir, "tsconfig.json"), isVite ? TSCONFIG_JSON_VITE : TSCONFIG_JSON);
   writeText(join(appDir, ".gitignore"), "node_modules\n.next\nout\ndist\n");
   if (isVite) {
@@ -350,6 +348,10 @@ export function generateSiteApp(opts: {
     const renderKids = plan ? middleChildren(route.ir, plan) : route.ir.root.children;
     const routeReg = opts.components ? buildComponentRegistry(subtreeIr(route.ir, renderKids)) : undefined;
     if (routeReg) ctx.components = routeReg;
+    const lottieInlinePaths = materializeInlineLottieJson(route.capture?.motion, join(appDir, "public"));
+    ctx.lottieFramePaths = materializeLottieFrameSvgs(route.ir, route.capture?.motion, join(appDir, "public"));
+    const lottieSpec = buildLottieSpec(route.ir, route.capture?.motion, route.assetGraph, include, lottieInlinePaths);
+    const hasLottie = lottieHasContent(lottieSpec);
     const bodyJsx = renderChildrenJsx(renderKids, assetMap, base, 3, ctx);
     // Tailwind: utilities are in the JSX; ditto.css carries only pseudo/raw + interaction
     // (keyed by [data-cid]). Legacy CSS: per-node rules + interaction (.c<id>).
@@ -371,9 +373,6 @@ export function generateSiteApp(opts: {
     const wireImport = wires.length ? `import DittoWire from "${dittoWireImportPath(depth)}";\n` : "";
     const wireBody = wires.length ? "\n" + wiresJsx(wires, 3) : "";
     if (wires.length) anyWires = true;
-    // Lottie replay for this route (third-party JSON animations). Same per-route shape as wires.
-    const lottieSpec = buildLottieSpec(route.ir, route.capture?.motion, route.assetGraph, include);
-    const hasLottie = lottieHasContent(lottieSpec);
     const lottieImport = hasLottie ? `import DittoLottie from "${dittoLottieImportPath(depth)}";\n` : "";
     const lottieBody = hasLottie ? "\n" + lottieWireJsx(lottieSpec, 3) : "";
     if (hasLottie) anyLottie = true;
@@ -419,7 +418,6 @@ export function generateSiteApp(opts: {
   }
   if (anyWires) writeText(join(appDir, "src", isVite ? "ditto" : join("app", "ditto"), "DittoWire.tsx"), DITTO_WIRE_TSX);
   if (anyLottie) writeText(join(appDir, "src", isVite ? "ditto" : join("app", "ditto"), "DittoLottie.tsx"), DITTO_LOTTIE_TSX);
-  // Deferred package.json — inject lottie-web only when a route replays a Lottie animation.
   const sitePkg = isVite ? (tw ? PACKAGE_JSON_VITE_TW : PACKAGE_JSON_VITE) : (tw ? PACKAGE_JSON_TW : PACKAGE_JSON);
   writeText(join(appDir, "package.json"), anyLottie ? injectLottieDep(sitePkg) : sitePkg);
   if (isVite) {
@@ -438,7 +436,6 @@ export function generateSiteApp(opts: {
     const globals = tailwindGlobalsCss({
       reset: RESET_CSS, fontCss: unionFontCss(routes), tokensCss, htmlBg, bodyFont: SYSTEM_FALLBACK, clip,
       colorTokens: [...interner.tokens], viewports: entry.ir.doc.viewports,
-      canonical: entry.ir.doc.canonicalViewport,
     });
     writeText(join(appDir, "src", isVite ? "globals.css" : join("app", "globals.css")), isVite ? viteGlobalsCss(globals) : globals);
   } else {

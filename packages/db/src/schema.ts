@@ -66,6 +66,17 @@ export const signupTokens = pgTable("signup_tokens", {
   consumedAt: timestamp("consumed_at", { withTimezone: true }),
 });
 
+/** Structured clone progress events (mirrors in-memory backend event stream). */
+export const jobEvents = pgTable("job_events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  jobId: uuid("job_id")
+    .notNull()
+    .references(() => jobs.id, { onDelete: "cascade" }),
+  seq: integer("seq").notNull(),
+  payload: jsonb("payload").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type Job = typeof jobs.$inferSelect;
 export type NewJob = typeof jobs.$inferInsert;
 export type Clone = typeof clones.$inferSelect;
@@ -74,3 +85,4 @@ export type CacheRow = typeof cache.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;
 export type SignupToken = typeof signupTokens.$inferSelect;
 export type NewSignupToken = typeof signupTokens.$inferInsert;
+export type JobEvent = typeof jobEvents.$inferSelect;

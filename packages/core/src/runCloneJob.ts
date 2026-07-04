@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, cpSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { constants as fsConstants, mkdtempSync, rmSync, cpSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -16,8 +16,9 @@ import {
   type CloneSiteResult,
 } from "clone-static";
 import { collectFileMap } from "./collectFileMap.js";
+import { ensureAppPreview } from "./ensureAppPreview.js";
 import type { CaptureSanity, CloneJobResult, CloneOptions, RouteInfo, RunCloneJobInput } from "./types.js";
-import { normalizeCloneRequestOptions, resolveCloneOptions } from "./options.js";
+import { normalizeCloneRequestOptions, resolveCloneOptions, type ResolvedCloneOptions } from "./options.js";
 
 /** Compute the cheap capture-sanity audit (no build): node count + whether the
  *  pollution gate flags the capture as degenerate, and whether bot/egress-wall text
@@ -53,7 +54,29 @@ function persistCapture(srcDir: string | undefined, dest: string): void {
   if (!srcDir || !existsSync(join(srcDir, "capture", "capture-result.json"))) return;
   mkdirSync(dirname(dest), { recursive: true });
   rmSync(dest, { recursive: true, force: true });
-  cpSync(srcDir, dest, { recursive: true });
+  // Copy-on-write clone where the filesystem supports it (heavy captures are
+  // >100MB); COPYFILE_FICLONE falls back to a plain copy elsewhere.
+  cpSync(srcDir, dest, { recursive: true, mode: fsConstants.COPYFILE_FICLONE });
+}
+
+/** Whether a cached capture can substitute for a fresh one under these options.
+ *  The cache is keyed by URL only, so feature parity is checked here: every
+ *  requested viewport must have been captured, interaction/motion evidence must
+ *  match the request EXACTLY (a motion-bearing capture generates different output
+ *  than a no-motion one), and screenshots must exist when validation needs them. */
+function captureCompatible(dir: string, options: ResolvedCloneOptions, needScreenshots: boolean): boolean {
+  try {
+    const cap = readJSON<CaptureResult>(join(dir, "capture", "capture-result.json"));
+    const requested = options.viewports ?? [375, 768, 1280, 1920];
+    const captured = new Set(cap.viewports ?? []);
+    if (!requested.every((vp) => captured.has(vp))) return false;
+    if (!!cap.interaction !== options.interactions) return false;
+    if (!!cap.motion !== options.motion) return false;
+    if (needScreenshots && !requested.every((vp) => existsSync(join(dir, "screenshots", `${vp}.png`)))) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -90,6 +113,14 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
     let routes: RouteInfo[] | undefined;
     let sanity: CaptureSanity;
     let captureReused = false;
+    // The compiler emits `capture_done` when ALL capture work ends (asset fallback,
+    // SEO fetches, evidence freeze included — captureSite's per-viewport `captured`
+    // events fire earlier); timestamping it splits captureMs/generateMs truthfully.
+    let capturedTs: number | undefined;
+    const timedLog = (e: Record<string, unknown>) => {
+      if (e.event === "capture_done" && capturedTs === undefined) capturedTs = Date.now();
+      log(e);
+    };
     // Persistent entry-capture cache (the single→multi speed path), keyed by URL.
     const cacheEntry = input.captureCacheDir ? entryCacheSource(input.captureCacheDir, input.url) : undefined;
 
@@ -132,6 +163,16 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       // Refresh the cache with the entry capture (seeds it for a cold multi-page run).
       if (cacheEntry && entry) persistCapture(entry.sourceDir, cacheEntry);
     } else {
+      // Repeat-clone speed path: reuse the URL-keyed cached capture when it is fresh
+      // AND feature-compatible with this request (viewports/interactions/motion/screenshots).
+      const reuseSource =
+        !requestOptions.noCache &&
+        cacheEntry &&
+        freshCapture(cacheEntry, input.captureCacheTtlMs) &&
+        captureCompatible(cacheEntry, options, captureValidationArtifacts)
+          ? cacheEntry
+          : undefined;
+      captureReused = !!reuseSource;
       const res: CompilerCloneResult = await runClone({
         url: input.url,
         runsDir,
@@ -142,14 +183,21 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
         humanizeMode: options.styling,
         framework: options.framework,
         screenshots: captureValidationArtifacts,
-        log,
+        // The band-edge sweep costs ~4s and its output has no consumer for a
+        // single-viewport clone — skip it on that fast path.
+        breakpoints: (options.viewports?.length ?? 4) > 1,
+        reuseSource,
+        log: timedLog,
       });
       runDir = res.runDir;
       sanity = captureSanity(res.sourceDir, options.viewports ?? [375, 768, 1280, 1920]);
-      // Stash this page's capture so a later multi-page job can expand on it (speed path).
-      if (cacheEntry) persistCapture(res.sourceDir, cacheEntry);
+      // Stash this page's capture so a later job can reuse it (speed path). Skip on
+      // reuse: re-copying identical data would only refresh the TTL artificially.
+      if (cacheEntry && !captureReused) persistCapture(res.sourceDir, cacheEntry);
     }
-    const captureMs = Date.now() - t0;
+    const cloneMs = Date.now() - t0;
+    const captureMs = capturedTs !== undefined ? capturedTs - t0 : cloneMs;
+    const generateMs = capturedTs !== undefined ? cloneMs - captureMs : 0;
 
     // Optional verify (build + serve + re-render + grade). The single isolation-
     // sensitive step: pass a per-worker harnessDir so concurrent builds don't collide.
@@ -161,6 +209,23 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       verifyMs = done.verifyMs;
     }
 
+    // App preview: static export published under public/app-preview/ so it rides the
+    // file map. Build failure is non-fatal — the clone's sources still deliver.
+    let previewMs: number | undefined;
+    if (options.preview) {
+      // A verify pass that built cleanly and pruned nothing leaves a fresh build of
+      // this exact app in the harness — publish that instead of building twice.
+      // (Interaction pruning regenerates the app AFTER the build, so the harness
+      // export would be stale in that case.)
+      const report = verify as { gates?: Record<string, { pass?: boolean; metrics?: { rejected?: string[] } }> } | undefined;
+      const reusePriorBuild =
+        !!(syncVerify && kind === "clone" && report?.gates?.build?.pass) &&
+        ((report?.gates?.interaction?.metrics?.rejected ?? []).length === 0);
+      const p = ensureAppPreview(runDir, { harnessDir: input.harnessDir, reusePriorBuild, log });
+      previewMs = p.previewMs;
+      if (!p.ok) log({ event: "app_preview_failed", error: p.error?.slice(-400) });
+    }
+
     const files = collectFileMap(runDir);
 
     return {
@@ -169,7 +234,7 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       options: requestOptions,
       status: "succeeded",
       compilerVersion: COMPILER_VERSION,
-      timings: { captureMs, generateMs: 0, ...(verifyMs !== undefined ? { verifyMs } : {}) },
+      timings: { captureMs, generateMs, ...(verifyMs !== undefined ? { verifyMs } : {}), ...(previewMs !== undefined ? { previewMs } : {}) },
       routes,
       files,
       capture: sanity,

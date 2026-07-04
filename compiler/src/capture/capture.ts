@@ -1,19 +1,16 @@
-import { chromium, type Browser, type BrowserContext } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { join } from "node:path";
 import { collectPage, type PageSnapshot, type FontFace } from "./walker.js";
 import { tagElements, captureInteractions, type InteractionCapture } from "./interactions.js";
 import { captureMotion, probeReveals, type MotionCapture } from "./motion.js";
-import {
-  promoteLazyMedia, settleCarousels, settleScrollReveals, neutralizePreReveal,
-  forceRevealForShot, restoreRevealForShot, neutralizeScrollTimelineAnimations,
-} from "./stabilize.js";
-import {
-  enumerateFramesInPage, planForFrameUrl, graftFrameIntoSnapshot, frameHasRenderableContent,
-  MAX_GRAFT_FRAMES, FRAME_GRAFT_MAX_NODES, type FrameCandidate,
-} from "./graft.js";
 import { discoverBreakpoints } from "./breakpoints.js";
 import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.js";
 import { sha1_12, round } from "../util/canonical.js";
+import { scrollForLazyLoad, preScreenshotSettle } from "../settle/recipe.js";
+import { isWallText } from "../util/wallText.js";
+import { writeLiveWitnessViewport, liveWitnessDir } from "../evidence/liveWitness.js";
+import { baseEvidenceManifest, writeEvidenceManifest } from "../evidence/manifest.js";
+import { hashAssetStore } from "../materialize/manifest-hash.js";
 
 export const REQUIRED_VIEWPORTS = [375, 768, 1280, 1920] as const;
 // The dense width set captured for SIZE INFERENCE: a node sampled at 9 widths reveals its sizing
@@ -39,6 +36,30 @@ const DESKTOP_UA =
 
 // Defines esbuild/tsx runtime helpers in the page so serialized evaluate
 // callbacks that reference them don't throw ReferenceError.
+/** Neutralize the two entropy sources page JS can render from, BEFORE any page
+ *  script runs: Math.random becomes a seeded PRNG (mulberry32), and the wall
+ *  clock is shifted so every capture starts at the same epoch — while still
+ *  advancing, so elapsed-time logic (animations, lazy-load timers) behaves.
+ *  Raw string: it must not be transformed by tsx/esbuild. */
+const DETERMINISTIC_ENV_SHIM = `(() => {
+  let s = 0x9e3779b9;
+  Math.random = function() {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const RealDate = Date;
+  const delta = 1767225600000 - RealDate.now(); /* pin start to 2026-01-01T00:00:00Z */
+  class DittoDate extends RealDate {
+    constructor(...args) { args.length ? super(...args) : super(RealDate.now() + delta); }
+    static now() { return RealDate.now() + delta; }
+  }
+  DittoDate.parse = RealDate.parse;
+  DittoDate.UTC = RealDate.UTC;
+  globalThis.Date = DittoDate;
+})();`;
+
 const ESBUILD_SHIM =
   "globalThis.__name = globalThis.__name || ((fn) => fn);" +
   "globalThis.__defProp = globalThis.__defProp || Object.defineProperty;";
@@ -92,27 +113,20 @@ export type CaptureResult = {
   // Stage 5: optional motion capture (WAAPI animations + rotating text). CSS @keyframes
   // motion is reconstructed from the IR, so it isn't re-captured here.
   motion?: MotionCapture;
+  // Fast-path (interactions OFF) hover/focus rules recovered from the source
+  // stylesheets. capId keys match data-cid-cap attrs carried into the IR.
+  pseudoStates?: PseudoStateRule[];
+};
+
+export type PseudoStateRule = {
+  capId: string;
+  pseudo: "hover" | "focus" | "focus-visible" | "focus-within";
+  media?: string;
+  decls: Record<string, string>;
 };
 
 function viewportHeight(width: number): number {
   return VIEWPORT_HEIGHTS[width] ?? Math.round(width * 0.66);
-}
-
-// ---- Asset download retry (Fix: transient failures silently degrade to placeholders) ----
-
-/** Types whose absence is visible in the clone (image → transparent GIF, video → blank,
- *  font → fallback face). These earn one retry; css/manifest/lottie degrade gracefully. */
-const RETRYABLE_ASSET_TYPES = new Set(["image", "svg", "video", "font"]);
-/** Fixed, bounded delay before the single retry — deterministic (no jitter/backoff). */
-export const ASSET_RETRY_DELAY_MS = 750;
-
-/** Should a failed download of `type` with HTTP `status` (null = network error / no
- *  response) be retried once? Transient states only: connection failures, 5xx, and 429.
- *  4xx (404/403/…) are authoritative — retrying can't change them. */
-export function isRetryableAssetFailure(type: string, status: number | null): boolean {
-  if (!RETRYABLE_ASSET_TYPES.has(type)) return false;
-  if (status === null) return true;
-  return status >= 500 || status === 429;
 }
 
 function extFromUrl(url: string): string {
@@ -162,36 +176,8 @@ function isCss(url: string, contentType: string | null): boolean {
   return classifyAsset(url, contentType) === "css";
 }
 
-/** Container-magic check for accepted video bytes: ISO-BMFF (`ftyp` within the first
- *  12 bytes — mp4/m4v/mov), webm/mkv (EBML 0x1A45DFA3), or ogg (`OggS`). A range
- *  fragment (e.g. an mp4's moov-atom tail served as a 206) fails all three, so a
- *  corrupt partial body is never stored as the asset. */
-export function looksLikeVideoFile(bytes: Buffer): boolean {
-  if (bytes.length < 12) return false;
-  const head = bytes.subarray(0, 12);
-  if (head.includes("ftyp")) return true;
-  if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return true; // EBML (webm/mkv)
-  if (head[0] === 0x4f && head[1] === 0x67 && head[2] === 0x67 && head[3] === 0x53) return true; // "OggS"
-  return false;
-}
-
 async function autoScroll(page: import("playwright").Page, vpHeight: number): Promise<void> {
-  // Scroll through the page to trigger lazy-loaded images/backgrounds, then return
-  // to the top so document-coordinate bboxes are measured from a settled layout.
-  await page.evaluate(async (step: number) => {
-    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    const maxScroll = () => document.documentElement.scrollHeight - window.innerHeight;
-    let y = 0;
-    let guard = 0;
-    while (y < maxScroll() && guard < 100) {
-      y += step;
-      window.scrollTo(0, y);
-      await sleep(60);
-      guard++;
-    }
-    window.scrollTo(0, 0);
-    await sleep(120);
-  }, Math.max(Math.round(vpHeight * 0.8), 300));
+  await scrollForLazyLoad(page, vpHeight);
 }
 
 async function settle(page: import("playwright").Page, maxMs = 2500): Promise<void> {
@@ -427,6 +413,21 @@ async function captureVideoStills(page: import("playwright").Page): Promise<Vide
           try { v.pause(); } catch { /* ignore */ }
           try { v.currentTime = 0; } catch { /* ignore */ }
           await sleep(100);
+          // Lazy background videos (preload="none" / range-aborted) sit at
+          // readyState < 2 with no decodable frame — force one in (bounded) so the
+          // canvas readback has pixels. Elementor hero videos land here.
+          if (v.readyState < 2 && (v.currentSrc || v.querySelector("source"))) {
+            try {
+              v.muted = true;
+              v.preload = "auto";
+              v.load();
+              const p = v.play();
+              if (p && typeof p.catch === "function") p.catch(() => { /* autoplay denied */ });
+            } catch { /* ignore */ }
+            for (let t = 0; t < 20 && v.readyState < 2; t++) await sleep(100);
+            try { v.pause(); v.currentTime = 0; } catch { /* ignore */ }
+            await sleep(100);
+          }
           let done = false;
           const w = v.videoWidth, h = v.videoHeight;
           if (w && h && v.readyState >= 2) {
@@ -512,6 +513,9 @@ export async function captureSite(opts: {
   interactions?: boolean; // Stage 4: opt-in interaction capture (hover/focus + patterns)
   motion?: boolean; // Stage 5: opt-in motion capture (WAAPI + rotating text)
   breakpoints?: boolean; // discover the source's real responsive band edges (default on; read-only sweep)
+  deterministicEnv?: boolean; // seed Math.random + pin the clock epoch BEFORE page JS runs (default on),
+                              // so shuffled carousels / random ids / "posted N minutes ago" render the
+                              // same across captures. Relative time still advances (timers behave).
   screenshots?: boolean; // write per-viewport full-page PNGs (default on). ONLY the validator reads these
                          // (generation never touches pixels), and full-page shots of tall pages are the
                          // dominant capture cost — so a production clone that won't be perceptually graded
@@ -573,10 +577,6 @@ export async function captureSite(opts: {
 
   const storeBytes = (url: string, type: string, bytes: Buffer): void => {
     if (!bytes || bytes.length === 0) return;
-    // Reject non-container bytes for video from EVERY path (a range fragment or error
-    // page stored under first-stored-wins ships a corrupt file). Left unstored, the
-    // asset surfaces in visual_assets_missing instead.
-    if (type === "video" && !looksLikeVideoFile(bytes)) return;
     const a = assetMap.get(url) ?? recordAsset(url, type, null, null, "network");
     if (a.storedAs) return;
     const ext = extFromUrl(url) || extFromContentType(a.contentType) ||
@@ -652,6 +652,7 @@ export async function captureSite(opts: {
   const perViewport: CaptureResult["perViewport"] = [];
   let interaction: InteractionCapture | undefined;
   let motion: MotionCapture | undefined;
+  let pseudoStates: PseudoStateRule[] = [];
   let discoveredBreakpoints: number[] | undefined;
   const captureSeoResources: SeoResource[] = [];
   const cssTextsForParsing: Array<{ baseUrl: string; text: string }> = [];
@@ -671,104 +672,142 @@ export async function captureSite(opts: {
     // hero on each fresh load) and session-reuse degeneration (warbyparker returned
     // a 13-node shell when reloaded with a carried session). The IR's cross-viewport
     // alignment then operates on one logical DOM that CSS merely reflows.
-    const context: BrowserContext = await browser.newContext({
-      ignoreHTTPSErrors: true,
-      viewport: { width: canonical, height: viewportHeight(canonical) },
-      deviceScaleFactor: 1,
-      userAgent: DESKTOP_UA,
-      javaScriptEnabled: true,
-    });
-    const page = await context.newPage();
-    // tsx/esbuild wraps functions with a __name() helper for stack traces; that
-    // helper does not exist in the browser when we serialize page.evaluate
-    // callbacks. Shim it (as a raw string so it isn't itself transformed).
-    await page.addInitScript(ESBUILD_SHIM);
     const bodyPromises: Promise<void>[] = [];
+    const isClosedError = (e: unknown) =>
+      /Target page, context or browser has been closed|page closed|has crashed|browser has been closed/i.test(String(e));
 
-    page.on("response", (resp) => {
-      try {
-        const url = resp.url();
-        if (url.startsWith("data:") || url.startsWith("blob:")) return;
-        const ct = resp.headers()["content-type"] || null;
-        const type = classifyAsset(url, ct);
-        if (!type) return;
-        const status = resp.status();
-        recordAsset(url, type, ct, status, "network");
-        const existing = assetMap.get(url);
-        if (existing?.storedAs) return;
-        if (status >= 400) return;
-        // A 206 body is a RANGE FRAGMENT (media seek), not the asset — storing it would
-        // ship a corrupt file under first-stored-wins and the full-download fallback
-        // would then skip the asset. Record only; the fallback pass fetches the 200 body.
-        if (status === 206) return;
-        bodyPromises.push(
-          (async () => {
-            try {
-              const buf = await resp.body();
-              storeBytes(url, type, buf);
-              if (type === "css") cssTextsForParsing.push({ baseUrl: url, text: buf.toString("utf8") });
-              if (type === "manifest") parseManifestForAssets(buf.toString("utf8"), url);
-            } catch { /* body unavailable */ }
-          })(),
-        );
-      } catch { /* ignore */ }
-    });
+    const attachPageHandlers = (pg: Page) => {
+      pg.on("crash", () => log({ event: "page_crash" }));
+      pg.on("response", (resp) => {
+        try {
+          const url = resp.url();
+          if (url.startsWith("data:") || url.startsWith("blob:")) return;
+          const ct = resp.headers()["content-type"] || null;
+          const type = classifyAsset(url, ct);
+          if (!type) return;
+          const status = resp.status();
+          recordAsset(url, type, ct, status, "network");
+          const existing = assetMap.get(url);
+          if (existing?.storedAs) return;
+          if (status >= 400) return;
+          // A 206 body is a RANGE FRAGMENT (media elements fetch videos in chunks) —
+          // storing it would freeze a truncated file as "downloaded" (cropin's hero
+          // video landed as 27KB of a multi-MB mp4). Leave it unstored; the fallback
+          // downloader fetches the complete file with a plain GET.
+          if (status === 206) return;
+          bodyPromises.push(
+            (async () => {
+              try {
+                const buf = await resp.body();
+                storeBytes(url, type, buf);
+                if (type === "css") cssTextsForParsing.push({ baseUrl: url, text: buf.toString("utf8") });
+                if (type === "manifest") parseManifestForAssets(buf.toString("utf8"), url);
+              } catch { /* body unavailable */ }
+            })(),
+          );
+        } catch { /* ignore */ }
+      });
+    };
+
+    const newSession = async (): Promise<{ context: BrowserContext; page: Page }> => {
+      const context = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        viewport: { width: canonical, height: viewportHeight(canonical) },
+        deviceScaleFactor: 1,
+        userAgent: DESKTOP_UA,
+        javaScriptEnabled: true,
+      });
+      const page = await context.newPage();
+      // tsx/esbuild wraps functions with a __name() helper for stack traces; that
+      // helper does not exist in the browser when we serialize page.evaluate
+      // callbacks. Shim it (as a raw string so it isn't itself transformed).
+      attachPageHandlers(page);
+      await page.addInitScript(ESBUILD_SHIM);
+      if (opts.deterministicEnv ?? true) await page.addInitScript(DETERMINISTIC_ENV_SHIM);
+      return { context, page };
+    };
 
     // Single navigation at the canonical width; every viewport below is a resize.
-    log({ event: "goto", url: opts.url });
-    let navigated = false;
-    let navErr: unknown = null;
-    for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
-      try {
-        await page.goto(opts.url, { waitUntil: attempt === 0 ? "load" : "domcontentloaded", timeout: 45000 });
-        navigated = true;
-      } catch (e) {
-        navErr = e;
-        await page.waitForTimeout(1000);
+    // Bounded by a TOTAL budget (not per-attempt × retries) so a hanging origin
+    // fails fast with a clear error instead of stalling the pipeline for minutes.
+    const navigateLoaded = async (pg: Page): Promise<void> => {
+      log({ event: "goto", url: opts.url });
+      const NAV_BUDGET_MS = 60_000;
+      const navStart = Date.now();
+      let navigated = false;
+      let navErr: unknown = null;
+      for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
+        const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
+        if (remaining < 5_000) break;
+        try {
+          await pg.goto(opts.url, {
+            waitUntil: attempt === 0 ? "load" : "domcontentloaded",
+            timeout: Math.min(attempt === 0 ? 30_000 : 15_000, remaining),
+          });
+          navigated = true;
+        } catch (e) {
+          navErr = e;
+          await pg.waitForTimeout(1000);
+        }
       }
-    }
-    if (!navigated) throw navErr;
-    await settle(page);
+      if (!navigated) {
+        throw new Error(
+          `navigation failed for ${opts.url} within ${Math.round((Date.now() - navStart) / 1000)}s: ${String(navErr).slice(0, 300)}`,
+        );
+      }
+      await settle(pg);
+    };
 
-    // Stage 2: lazy-loader promotion. WP Rocket/lazysizes keep a 0-size placeholder in
-    // `src` with the real URL in data attrs; autoScroll outruns their IntersectionObserver
-    // (collapsed sections in the snapshot) and the interaction pass can trigger the swap
-    // midway (viewports then DISAGREE about the section's size). Promote once, before any
-    // snapshot, so every viewport measures the same loaded media.
-    const lazyPromoted = await promoteLazyMedia(page);
-    if (lazyPromoted) {
-      log({ event: "lazy_promoted", count: lazyPromoted });
-      await settle(page, 2000); // newly-real images reflow the layout
-    }
+    let { context, page } = await newSession();
+    await navigateLoaded(page);
 
-    // Stage 2: reveal settling. Scroll reveals (Elementor waypoints, WOW/AOS class swaps)
-    // are the same class of one-shot load-state as lazy media: fire them ONCE, before any
-    // viewport snapshot, so every width records the POST-REVEAL steady state — otherwise
-    // the snapshot bakes `visibility:hidden` wrappers (or a mid-fade opacity) with no JS
-    // to ever reveal them, and the clone renders below-fold content blank.
-    // A scroll-locking consent wall would defeat the dwell walk, so clear it first (the
-    // per-viewport dismissal below still runs and owns the audit trail).
-    const preClicked = await clickDismiss(page);
-    if (preClicked.length) {
-      for (const d of preClicked) if (!dismissUnion.dismissed.includes(d)) dismissUnion.dismissed.push(d);
-      await settle(page, 1000);
+    const recoverSession = async (): Promise<void> => {
+      log({ event: "capture_recover", reason: "browser_or_page_closed" });
+      try {
+        if (!page.isClosed()) await page.close();
+      } catch { /* ignore */ }
+      try {
+        await context.close();
+      } catch { /* ignore */ }
+      ({ context, page } = await newSession());
+      await navigateLoaded(page);
+    };
+
+    const safeSetViewport = async (vw: number, vh: number): Promise<void> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (page.isClosed()) throw new Error("page closed");
+          await page.setViewportSize({ width: vw, height: vh });
+          return;
+        } catch (e) {
+          if (attempt === 0 && isClosedError(e)) {
+            await recoverSession();
+            continue;
+          }
+          throw e;
+        }
+      }
+    };
+
+    // Auth/bot-wall fast fail: a wall page would otherwise burn the full
+    // multi-viewport capture and only get flagged by the pollution gate afterward.
+    // Same signature set as the gate (util/wallText.ts) so the judgments agree.
+    const wallProbe = await page
+      .evaluate(() => ({
+        text: (document.body?.innerText ?? "").slice(0, 20_000),
+        nodes: document.querySelectorAll("*").length,
+      }))
+      .catch(() => null);
+    if (wallProbe && wallProbe.nodes < 220 && isWallText(wallProbe.text)) {
+      throw new Error(
+        `auth/bot wall detected at ${opts.url} (${wallProbe.nodes} nodes, wall text matched): capture aborted early`,
+      );
     }
-    // Motion capture needs the PRE-reveal hidden state, observable only before the first
-    // scroll — tag + probe now (captureMotion confirms the candidates at the canonical
-    // snapshot, reading each revealed element's entrance animation from computed style).
-    if (opts.motion) { await tagElements(page); await probeReveals(page); }
-    const revealSettle = await settleScrollReveals(page);
-    log({ event: "reveals_settled", ...revealSettle });
-    // Belt-and-braces: reveal any element STILL carrying a known-library pre-reveal marker
-    // (below the step bound, or keyed to a non-scroll trigger) via the library's own
-    // revealed state, so captured computed styles are genuine post-reveal values.
-    const neutralized = await neutralizePreReveal(page);
-    if (neutralized) log({ event: "prereveal_neutralized", count: neutralized });
-    await settle(page, 1500); // revealed content reflows the layout
 
     for (const vw of viewports) {
+      if (perViewport.some((p) => p.viewport === vw)) continue;
       const vh = viewportHeight(vw);
-      await page.setViewportSize({ width: vw, height: vh });
+      await safeSetViewport(vw, vh);
       await settle(page, 1500); // let the resize reflow + any width-triggered content settle
 
       // Stage 2: dismiss cookie/consent/newsletter/region overlays. Run TWICE —
@@ -792,8 +831,12 @@ export async function captureSite(opts: {
       };
       await applyDismiss("load");
 
-      // (Scroll-reveal probing happens once, before the viewport loop — see the reveal
-      // settling pass above; by this point all one-shot reveals have already fired.)
+      // Stage 5 (scroll reveals): at the FIRST viewport, before any scroll, tag elements
+      // and snapshot the pre-reveal hidden state — scroll reveals fire on the first
+      // autoScroll and stay revealed, so this is the only moment their hidden state is
+      // observable. Idempotent + motion-gated; the settled snapshot is unchanged.
+      if (opts.motion && vw === viewports[0]) { await tagElements(page); await probeReveals(page); }
+
       await autoScroll(page, vh);
       await settle(page, 1500);
       await applyDismiss("post-scroll");
@@ -802,6 +845,21 @@ export async function captureSite(opts: {
       // Stage 2: wait for entrance/scroll animations to settle so geometry isn't
       // sampled mid-transition.
       const quiescent = await waitForQuiescence(page);
+
+      // Fast-path hover/focus recovery: when Stage 4 (live interaction driving) is
+      // OFF, recover state-variant styling from the stylesheets instead — parse
+      // :hover/:focus rules, match their base selectors against the live DOM, and
+      // tag matches (data-cid-cap survives into the IR). Cross-origin sheets are
+      // unreadable via CSSOM, so their intercepted raw text is re-parsed through
+      // constructed stylesheets. Runs once, before any DOM walk.
+      if (!opts.interactions && vw === viewports[0]) {
+        try {
+          pseudoStates = await collectPseudoStates(page, cssTextsForParsing.map((t) => t.text));
+          if (pseudoStates.length) log({ event: "pseudo_states", rules: pseudoStates.length });
+        } catch (e) {
+          log({ event: "pseudo_states_error", error: String(e).slice(0, 160) });
+        }
+      }
 
       // Reset window + all inner scrollable containers to scroll 0 so captured
       // positions match the generated app's default (un-scrolled) render. Inner
@@ -814,15 +872,6 @@ export async function captureSite(opts: {
         }
       });
       await page.waitForTimeout(150);
-
-      // Stage 2: settle autoplaying carousels (pause + navigate to the home slide)
-      // before EVERY snapshot — otherwise each viewport freezes a different track
-      // offset (per-band CSS then bakes four different slides), and the interaction
-      // pass between the canonical and last snapshots would leave the final viewport
-      // contaminated. Scoped to named-library tracks so motion.ts's marquee/rotator
-      // capture (which runs after the canonical snapshot) observes them unchanged.
-      const carousels = await settleCarousels(page);
-      if (carousels.roots) log({ event: "carousels_settled", viewport: vw, ...carousels });
 
       // Stage 2: dynamic-media first frame. Materialize a still for poster-less
       // videos so they don't render blank — canvas where the frame is readable, else
@@ -842,27 +891,12 @@ export async function captureSite(opts: {
           } catch { /* ignore */ }
         }
         for (const s of plan.shots) {
-          // A visibility:hidden video (entrance animation not yet fired) passes the size
-          // gate, but locator.screenshot auto-waits for visibility and times out —
-          // force-reveal the hidden ancestor chain for the shot, restore exactly after.
-          let shot = false;
           try {
-            await page.evaluate(forceRevealForShot, s.sel);
             const buf = await page.locator(s.sel).first().screenshot({ type: "jpeg", quality: 82, timeout: 5000, animations: "disabled" });
             recordAsset(s.url, "image", "image/jpeg", 200, "video-still");
             storeBytes(s.url, "image", buf);
             dismissUnion.videoStills++;
-            shot = true;
-          } catch (e) {
-            log({ event: "video_still_error", viewport: vw, sel: s.sel, error: String(e).slice(0, 200) });
-          } finally {
-            await page.evaluate(restoreRevealForShot).catch(() => { /* ignore */ });
-          }
-          // A synthetic poster with no bytes behind it generates a transparent tile —
-          // on failure, remove the attr so the video renders as it did pre-capture.
-          if (!shot) {
-            await page.evaluate((sel) => { document.querySelector(sel)?.removeAttribute("poster"); }, s.sel).catch(() => { /* ignore */ });
-          }
+          } catch { /* element not shootable (off-screen/detached) — poster falls back to placeholder */ }
         }
         // Element screenshots scroll the target into view; restore scroll 0 so the
         // canonical DOM walk + screenshot match the generated app's default render.
@@ -876,116 +910,12 @@ export async function captureSite(opts: {
       // them (whitelisted), enabling interaction deltas + motion specs to map to cids.
       if ((opts.interactions || opts.motion) && vw === canonical) await tagElements(page);
 
-      // Stage 2.6: cross-origin iframe content. The in-page walker cannot see into a
-      // cross-origin frame (newsletter/form embeds), but Node CAN evaluate in it — run the
-      // SAME collectPage per meaningful frame here, then graft each subtree into this
-      // viewport's snapshot below (graft.ts). Frames that can't be grafted (media players,
-      // dead frames) get an element-screenshot recorded as the iframe's background at the
-      // canonical viewport, so the box at least PAINTS. Runs before the main collectPage so
-      // the fallback's inline background is part of the canonical computed style.
-      const frameCands: FrameCandidate[] = await Promise.race([
-        page.evaluate(enumerateFramesInPage),
-        new Promise<FrameCandidate[]>((res) => setTimeout(() => res([]), 8000)),
-      ]).catch(() => [] as FrameCandidate[]);
-      const frameGrafts: Array<{ cand: FrameCandidate; snap: PageSnapshot }> = [];
-      let graftBudget = MAX_GRAFT_FRAMES;
-      let stillBudget = MAX_GRAFT_FRAMES; // fallback stills share the same per-page bound
-      let frameShotScrolled = false;
-      for (const cand of frameCands) {
-        if (!cand.visible) continue;
-        const plan = planForFrameUrl(cand.url);
-        if (plan === "skip") continue;
-        let frameSnap: PageSnapshot | null = null;
-        if (plan === "graft" && graftBudget > 0) {
-          try {
-            const handle = await page.$(`iframe[data-ditto-frame="${cand.idx}"]`);
-            const frame = handle ? await handle.contentFrame() : null;
-            if (frame) {
-              await frame.evaluate(ESBUILD_SHIM);
-              frameSnap = await Promise.race([
-                frame.evaluate(collectPage, { maxNodes: FRAME_GRAFT_MAX_NODES }),
-                new Promise<never>((_, rej) => setTimeout(() => rej(new Error("frame collect timeout")), 20_000)),
-              ]);
-            }
-            await handle?.dispose();
-          } catch (e) {
-            log({ event: "frame_graft_error", viewport: vw, frame: cand.idx, url: cand.url.slice(0, 160), error: String(e).slice(0, 200) });
-            frameSnap = null;
-          }
-        }
-        if (frameSnap && frameHasRenderableContent(frameSnap.root)) {
-          graftBudget--;
-          frameGrafts.push({ cand, snap: frameSnap });
-          // Merge the frame's discoveries exactly like the main document's below: its
-          // assets/fonts flow through the same pipeline so grafted <img>/@font-face resolve.
-          for (const da of frameSnap.domAssets) {
-            const t = classifyAsset(da.url, null) ?? (da.kind === "video" ? "video" : da.kind === "svg" ? "svg" : "image");
-            recordAsset(da.url, t, null, null, `frame${cand.idx}:${da.via}`);
-          }
-          for (const u of frameSnap.cssUrls) {
-            const t = classifyAsset(u, null) ?? "other";
-            recordAsset(u, t, null, null, "css-url");
-          }
-          for (const ff of frameSnap.fontFaces) {
-            const key = `${ff.family}|${ff.weight ?? ""}|${ff.style ?? ""}|${ff.src}`;
-            if (!fontFaceMap.has(key)) fontFaceMap.set(key, ff);
-          }
-        } else if (vw === canonical && stillBudget > 0) {
-          stillBudget--;
-          // Screenshot fallback — synthetic-poster pattern (see captureVideoStills): the
-          // still's bytes ride the normal asset pipeline under a synthetic URL; the iframe's
-          // inline background then rewrites to the local file at generation.
-          const stillUrl = `https://clone-frame.local/${cand.idx}-${sha1_12(cand.url || String(cand.idx))}.jpg`;
-          const sel = `iframe[data-ditto-frame="${cand.idx}"]`;
-          try {
-            await page.evaluate(forceRevealForShot, sel);
-            const buf = await page.locator(sel).first().screenshot({ type: "jpeg", quality: 82, timeout: 5000, animations: "disabled" });
-            recordAsset(stillUrl, "image", "image/jpeg", 200, "iframe-still");
-            storeBytes(stillUrl, "image", buf);
-            frameShotScrolled = true;
-            await page.evaluate(({ s, u }) => {
-              const el = document.querySelector(s) as HTMLElement | null;
-              if (el) {
-                el.style.backgroundImage = `url("${u}")`;
-                el.style.backgroundSize = "100% 100%";
-                el.style.backgroundRepeat = "no-repeat";
-              }
-            }, { s: sel, u: stillUrl });
-            log({ event: "frame_still", viewport: vw, frame: cand.idx, url: cand.url.slice(0, 160) });
-          } catch (e) {
-            log({ event: "frame_still_error", viewport: vw, frame: cand.idx, error: String(e).slice(0, 200) });
-          } finally {
-            await page.evaluate(restoreRevealForShot).catch(() => { /* ignore */ });
-          }
-        }
-      }
-      // Element screenshots scroll the target into view; restore scroll 0 before the walk.
-      if (frameShotScrolled) {
-        await page.evaluate(() => window.scrollTo(0, 0));
-        await page.waitForTimeout(80);
-      }
-
-      // Scroll-linked animations (animation-timeline: scroll()/view()) are held at their
-      // end keyframe by `fill-mode:both` after the dwell-scroll pass, even with scroll reset
-      // to 0 — so the walk would bake the frozen END state (e.g. a text-fill stuck at 100%).
-      // Cancel them here so the snapshot records the genuine AT-REST (unscrolled, 0%) values.
-      // Time-based reveals use the default document timeline and are untouched.
-      const scrollAnimsCanceled = await neutralizeScrollTimelineAnimations(page);
-      if (scrollAnimsCanceled) log({ event: "scroll_timeline_anims_canceled", viewport: vw, count: scrollAnimsCanceled });
-
       // Bound the in-page DOM walk: page.evaluate has no default timeout, so a
       // pathologically large/animated DOM (e.g. asana.com) could hang forever.
       const snapshot: PageSnapshot = await Promise.race([
         page.evaluate(collectPage),
         new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`collectPage timeout vp${vw}`)), 60_000)),
       ]);
-
-      // Graft the captured frame subtrees into this viewport's snapshot (offset bboxes,
-      // namespaced ids, frame-URL-absolutized src/href — see graft.ts).
-      for (const g of frameGrafts) {
-        const ok = graftFrameIntoSnapshot(snapshot, g.cand, g.snap);
-        log({ event: ok ? "frame_grafted" : "frame_graft_orphaned", viewport: vw, frame: g.cand.idx, url: g.cand.url.slice(0, 160), nodes: g.snap.doc.nodeCount });
-      }
 
       // Merge discovered references from the snapshot (DOM + accessible CSS).
       for (const da of snapshot.domAssets) {
@@ -1020,7 +950,26 @@ export async function captureSite(opts: {
 
       // Persist DOM snapshot, and (unless skipped for a production clone) the full-page screenshot.
       writeJSONCompact(join(captureDir, `dom-${vw}.json`), snapshot);
-      if (opts.screenshots !== false) await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
+      if (opts.screenshots !== false) {
+        await preScreenshotSettle(page);
+        await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
+      }
+
+      // Frozen live witness (HTML + DOM + screenshot) for validate gates — no live re-fetch.
+      const witnessVpDir = join(liveWitnessDir(opts.outDir), String(vw));
+      ensureDir(witnessVpDir);
+      writeJSONCompact(join(witnessVpDir, "dom.json"), snapshot);
+      try {
+        const pageHtml = await page.content();
+        writeLiveWitnessViewport({
+          sourceDir: opts.outDir,
+          viewport: vw,
+          html: pageHtml,
+          screenshotSrc: opts.screenshots !== false ? join(screenshotsDir, `${vw}.png`) : undefined,
+        });
+      } catch (e) {
+        log({ event: "live_witness_error", viewport: vw, error: String(e).slice(0, 160) });
+      }
 
       // Stage 4: drive recognized affordances at the canonical viewport (opt-in).
       if (opts.interactions && vw === canonical) {
@@ -1032,24 +981,6 @@ export async function captureSite(opts: {
       if (opts.motion && vw === canonical) {
         try { motion = await captureMotion(page, { log }); }
         catch (e) { log({ event: "motion_error", error: String(e).slice(0, 200) }); }
-        // Register lottie source JSONs as assets so the asset stage downloads + materializes
-        // them (the in-page detector only records the URL; the fallback fetch grabs the file).
-        for (const l of motion?.lotties ?? []) {
-          if (l.src) { recordAsset(l.src, "lottie", null, null, "lottie"); continue; }
-          // Inline animationData (no fetchable URL): store it as a real .json asset so it
-          // materializes to /assets/cloned/lottie like any other source, instead of being
-          // embedded in the page spec. Content-hashed so output stays deterministic.
-          if (l.inlineKey && motion?.lottieInline) {
-            const data = motion.lottieInline[l.inlineKey];
-            if (data === undefined) continue;
-            const buf = Buffer.from(JSON.stringify(data), "utf8");
-            const synthUrl = `ditto-inline:/lottie/${sha1_12(buf.toString("utf8"))}.json`;
-            recordAsset(synthUrl, "lottie", "application/json", 200, "lottie-inline");
-            storeBytes(synthUrl, "lottie", buf);
-            l.src = synthUrl; // now resolves to a local path through the asset graph
-            l.inlineKey = null;
-          }
-        }
       }
 
       perViewport.push({
@@ -1063,6 +994,54 @@ export async function captureSite(opts: {
         quiescent,
       });
       log({ event: "captured", viewport: vw, nodes: snapshot.doc.nodeCount, scrollHeight: snapshot.doc.scrollHeight });
+    }
+
+    // Conditional-asset sweep: harvest lazy refs the scroll pass never fired
+    // (data-src / data-bg aliases, srcset variants, loading=lazy images). They are
+    // only RECORDED here — the fallback downloader below fetches whatever the
+    // network listener didn't store, so this is purely additive discovery. Gate 2b's
+    // `untracked` metric measures exactly this gap.
+    try {
+      const lazyRefs = await page.evaluate(() => {
+        const urls = new Set<string>();
+        const push = (v: string | null | undefined) => {
+          if (!v || v.startsWith("data:")) return;
+          try { urls.add(new URL(v, location.href).href) } catch { /* ignore */ }
+        };
+        const LAZY_ATTRS = ["data-src", "data-lazy-src", "data-original", "data-bg", "data-background", "data-background-image"];
+        for (const el of Array.from(document.querySelectorAll(LAZY_ATTRS.map((a) => `[${a}]`).join(",")))) {
+          for (const a of LAZY_ATTRS) push(el.getAttribute(a));
+        }
+        for (const el of Array.from(document.querySelectorAll("picture source[srcset], picture source[src], source[srcset]"))) {
+          const ss = el.getAttribute("srcset") ?? el.getAttribute("src") ?? "";
+          for (const part of ss.split(",")) push(part.trim().split(/\s+/)[0]);
+        }
+        for (const el of Array.from(document.querySelectorAll("[style*='background'], [style*='url(']"))) {
+          const st = el.getAttribute("style") ?? "";
+          for (const m of st.matchAll(/url\(\s*['"]?([^'")]+)['"]?\s*\)/gi)) push(m[1]);
+        }
+        for (const el of Array.from(document.querySelectorAll("noscript"))) {
+          for (const m of (el.textContent ?? "").matchAll(/(?:src|href|srcset)\s*=\s*['"]([^'"]+)['"]/gi)) push(m[1]);
+        }
+        for (const el of Array.from(document.querySelectorAll("img[srcset], source[srcset], [data-srcset]"))) {
+          const ss = el.getAttribute("srcset") ?? el.getAttribute("data-srcset") ?? "";
+          for (const part of ss.split(",")) push(part.trim().split(/\s+/)[0]);
+        }
+        for (const img of Array.from(document.querySelectorAll<HTMLImageElement>("img[loading=lazy]"))) push(img.currentSrc || img.src);
+        return [...urls].sort();
+      });
+      let swept = 0;
+      for (const url of lazyRefs) {
+        if (swept >= 100) break; // bound pathological pages; fallback fetch is 30s/asset
+        if (!/^https?:\/\//i.test(url) || assetMap.has(url)) continue;
+        const t = classifyAsset(url, null);
+        if (!t || !["image", "svg", "video", "font", "lottie"].includes(t)) continue;
+        recordAsset(url, t, null, null, "lazy-sweep");
+        swept++;
+      }
+      if (swept) log({ event: "lazy_sweep", recorded: swept, seen: lazyRefs.length });
+    } catch (e) {
+      log({ event: "lazy_sweep_error", error: String(e).slice(0, 160) });
     }
 
     // Browser-as-oracle: discover the source's real responsive band edges by sweeping the viewport
@@ -1101,38 +1080,21 @@ export async function captureSite(opts: {
       if (a.storedAs) continue;
       if (a.url.startsWith("data:")) continue;
       if (!["image", "svg", "video", "font", "lottie", "css", "manifest"].includes(a.type)) continue;
-      // One bounded retry for transiently-failed VISUAL assets (network error / 5xx / 429):
-      // a single flaky fetch otherwise degrades an image to the transparent-GIF placeholder.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        let failStatus: number | null = null;
-        try {
-          const resp = await fallbackCtx.request.get(a.url, { timeout: 30000 });
-          a.status = resp.status();
-          if (resp.ok()) {
-            const buf = await resp.body();
-            a.contentType = a.contentType ?? (resp.headers()["content-type"] || null);
-            storeBytes(a.url, a.type, buf);
-            if (a.type === "css") parseCssForFonts(buf.toString("utf8"), a.url, fontFaceMap, (u) => {
-              const t = classifyAsset(u, null) ?? "other";
-              recordAsset(u, t, null, null, "css-text");
-            });
-            if (a.type === "manifest") parseManifestForAssets(buf.toString("utf8"), a.url);
-            break;
-          }
-          failStatus = resp.status();
-        } catch { failStatus = null; /* unreachable/signed — left as skipped */ }
-        if (attempt > 0 || !isRetryableAssetFailure(a.type, failStatus)) break;
-        log({ event: "asset_retry", url: a.url, type: a.type, status: failStatus });
-        await new Promise((r) => setTimeout(r, ASSET_RETRY_DELAY_MS));
-      }
+      try {
+        const resp = await fallbackCtx.request.get(a.url, { timeout: 30000 });
+        a.status = resp.status();
+        if (resp.ok()) {
+          const buf = await resp.body();
+          a.contentType = a.contentType ?? (resp.headers()["content-type"] || null);
+          storeBytes(a.url, a.type, buf);
+          if (a.type === "css") parseCssForFonts(buf.toString("utf8"), a.url, fontFaceMap, (u) => {
+            const t = classifyAsset(u, null) ?? "other";
+            recordAsset(u, t, null, null, "css-text");
+          });
+          if (a.type === "manifest") parseManifestForAssets(buf.toString("utf8"), a.url);
+        }
+      } catch { /* unreachable/signed — left as skipped */ }
     }
-    // Every visual asset that ultimately failed, in one machine-readable event: these are
-    // the boxes that will paint as placeholders (image → transparent GIF, video → blank).
-    const visualMissing = [...assetMap.values()]
-      .filter((a) => !a.storedAs && !a.url.startsWith("data:") && (a.type === "image" || a.type === "svg" || a.type === "video"))
-      .map((a) => ({ url: a.url, type: a.type, status: a.status }))
-      .sort((x, y) => x.url.localeCompare(y.url));
-    if (visualMissing.length) log({ event: "visual_assets_missing", count: visualMissing.length, assets: visualMissing });
     const seoResources: SeoResource[] = [];
     const fetchedSeo = new Set<string>();
     const fetchSeoResource = async (url: string, kind: SeoResource["kind"]): Promise<void> => {
@@ -1188,6 +1150,7 @@ export async function captureSite(opts: {
     dismissal: dismissUnion,
     interaction,
     motion,
+    ...(pseudoStates.length ? { pseudoStates } : {}),
   };
 
   if (interaction) writeJSON(join(opts.outDir, "interaction.json"), interaction);
@@ -1196,7 +1159,108 @@ export async function captureSite(opts: {
   writeJSON(join(opts.outDir, "fonts-discovered.json"), fontFaces);
   writeJSON(join(captureDir, "capture-result.json"), result);
 
+  const assetManifest = hashAssetStore(opts.outDir);
+  writeEvidenceManifest(opts.outDir, baseEvidenceManifest({
+    sourceUrl: opts.url,
+    viewports,
+    userAgent: DESKTOP_UA,
+    assetManifest,
+  }));
+  log({ event: "evidence_frozen", assetFiles: assetManifest.fileCount, assetHash: assetManifest.hash.slice(0, 12) });
+
   return result;
+}
+
+// Kebab-case mirror of interactions.ts PSEUDO_PROPS — the curated set a
+// :hover/:focus rule realistically changes. Filtering to it keeps recovered
+// rules from dragging layout-shifting junk (display/position) into the clone.
+const PSEUDO_DECL_ALLOW = [
+  "color", "background-color", "background-image", "background-position",
+  "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+  "border-color", "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+  "box-shadow", "opacity", "transform", "filter",
+  "text-decoration-line", "text-decoration-color", "text-decoration",
+  "outline-color", "outline-width", "outline-style", "letter-spacing",
+];
+
+/** Scan every reachable stylesheet for self-targeting :hover/:focus rules, match
+ *  their base selectors against the live DOM, tag matches with data-cid-cap, and
+ *  return the (deduped) rules. Cross-origin sheets can't be read via CSSOM, so
+ *  their intercepted raw text is re-parsed through constructed stylesheets. */
+async function collectPseudoStates(page: Page, crossOriginCssTexts: string[]): Promise<PseudoStateRule[]> {
+  const raw = await page.evaluate(
+    ({ texts, allow }: { texts: string[]; allow: string[] }) => {
+      const out: Array<{ capId: string; pseudo: string; media?: string; decls: Record<string, string> }> = [];
+      const allowSet = new Set(allow);
+      let counter = 0;
+      const idFor = (el: Element): string => {
+        let id = el.getAttribute("data-cid-cap");
+        if (!id) {
+          id = "ps" + counter++;
+          el.setAttribute("data-cid-cap", id);
+        }
+        return id;
+      };
+      const PSEUDO_RE = /^(.*?):(hover|focus-visible|focus-within|focus)$/;
+      const sheets: CSSStyleSheet[] = Array.from(document.styleSheets) as CSSStyleSheet[];
+      for (const t of texts) {
+        try {
+          const s = new CSSStyleSheet();
+          s.replaceSync(t);
+          sheets.push(s);
+        } catch { /* unparseable text */ }
+      }
+      const visit = (rules: CSSRuleList | null | undefined, media: string | undefined): void => {
+        if (!rules) return;
+        for (const r of Array.from(rules)) {
+          if (out.length >= 400) return;
+          const asMedia = r as CSSMediaRule;
+          const asStyle = r as CSSStyleRule;
+          if (asMedia.media && (asMedia as { cssRules?: CSSRuleList }).cssRules) {
+            visit(asMedia.cssRules, asMedia.media.mediaText || media);
+            continue;
+          }
+          if (!asStyle.selectorText && (r as { cssRules?: CSSRuleList }).cssRules) {
+            visit((r as { cssRules?: CSSRuleList }).cssRules, media); // @supports / @layer
+            continue;
+          }
+          if (!asStyle.selectorText || !asStyle.style || !/:(hover|focus)/.test(asStyle.selectorText)) continue;
+          for (const part of asStyle.selectorText.split(",")) {
+            const m = PSEUDO_RE.exec(part.trim());
+            if (!m || !m[1]) continue; // self-targeting only; `.card:hover .overlay` reveals stay Stage 4's job
+            const decls: Record<string, string> = {};
+            for (let i = 0; i < asStyle.style.length; i++) {
+              const prop = asStyle.style.item(i);
+              if (allowSet.has(prop)) decls[prop] = asStyle.style.getPropertyValue(prop);
+            }
+            if (!Object.keys(decls).length) continue;
+            let els: Element[] = [];
+            try {
+              els = Array.from(document.querySelectorAll(m[1])).slice(0, 30);
+            } catch { continue; } // selector syntax the engine rejects
+            for (const el of els) {
+              out.push({ capId: idFor(el), pseudo: m[2]!, ...(media ? { media } : {}), decls });
+            }
+          }
+        }
+      };
+      for (const s of sheets) {
+        try { visit(s.cssRules, undefined); } catch { /* cross-origin CSSOM — covered by texts */ }
+      }
+      return out;
+    },
+    { texts: crossOriginCssTexts, allow: PSEUDO_DECL_ALLOW },
+  );
+  // Same-origin sheets appear both in CSSOM and in the intercepted texts — dedupe.
+  const seen = new Set<string>();
+  const rules: PseudoStateRule[] = [];
+  for (const r of raw) {
+    const key = `${r.capId}|${r.pseudo}|${r.media ?? ""}|${JSON.stringify(r.decls)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rules.push(r as PseudoStateRule);
+  }
+  return rules;
 }
 
 function parseCssForFonts(

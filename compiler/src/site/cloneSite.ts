@@ -21,7 +21,7 @@ import { structurallySimilar } from "./signature.js";
 import { generateSiteApp, routeToSegment, routeKey, type RouteArtifact } from "./generateSite.js";
 import { detectSharedChrome, chromeSignatureId } from "./sharedLayout.js";
 import { validateSite, type SiteReport } from "./validateSite.js";
-import { siteIdFromUrl, namedOutDirs, exportApp, writeLatestPointer } from "../cli.js";
+import { siteIdFromUrl, namedOutDirs, exportApp } from "../cli.js";
 import { writeJSON, readJSON, ensureDir, fileExists, writeText } from "../util/fsx.js";
 import { seoInventoryToMarkdown } from "../generate/seo.js";
 import type { AppFramework } from "../generate/app.js";
@@ -56,8 +56,6 @@ export type CloneSiteResult = {
   plan: RoutePlan;
   routes: RouteArtifact[];
   siteReport?: SiteReport;
-  /** Stable, timestamp-free path to the app (via the `runs/<site>/latest` symlink), when created. */
-  stableAppDir?: string;
 };
 
 function timestamp(): string {
@@ -130,7 +128,7 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
         // Only capture interactions on full (all-viewport) route captures, never the
         // light single-viewport sibling probes used for collection confirmation.
         const full = viewports.length === REQUIRED_VIEWPORTS.length;
-        const capture = await captureSite({ url, outDir: sourceDir, viewports, interactions: opts.interactions && full, motion: full, screenshots, log: () => {} });
+        const capture = await captureSite({ url, outDir: sourceDir, viewports, interactions: opts.interactions && full, screenshots, log: () => {} });
         const ir = buildIR(sourceDir, viewports);
         const assetGraph = buildAssetGraph(capture);
         const fontGraph = buildFontGraph(capture.fontFaces, assetGraph, url);
@@ -238,10 +236,8 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
     siteReport = await validateSite(runDir, { tier: opts.tier ?? "stage2", routeConcurrency: opts.validationConcurrency, viewportConcurrency: opts.viewportConcurrency, log });
   }
 
-  let stableAppDir: string | undefined;
   if (out) { exportApp(appDir, out.appDir); log({ event: "exported", app: out.appDir }); }
-  else { stableAppDir = writeLatestPointer(runsDir, siteId, runDir); }
-  return { runDir, appDir: out ? out.appDir : appDir, siteId, plan, routes, siteReport, stableAppDir };
+  return { runDir, appDir: out ? out.appDir : appDir, siteId, plan, routes, siteReport };
 }
 
 type ManifestForRegen = {

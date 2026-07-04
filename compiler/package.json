@@ -1,13 +1,13 @@
 {
   "name": "clone-static",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Deterministic website compiler CLI and library for ditto.site.",
+  "description": "Deterministic website compiler for ishaans-ditto-site (dual Next.js + /static/ mirror).",
   "license": "MIT",
-  "author": "ion-design",
+  "author": "ishaansamantray",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ion-design/ditto.site.git",
+    "url": "https://github.com/devteamaegis/ishaans-ditto-site.git",
     "directory": "compiler"
   },
   "bugs": {

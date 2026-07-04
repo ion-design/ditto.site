@@ -1,0 +1,9 @@
+# Onboarding acceptance profile — onni.com
+site: https://onni.com/
+tier: onboarding
+gate2_strict: true
+visual_threshold: 0.14
+mirror_mount: /static
+routes:
+  - /
+allowed_skips: []

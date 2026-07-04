@@ -47,9 +47,6 @@ export type RawNode = {
   sizing?: RawSizing;
   before?: RawStyle;
   after?: RawStyle;
-  // ::placeholder computed style for input/textarea with placeholder text. Without it the
-  // clone renders the browser's default gray, losing the authored placeholder color/type.
-  placeholder?: RawStyle;
   rawHTML?: string; // set for inline <svg>
   children: RawChild[];
 };
@@ -103,9 +100,7 @@ export type PageSnapshot = {
   keyframes: string[]; // raw @keyframes blocks from accessible sheets
 };
 
-// `| void` keeps the no-arg `page.evaluate(collectPage)` call sites type-compatible
-// (Playwright types the missing argument as void); frame grafts pass { maxNodes }.
-export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
+export function collectPage(): PageSnapshot {
   // NOTE: This function is serialized and run in the browser via page.evaluate,
   // so every constant/helper it uses must be declared INSIDE it (no module-scope
   // closure is available in the page).
@@ -172,44 +167,15 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     "overflow", "objectFit",
   ];
 
-  // ::placeholder property set: the visual identity of placeholder text. Kept small —
-  // it inherits everything else from the input itself.
-  const PLACEHOLDER_PROPS: string[] = [
-    "color", "opacity", "fontFamily", "fontSize", "fontWeight", "fontStyle",
-    "letterSpacing", "textTransform",
-  ];
-
   const SKIP_TAGS = new Set([
     "script", "style", "link", "meta", "noscript", "template", "base", "title", "head",
   ]);
 
-  // Text-level tags whose whitespace-only text still renders even as the FIRST/ONLY
-  // child (the lone-space case below); a block container's stray whitespace does not.
-  const INLINE_TEXT_TAGS = new Set([
-    "span", "strong", "em", "b", "i", "a", "u", "small", "sub", "sup", "code", "abbr", "time", "label",
-  ]);
-
-  // Frame grafts pass a lower cap so one pathological embed can't dominate the snapshot.
-  const MAX_NODES = (opts && opts.maxNodes) || 12000;
+  const MAX_NODES = 12000;
 
   const round2 = (n: number): number => Math.round((n || 0) * 100) / 100;
   const scrollX = window.scrollX;
   const scrollY = window.scrollY;
-
-  // Viewport + page extents used by isVisible's off-screen test. bbox coords are in
-  // DOCUMENT space (r + scroll), so the visible window on each axis is
-  // [scroll, scroll + inner]. A box whose border box lies wholly outside that window
-  // on a NON-scrollable axis is unreachable and paints nothing to the user.
-  const vpW = window.innerWidth;
-  const vpH = window.innerHeight;
-  const scrollEl = document.scrollingElement || document.documentElement;
-  // Horizontal scrolling is legitimate when the page is wider than the viewport (RTL
-  // carousels, horizontal galleries). In that case content parked to the RIGHT is
-  // reachable by scrolling, so we only reject boxes fully off the LEFT edge (x <= 0
-  // start-of-page, never reachable). Vertical always scrolls, so we never reject
-  // in-flow content below the fold — only position:fixed boxes, which do NOT scroll
-  // with the page and so are truly gone if parked above/below the viewport.
-  const horizScrollable = round2(scrollEl.scrollWidth) > vpW + 1;
 
   // Resolve `line-height: normal` to a concrete px value by probing the actual
   // line-box height for each (font-family, font-size, font-weight, font-style).
@@ -249,39 +215,12 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
 
   const isVisible = (el: Element, cs: CSSStyleDeclaration, bbox: RawBBox): boolean => {
     if (cs.display === "none") return false;
-    // getComputedStyle already resolves `visibility` inheritance: a descendant that
-    // sets visibility:visible inside a hidden ancestor reports "visible" here (and is
-    // genuinely painted), so this test is exactly CSS computed semantics — no separate
-    // ancestor walk is needed. The off-screen test below is what catches un-hidden
-    // content parked outside the viewport (e.g. a slide-in drawer's inner nodes).
     if (cs.visibility === "hidden" || cs.visibility === "collapse") return false;
     if (parseFloat(cs.opacity || "1") === 0) return false;
     if (bbox.width === 0 && bbox.height === 0) {
       // zero-size but might still matter (e.g. absolutely positioned icon); treat
       // as not visible for matching purposes.
       return false;
-    }
-    // Off-screen test. bbox is document-space (x/y already include scroll). The box is
-    // invisible only when it lies WHOLLY outside a non-scrollable axis window — a box
-    // that merely straddles an edge (negative-margin / overflow-hidden decoration
-    // peeking in) still paints and stays visible.
-    //
-    // Horizontal: the page never scrolls left of origin, so anything whose right edge
-    // is at/left of 0 is unreachable. When the page is NOT horizontally scrollable we
-    // also reject boxes whose left edge is at/right of the viewport width; when it IS
-    // scrollable (wide/RTL/carousel pages), right-parked content is reachable, so only
-    // the fully-left case counts.
-    const rightEdge = bbox.x + bbox.width;
-    if (rightEdge <= 0) return false;
-    if (!horizScrollable && bbox.x >= vpW) return false;
-    // Vertical: the page scrolls, so below-/above-fold in-flow content is reachable and
-    // must stay visible. Only position:fixed boxes are pinned to the viewport and do NOT
-    // scroll into view — a fixed box parked entirely above or below the viewport is gone.
-    if (cs.position === "fixed") {
-      const top = bbox.y - scrollY;
-      const bottom = top + bbox.height;
-      if (bottom <= 0) return false;
-      if (top >= vpH) return false;
     }
     return true;
   };
@@ -419,13 +358,6 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       }
     } catch { /* ignore */ }
 
-    // ::placeholder: only meaningful on a control that shows placeholder text.
-    if ((tag === "input" || tag === "textarea") && (attrs.placeholder || "").trim()) {
-      try {
-        node.placeholder = grabStyle(window.getComputedStyle(el, "::placeholder"), PLACEHOLDER_PROPS);
-      } catch { /* ignore */ }
-    }
-
     // Inline SVG → raw markup, no recursion.
     if (tag === "svg") {
       node.rawHTML = el.outerHTML;
@@ -446,11 +378,6 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
           node.children.push({ text: t });
         } else if (t.length > 0 && node.children.length > 0) {
           // Preserve a single significant space between inline elements.
-          node.children.push({ text: " " });
-        } else if (t.length > 0 && (/^inline/.test(cs.display) || INLINE_TEXT_TAGS.has(tag))) {
-          // Whitespace that is the FIRST/ONLY child of an inline element still renders
-          // (`of<strong> </strong>the` keeps its space); dropping it fuses the adjacent
-          // text runs. Scoped to inline parents so block containers stay empty.
           node.children.push({ text: " " });
         }
         continue;

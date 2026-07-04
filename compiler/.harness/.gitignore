@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+dist
+AGENTS.md
+ARCHITECTURE.md
+index.html
+vite.config.ts
+src
+public
+next.config.mjs
+postcss.config.mjs
+tsconfig.json
+next-env.d.ts

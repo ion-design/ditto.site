@@ -44,6 +44,7 @@ export function canonicalOptions(options: CloneOptions = {}): string {
     interactions: resolved.interactions,
     components: resolved.components,
     motion: resolved.motion,
+    preview: resolved.preview,
     verify: !!resolved.verify,
     asyncVerify: !!resolved.asyncVerify,
     maxRoutes: resolved.maxRoutes ?? null,
