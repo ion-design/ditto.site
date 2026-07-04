@@ -15,6 +15,8 @@ import { discoverBreakpoints } from "./breakpoints.js";
 import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.js";
 import { sha1_12, round } from "../util/canonical.js";
 import { isZipArchive, extractDotLottieJson } from "./dotlottie.js";
+import { buildDeterministicEnvShim, captureEpochMs, DEFAULT_PRNG_SEED } from "../util/envShim.js";
+import { isBotWall, classifyNavFailure } from "../util/captureFailure.js";
 
 export const REQUIRED_VIEWPORTS = [375, 768, 1280, 1920] as const;
 // The dense width set captured for SIZE INFERENCE: a node sampled at 9 widths reveals its sizing
@@ -65,6 +67,10 @@ export type SeoResource = {
 export type CaptureResult = {
   sourceUrl: string;
   capturedAt: string;
+  // Deterministic-env shim parameters actually used for this run (Item 1). Recorded
+  // so a recapture can reuse the exact {seed, epochMs} — the pinned wall clock is a
+  // run-metadata value, not a hardcoded constant. Absent when the shim was disabled.
+  deterministicEnv?: { seed: number; epochMs: number };
   viewports: number[];
   // Browser-as-oracle: the widths where the SOURCE layout actually restructures (display /
   // flex-direction / wrap / grid-track-count / position / visibility flips), found by sweeping the
@@ -798,6 +804,66 @@ async function captureCanvasStills(page: import("playwright").Page): Promise<Can
 const CDP_MAX_SHOT_DIMENSION = 16_384;
 
 /**
+ * Item 2: extended lazy-asset DISCOVERY. Returns the deduped, sorted set of asset
+ * URLs referenced through channels the walker + promoteLazyMedia miss:
+ *   (1) <noscript> fallback markup (the walker skips <noscript> entirely) — parsed as
+ *       HTML so real img/source src + srcset are read, not regex-scraped;
+ *   (2) inline element style="…url(…)…" (the walker harvests url() from STYLESHEET
+ *       rules only, not from an element's own style attribute);
+ *   (3) data-background / data-background-image lazy-bg aliases (beyond promoteLazyMedia's
+ *       single data-bg);
+ *   (4) img[loading=lazy] currentSrc — the variant a below-fold image resolved to.
+ * data: URLs and unresolvable refs are dropped. Discovery-only: the caller RECORDS these
+ * for the fallback downloader; nothing here mutates the DOM (snapshots are already taken).
+ * Exported for the fixture tests (page.evaluate'd directly).
+ */
+export function discoverLazyAssetsInPage(): string[] {
+  const urls = new Set<string>();
+  const push = (v: string | null | undefined): void => {
+    if (!v) return;
+    const s = v.trim();
+    if (!s || s.startsWith("data:")) return;
+    try { urls.add(new URL(s, document.baseURI).href); } catch { /* not a URL */ }
+  };
+  const firstOfSrcset = (ss: string): void => {
+    for (const part of ss.split(",")) push(part.trim().split(/\s+/)[0]);
+  };
+  // (1) <noscript> fallback markup.
+  for (const ns of Array.from(document.querySelectorAll("noscript"))) {
+    const html = ns.textContent ?? "";
+    if (!html.includes("<")) continue;
+    let frag: Document;
+    try { frag = new DOMParser().parseFromString(html, "text/html"); } catch { continue; }
+    for (const el of Array.from(frag.querySelectorAll("img,source"))) {
+      push(el.getAttribute("src"));
+      const ss = el.getAttribute("srcset");
+      if (ss) firstOfSrcset(ss);
+    }
+  }
+  // (2) inline style url(...) on any element (background-image / mask / etc.).
+  for (const el of Array.from(document.querySelectorAll("[style]"))) {
+    const st = el.getAttribute("style") ?? "";
+    if (!st.includes("url(")) continue;
+    for (const m of st.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi)) push(m[2]);
+  }
+  // (3) lazy-background data-* aliases the promoter doesn't cover.
+  const BG_ATTRS = ["data-background", "data-background-image"];
+  for (const el of Array.from(document.querySelectorAll(BG_ATTRS.map((a) => `[${a}]`).join(",")))) {
+    for (const a of BG_ATTRS) {
+      const raw = el.getAttribute(a);
+      if (!raw) continue;
+      const m = /url\(\s*(['"]?)([^'")]+)\1\s*\)/i.exec(raw);
+      push(m ? m[2] : raw);
+    }
+  }
+  // (4) the variant a lazy image actually resolved to.
+  for (const img of Array.from(document.querySelectorAll<HTMLImageElement>("img[loading=lazy]"))) {
+    push(img.currentSrc || img.src);
+  }
+  return [...urls].sort();
+}
+
+/**
  * Full-page screenshot via CDP `Page.captureScreenshot` with `captureBeyondViewport:true`.
  * Unlike Playwright's `fullPage:true` (which scroll-stitches — scrolling the page to render
  * each band, FIRING scroll events that drive scroll-linked animations, e.g. IX2 grow-on-scroll
@@ -1004,6 +1070,14 @@ export async function captureSite(opts: {
   interactions?: boolean; // Stage 4: opt-in interaction capture (hover/focus + patterns)
   motion?: boolean; // Stage 5: opt-in motion capture (WAAPI + rotating text)
   breakpoints?: boolean; // discover the source's real responsive band edges (default on; read-only sweep)
+  deterministicEnv?: boolean; // Item 1: seed Math.random + pin the Date epoch BEFORE page JS runs
+                              // (default on), so shuffled carousels / random ids / relative-time text
+                              // ("posted N minutes ago") render the same across captures. Relative time
+                              // still advances (timers behave) and performance.now() stays real.
+  captureEpochMs?: number | string; // pinned wall-clock origin for the shim (ms since epoch, or a
+                                     // date string). Recorded in the result; a recapture passes the
+                                     // previously-recorded value to reproduce time-dependent content.
+  prngSeed?: number; // mulberry32 seed for the pinned Math.random (recorded in the result).
   screenshots?: boolean; // write per-viewport full-page PNGs (default on). ONLY the validator reads these
                          // (generation never touches pixels), and full-page shots of tall pages are the
                          // dominant capture cost — so a production clone that won't be perceptually graded
@@ -1013,6 +1087,13 @@ export async function captureSite(opts: {
 }): Promise<CaptureResult> {
   const viewports = opts.viewports ?? [...REQUIRED_VIEWPORTS];
   const log = opts.log ?? (() => {});
+  // Item 1: resolve the deterministic-env parameters once, at run start, and record
+  // them in the result. The epoch is a run-metadata value (recorded, reproducible),
+  // not a hardcoded constant; performance.now() is left real so motion capture is
+  // unaffected. Defaults on; opts.deterministicEnv === false disables the shim.
+  const deterministicEnvOn = opts.deterministicEnv !== false;
+  const prngSeed = Number.isFinite(opts.prngSeed) ? Math.trunc(opts.prngSeed!) : DEFAULT_PRNG_SEED;
+  const epochMs = captureEpochMs(opts.captureEpochMs);
   const captureDir = join(opts.outDir, "capture");
   const screenshotsDir = join(opts.outDir, "screenshots");
   const cssDir = join(captureDir, "css");
@@ -1178,64 +1259,136 @@ export async function captureSite(opts: {
     // hero on each fresh load) and session-reuse degeneration (warbyparker returned
     // a 13-node shell when reloaded with a carried session). The IR's cross-viewport
     // alignment then operates on one logical DOM that CSS merely reflows.
-    const context: BrowserContext = await browser.newContext({
-      ignoreHTTPSErrors: true,
-      viewport: { width: canonical, height: viewportHeight(canonical) },
-      deviceScaleFactor: 1,
-      userAgent: DESKTOP_UA,
-      javaScriptEnabled: true,
-    });
-    const page = await context.newPage();
-    // tsx/esbuild wraps functions with a __name() helper for stack traces; that
-    // helper does not exist in the browser when we serialize page.evaluate
-    // callbacks. Shim it (as a raw string so it isn't itself transformed).
-    await page.addInitScript(ESBUILD_SHIM);
     const bodyPromises: Promise<void>[] = [];
 
-    page.on("response", (resp) => {
-      try {
-        const url = resp.url();
-        if (url.startsWith("data:") || url.startsWith("blob:")) return;
-        const ct = resp.headers()["content-type"] || null;
-        const type = classifyAsset(url, ct);
-        if (!type) return;
-        const status = resp.status();
-        recordAsset(url, type, ct, status, "network");
-        const existing = assetMap.get(url);
-        if (existing?.storedAs) return;
-        if (status >= 400) return;
-        // A 206 body is a RANGE FRAGMENT (media seek), not the asset — storing it would
-        // ship a corrupt file under first-stored-wins and the full-download fallback
-        // would then skip the asset. Record only; the fallback pass fetches the 200 body.
-        if (status === 206) return;
-        bodyPromises.push(
-          (async () => {
-            try {
-              const buf = await resp.body();
-              storeBytes(url, type, buf);
-              if (type === "css") cssTextsForParsing.push({ baseUrl: url, text: buf.toString("utf8") });
-              if (type === "manifest") parseManifestForAssets(buf.toString("utf8"), url);
-            } catch { /* body unavailable */ }
-          })(),
-        );
-      } catch { /* ignore */ }
-    });
+    // Response listener + init scripts are attached the same way to the initial page
+    // and to any fresh recovery page (Item 3c), so factor the wiring into one helper.
+    const attachResponseListener = (pg: import("playwright").Page): void => {
+      pg.on("response", (resp) => {
+        try {
+          const url = resp.url();
+          if (url.startsWith("data:") || url.startsWith("blob:")) return;
+          const ct = resp.headers()["content-type"] || null;
+          const type = classifyAsset(url, ct);
+          if (!type) return;
+          const status = resp.status();
+          recordAsset(url, type, ct, status, "network");
+          const existing = assetMap.get(url);
+          if (existing?.storedAs) return;
+          if (status >= 400) return;
+          // A 206 body is a RANGE FRAGMENT (media seek), not the asset — storing it would
+          // ship a corrupt file under first-stored-wins and the full-download fallback
+          // would then skip the asset. Record only; the fallback pass fetches the 200 body.
+          if (status === 206) return;
+          bodyPromises.push(
+            (async () => {
+              try {
+                const buf = await resp.body();
+                storeBytes(url, type, buf);
+                if (type === "css") cssTextsForParsing.push({ baseUrl: url, text: buf.toString("utf8") });
+                if (type === "manifest") parseManifestForAssets(buf.toString("utf8"), url);
+              } catch { /* body unavailable */ }
+            })(),
+          );
+        } catch { /* ignore */ }
+      });
+    };
 
-    // Single navigation at the canonical width; every viewport below is a resize.
-    log({ event: "goto", url: opts.url });
-    let navigated = false;
-    let navErr: unknown = null;
-    for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
-      try {
-        await page.goto(opts.url, { waitUntil: attempt === 0 ? "load" : "domcontentloaded", timeout: 45000 });
-        navigated = true;
-      } catch (e) {
-        navErr = e;
-        await page.waitForTimeout(1000);
+    const newSession = async (): Promise<{ context: BrowserContext; page: import("playwright").Page }> => {
+      const ctx: BrowserContext = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        viewport: { width: canonical, height: viewportHeight(canonical) },
+        deviceScaleFactor: 1,
+        userAgent: DESKTOP_UA,
+        javaScriptEnabled: true,
+      });
+      const pg = await ctx.newPage();
+      attachResponseListener(pg);
+      // tsx/esbuild wraps functions with a __name() helper for stack traces; that
+      // helper does not exist in the browser when we serialize page.evaluate
+      // callbacks. Shim it (as a raw string so it isn't itself transformed).
+      await pg.addInitScript(ESBUILD_SHIM);
+      // Item 1: deterministic-env shim — seed Math.random + pin the Date epoch BEFORE
+      // any page script runs. Raw string so tsx/esbuild leaves it byte-exact; the
+      // {seed, epochMs} are the recorded run-metadata values. performance.now() stays
+      // real, so motion.ts marquee/rotator velocity sampling is unaffected.
+      if (deterministicEnvOn) {
+        await pg.addInitScript(buildDeterministicEnvShim({ seed: prngSeed, epochMs }));
       }
+      return { context: ctx, page: pg };
+    };
+
+    // Single context + single navigation; every viewport is captured by RESIZING the
+    // same loaded page (see the block comment above). Item 3c: session recovery is
+    // deliberately scoped to the INITIAL navigation only — carrying one session across
+    // viewports is load-bearing (a reload can degenerate: warbyparker's 13-node shell),
+    // so we never recover mid-loop; we only retry the first nav with a fresh context
+    // when the page/browser died before any content was captured.
+    let { context, page } = await newSession();
+
+    // Total nav budget (Item 3a): a hung origin used to stall for up to ~3×45s + retries
+    // with no ceiling. Bound the WHOLE navigation phase so a dead host fails fast with a
+    // structured error instead of tying up the pipeline. Attempt 0 waits for `load`;
+    // later attempts fall back to `domcontentloaded` (a heavy page may never fire `load`).
+    const NAV_BUDGET_MS = 90_000;
+    const navigateLoaded = async (pg: import("playwright").Page): Promise<void> => {
+      log({ event: "goto", url: opts.url });
+      const navStart = Date.now();
+      let navigated = false;
+      let navErr: unknown = null;
+      for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
+        const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
+        if (remaining < 5_000) break; // not enough budget left for a meaningful attempt
+        try {
+          await pg.goto(opts.url, {
+            waitUntil: attempt === 0 ? "load" : "domcontentloaded",
+            timeout: Math.min(attempt === 0 ? 45_000 : 20_000, remaining),
+          });
+          navigated = true;
+        } catch (e) {
+          navErr = e;
+          await pg.waitForTimeout(1000);
+        }
+      }
+      if (!navigated) {
+        throw new Error(
+          `navigation failed for ${opts.url} within ${Math.round((Date.now() - navStart) / 1000)}s: ${String((navErr as { message?: string })?.message ?? navErr).slice(0, 300)}`,
+        );
+      }
+      await settle(pg);
+    };
+
+    try {
+      await navigateLoaded(page);
+    } catch (navErr) {
+      // Item 3c: one fresh-context retry, but ONLY for a session-death class of failure
+      // (browser/page/context closed, crash, transient reset/timeout). A wall or a hard
+      // terminal error (DNS/cert/refused) is not retried — a fresh context can't fix it.
+      const cls = classifyNavFailure(navErr);
+      if (cls !== "retryable") throw navErr;
+      log({ event: "capture_recover", reason: "session_death_on_initial_nav" });
+      try { if (!page.isClosed()) await page.close(); } catch { /* ignore */ }
+      try { await context.close(); } catch { /* ignore */ }
+      ({ context, page } = await newSession());
+      await navigateLoaded(page); // second failure propagates (no further retry)
     }
-    if (!navigated) throw navErr;
-    await settle(page);
+
+    // Item 3b: bot/auth-wall fast-fail. A wall page would otherwise burn the full
+    // multi-viewport capture and only get flagged by the pollution gate afterward.
+    // Uses the SAME signatures + node-count threshold as the gate (util/captureFailure.ts)
+    // so the abort and the grade agree; the pollution gate stays the shipped-capture
+    // authority, this only saves the wasted work of capturing an obvious wall.
+    const wallProbe = await page
+      .evaluate(() => ({
+        text: (document.body?.innerText ?? "").slice(0, 20_000),
+        nodes: document.querySelectorAll("*").length,
+      }))
+      .catch(() => null);
+    if (isBotWall(wallProbe)) {
+      throw new Error(
+        `auth/bot wall detected at ${opts.url} (${wallProbe!.nodes} nodes, wall text matched): capture aborted early`,
+      );
+    }
 
     // Stage 2: lazy-loader promotion. WP Rocket/lazysizes keep a 0-size placeholder in
     // `src` with the real URL in data attrs; autoScroll outruns their IntersectionObserver
@@ -1641,6 +1794,37 @@ export async function captureSite(opts: {
       log({ event: "captured", viewport: vw, nodes: snapshot.doc.nodeCount, scrollHeight: snapshot.doc.scrollHeight });
     }
 
+    // Item 2: extended lazy-asset discovery sweep. The walker + promoteLazyMedia
+    // already harvest img/source src/srcset and the common data-* lazy attrs
+    // (data-src / data-lazy-src / data-original / data-ll-src / data-(lazy-)srcset)
+    // and picture <source> variants — this sweep ONLY adds the references those miss:
+    //   • <noscript> contents — the walker skips <noscript> entirely, but the fallback
+    //     markup real browsers render with JS off often carries the true <img>/<source> URL;
+    //   • inline element style="…url(…)…" — the walker harvests url() from STYLESHEET
+    //     rules, not from an element's own style attribute (hero background-image inlined);
+    //   • data-background / data-background-image — lazy-bg aliases beyond promoteLazyMedia's
+    //     single data-bg;
+    //   • img[loading=lazy] currentSrc — the resolved variant a below-fold image settled on.
+    // Discovery-ONLY: URLs are recorded through recordAsset so the fallback downloader
+    // fetches them; nothing is promoted into the DOM (the snapshots are already taken, so
+    // this can never shift a captured layout). Bounded so a pathological page can't explode
+    // the fallback fetch phase.
+    try {
+      const sweptRefs: string[] = await page.evaluate(discoverLazyAssetsInPage);
+      let swept = 0;
+      for (const url of sweptRefs) {
+        if (swept >= 120) break; // bound pathological pages (fallback fetch is 30s/asset)
+        if (!/^https?:\/\//i.test(url) || assetMap.has(url)) continue;
+        const t = classifyAsset(url, null);
+        if (!t || !["image", "svg", "video", "font", "lottie"].includes(t)) continue;
+        recordAsset(url, t, null, null, "lazy-sweep");
+        swept++;
+      }
+      if (swept) log({ event: "lazy_sweep", recorded: swept, seen: sweptRefs.length });
+    } catch (e) {
+      log({ event: "lazy_sweep_error", error: String((e as { message?: string })?.message ?? e).slice(0, 160) });
+    }
+
     // Browser-as-oracle: discover the source's real responsive band edges by sweeping the viewport
     // and binary-searching each width where the discrete (media-query-toggled) layout signature
     // changes. Read-only and bounded; runs once here — overlays are dismissed and the DOM settled, so
@@ -1754,6 +1938,7 @@ export async function captureSite(opts: {
   const result: CaptureResult = {
     sourceUrl: opts.url,
     capturedAt: new Date().toISOString(),
+    ...(deterministicEnvOn ? { deterministicEnv: { seed: prngSeed, epochMs } } : {}),
     viewports,
     breakpoints: discoveredBreakpoints,
     perViewport,
