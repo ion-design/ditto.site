@@ -9,6 +9,7 @@ import { normalizeCloneRequestOptions } from "@cloner/core";
 import type { Backend } from "./backend.js";
 import { createMcpServer } from "./mcp.js";
 import { apiKeyAuth, hashApiKey, rateLimit, type AuthConfig } from "./auth.js";
+import { UI_HTML } from "./ui.js";
 
 const OptionsSchema = z
   .object({
@@ -106,6 +107,10 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  // Minimal dev/test UI (self-contained; talks to the same-origin /v1 API). The
+  // API surface itself stays the product — this page is a testing convenience.
+  app.get("/", (c) => c.html(UI_HTML));
 
   if (deps.signup) {
     const signup = deps.signup;
