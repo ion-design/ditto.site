@@ -438,6 +438,7 @@ export function generateSiteApp(opts: {
     const globals = tailwindGlobalsCss({
       reset: RESET_CSS, fontCss: unionFontCss(routes), tokensCss, htmlBg, bodyFont: SYSTEM_FALLBACK, clip,
       colorTokens: [...interner.tokens], viewports: entry.ir.doc.viewports,
+      canonical: entry.ir.doc.canonicalViewport,
     });
     writeText(join(appDir, "src", isVite ? "globals.css" : join("app", "globals.css")), isVite ? viteGlobalsCss(globals) : globals);
   } else {

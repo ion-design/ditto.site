@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lazy-media fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; }
+    img { display: block; }
+    .bg { width: 300px; height: 150px; background-size: cover; background-repeat: no-repeat; }
+  </style>
+</head>
+<body>
+  <h1>Lazy media</h1>
+
+  <!-- WP Rocket style: 0-size placeholder in src, real URL in data-lazy-src. -->
+  <img id="lazy1" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="og-image.png" alt="hero">
+
+  <!-- lazysizes style: no src at all, data-src + data-sizes="auto" (a swap flag, not a value). -->
+  <img id="lazy2" data-src="seo-icon.png" data-sizes="auto" alt="icon">
+
+  <picture>
+    <source id="lazysource" type="image/png" data-srcset="og-image.png 1x">
+    <img id="lazy3" data-src="og-image.png" alt="picture">
+  </picture>
+
+  <!-- Lazy background image (WP Rocket url(...) form). -->
+  <div id="lazybg" class="bg" data-bg="url('brand.svg')"></div>
+
+  <!-- Must NOT be promoted: the data attr is not a plausible URL. -->
+  <img id="notaurl" data-src="{{ placeholder }}" alt="template token">
+
+  <!-- Must NOT count as a promotion: src already equals the target. -->
+  <img id="already" src="seo-icon.png" data-src="seo-icon.png" alt="already swapped">
+</body>
+</html>

@@ -19,7 +19,13 @@ import type { MotionCapture, WaapiAnim, RotatorSpec, RevealSpec, MarqueeSpec } f
 
 export type RTWaapi = { cid: string; keyframes: Array<Record<string, string | number>>; duration: number; delay: number; easing: string; iterations: number; direction: string; fill: string };
 export type RTRotator = { cid: string; texts: string[]; intervalMs: number };
-export type RTReveal = { cid: string; opacity: string; transform: string; transition: string };
+// Reveal families: transition (hidden via opacity/transform, revealed by the element's own
+// transition) and visibility+entrance-class (hidden via visibility, revealed with a named
+// keyframe animation — Elementor/WOW/AOS; the @keyframes ship in the page CSS).
+export type RTReveal = {
+  cid: string; opacity: string; transform: string; transition: string;
+  visibility?: "hidden"; animationName?: string; animationDuration?: string; animationDelay?: string; animationTiming?: string;
+};
 export type RTMarquee = { cid: string; pxPerSec: number; periodPx: number };
 export type MotionSpec = { waapi: RTWaapi[]; rotators: RTRotator[]; reveals: RTReveal[]; marquees: RTMarquee[] };
 
@@ -58,7 +64,16 @@ export function buildMotionSpec(ir: IR, motion: MotionCapture | undefined, inclu
   for (const rv of (motion.reveals ?? []) as RevealSpec[]) {
     const cid = map.get(rv.cap);
     if (!ok(cid)) continue;
-    reveals.push({ cid, opacity: rv.opacity, transform: rv.transform, transition: rv.transition });
+    reveals.push({
+      cid, opacity: rv.opacity, transform: rv.transform, transition: rv.transition,
+      ...(rv.visibility === "hidden" ? { visibility: rv.visibility } : {}),
+      ...(rv.animationName ? {
+        animationName: rv.animationName,
+        animationDuration: rv.animationDuration,
+        animationDelay: rv.animationDelay,
+        animationTiming: rv.animationTiming,
+      } : {}),
+    });
   }
   const marquees: RTMarquee[] = [];
   for (const m of (motion.marquees ?? []) as MarqueeSpec[]) {
@@ -92,7 +107,10 @@ import { useEffect } from "react";
 
 type RTWaapi = { cid: string; keyframes: Array<Record<string, string | number>>; duration: number; delay: number; easing: string; iterations: number; direction: string; fill: string };
 type RTRotator = { cid: string; texts: string[]; intervalMs: number };
-type RTReveal = { cid: string; opacity: string; transform: string; transition: string };
+type RTReveal = {
+  cid: string; opacity: string; transform: string; transition: string;
+  visibility?: "hidden"; animationName?: string; animationDuration?: string; animationDelay?: string; animationTiming?: string;
+};
 type RTMarquee = { cid: string; pxPerSec: number; periodPx: number };
 export type MotionSpec = { waapi: RTWaapi[]; rotators: RTRotator[]; reveals: RTReveal[]; marquees: RTMarquee[] };
 
@@ -111,7 +129,8 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
     const intervals: ReturnType<typeof setInterval>[] = [];
     const rotators: Array<{ el: HTMLElement; original: string | null }> = [];
     const anims: Animation[] = [];
-    const revealed: Array<() => void> = []; // per-reveal "show now" fns (also the cleanup)
+    // per-reveal "show now" fns (also the cleanup); animate=false jumps to the settled frame
+    const revealed: Array<(animate: boolean) => void> = [];
     let io: IntersectionObserver | null = null;
     let forceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -153,29 +172,59 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
       intervals.push(setInterval(() => { i = (i + 1) % r.texts.length; el.textContent = r.texts[i]!; }, Math.max(400, r.intervalMs)));
     }
 
-    // Scroll reveals: hide each element (opacity/transform) with the captured transition,
-    // then reveal (clear the inline overrides → transitions to the base CSS) when it scrolls
-    // into view. A force-reveal timer guarantees nothing stays hidden if the observer misses.
+    // Scroll reveals: re-hide each element (JS-applied on mount, so non-JS/SSR still shows
+    // the content), then reveal when it scrolls into view. Two families:
+    //   - transition — hide via opacity/transform, reveal by transitioning to full;
+    //   - visibility+entrance-class (Elementor/WOW/AOS) — hide via visibility with the baked
+    //     entrance animation suppressed, reveal by restarting the captured @keyframes
+    //     (they ship in the page CSS under the captured animation-name).
+    // A force-reveal timer guarantees nothing stays hidden if the observer misses.
     if (spec.reveals.length) {
       // Reveal to the full resting state. Setting 1/none (not clearing to base) is correct for
       // every reveal — the revealed state is always full + un-offset — and is REQUIRED for
       // scroll-scrub panels whose captured base CSS is a frozen mid-scrub value (opacity 0.63).
-      const show = (el: HTMLElement) => { el.style.opacity = "1"; el.style.transform = "none"; };
-      const byEl = new Map<Element, HTMLElement>();
+      // animate=false (validator settle path) jumps straight to the settled frame so no
+      // measurement can catch a mid-entrance value.
+      const show = (el: HTMLElement, rv: RTReveal, animate: boolean) => {
+        el.style.opacity = "1"; el.style.transform = "none";
+        if (rv.visibility === "hidden") el.style.visibility = "visible";
+        if (rv.animationName) {
+          if (animate) {
+            // restart the entrance from t=0: none -> name starts a fresh animation
+            el.style.animationName = "none";
+            void el.offsetWidth;
+            el.style.animationName = rv.animationName;
+            el.style.animationDuration = rv.animationDuration || "1s";
+            el.style.animationDelay = rv.animationDelay || "0s";
+            el.style.animationTimingFunction = rv.animationTiming || "ease";
+            el.style.animationFillMode = "both";
+            el.style.animationIterationCount = "1";
+          } else {
+            el.style.animationName = "none"; // settled frame: keep the entrance suppressed
+          }
+        }
+      };
+      const shows = new Map<Element, (animate: boolean) => void>();
       for (const rv of spec.reveals) {
         const el = byCid(rv.cid);
         if (!el) continue;
-        el.style.transition = rv.transition;
-        el.style.opacity = rv.opacity;
-        if (rv.transform !== "none") el.style.transform = rv.transform;
-        byEl.set(el, el);
-        revealed.push(() => show(el));
+        if (rv.visibility === "hidden") {
+          el.style.visibility = "hidden";
+          el.style.animationName = "none"; // don't burn the baked entrance while hidden
+        } else {
+          el.style.transition = rv.transition;
+          el.style.opacity = rv.opacity;
+          if (rv.transform !== "none") el.style.transform = rv.transform;
+        }
+        const fn = (animate: boolean) => show(el, rv, animate);
+        shows.set(el, fn);
+        revealed.push(fn);
       }
       io = new IntersectionObserver((entries) => {
-        for (const e of entries) if (e.isIntersecting) { const el = byEl.get(e.target); if (el) { show(el); io!.unobserve(e.target); } }
+        for (const e of entries) if (e.isIntersecting) { const f = shows.get(e.target); if (f) { f(true); io!.unobserve(e.target); } }
       }, { rootMargin: "0px 0px -8% 0px" });
-      for (const el of byEl.keys()) io.observe(el);
-      forceTimer = setTimeout(() => { for (const f of revealed) f(); }, 4000);
+      for (const el of shows.keys()) io.observe(el);
+      forceTimer = setTimeout(() => { for (const f of revealed) f(true); }, 4000);
     }
 
     const stopAll = () => {
@@ -185,7 +234,7 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
       for (const a of anims) { try { a.cancel(); } catch { /* ignore */ } }
       if (io) io.disconnect();
       if (forceTimer) clearTimeout(forceTimer);
-      for (const f of revealed) f(); // reveal everything → base CSS settled frame
+      for (const f of revealed) f(false); // reveal everything, settled → base CSS graded frame
     };
     // Measurement hook: restore the fully-settled/revealed base for grading.
     (window as any).__dittoMotionStop = stopAll;

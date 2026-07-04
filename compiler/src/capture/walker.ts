@@ -47,6 +47,9 @@ export type RawNode = {
   sizing?: RawSizing;
   before?: RawStyle;
   after?: RawStyle;
+  // ::placeholder computed style for input/textarea with placeholder text. Without it the
+  // clone renders the browser's default gray, losing the authored placeholder color/type.
+  placeholder?: RawStyle;
   rawHTML?: string; // set for inline <svg>
   children: RawChild[];
 };
@@ -100,7 +103,9 @@ export type PageSnapshot = {
   keyframes: string[]; // raw @keyframes blocks from accessible sheets
 };
 
-export function collectPage(): PageSnapshot {
+// `| void` keeps the no-arg `page.evaluate(collectPage)` call sites type-compatible
+// (Playwright types the missing argument as void); frame grafts pass { maxNodes }.
+export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
   // NOTE: This function is serialized and run in the browser via page.evaluate,
   // so every constant/helper it uses must be declared INSIDE it (no module-scope
   // closure is available in the page).
@@ -167,11 +172,25 @@ export function collectPage(): PageSnapshot {
     "overflow", "objectFit",
   ];
 
+  // ::placeholder property set: the visual identity of placeholder text. Kept small —
+  // it inherits everything else from the input itself.
+  const PLACEHOLDER_PROPS: string[] = [
+    "color", "opacity", "fontFamily", "fontSize", "fontWeight", "fontStyle",
+    "letterSpacing", "textTransform",
+  ];
+
   const SKIP_TAGS = new Set([
     "script", "style", "link", "meta", "noscript", "template", "base", "title", "head",
   ]);
 
-  const MAX_NODES = 12000;
+  // Text-level tags whose whitespace-only text still renders even as the FIRST/ONLY
+  // child (the lone-space case below); a block container's stray whitespace does not.
+  const INLINE_TEXT_TAGS = new Set([
+    "span", "strong", "em", "b", "i", "a", "u", "small", "sub", "sup", "code", "abbr", "time", "label",
+  ]);
+
+  // Frame grafts pass a lower cap so one pathological embed can't dominate the snapshot.
+  const MAX_NODES = (opts && opts.maxNodes) || 12000;
 
   const round2 = (n: number): number => Math.round((n || 0) * 100) / 100;
   const scrollX = window.scrollX;
@@ -358,6 +377,13 @@ export function collectPage(): PageSnapshot {
       }
     } catch { /* ignore */ }
 
+    // ::placeholder: only meaningful on a control that shows placeholder text.
+    if ((tag === "input" || tag === "textarea") && (attrs.placeholder || "").trim()) {
+      try {
+        node.placeholder = grabStyle(window.getComputedStyle(el, "::placeholder"), PLACEHOLDER_PROPS);
+      } catch { /* ignore */ }
+    }
+
     // Inline SVG → raw markup, no recursion.
     if (tag === "svg") {
       node.rawHTML = el.outerHTML;
@@ -378,6 +404,11 @@ export function collectPage(): PageSnapshot {
           node.children.push({ text: t });
         } else if (t.length > 0 && node.children.length > 0) {
           // Preserve a single significant space between inline elements.
+          node.children.push({ text: " " });
+        } else if (t.length > 0 && (/^inline/.test(cs.display) || INLINE_TEXT_TAGS.has(tag))) {
+          // Whitespace that is the FIRST/ONLY child of an inline element still renders
+          // (`of<strong> </strong>the` keeps its space); dropping it fuses the adjacent
+          // text runs. Scoped to inline parents so block containers stay empty.
           node.children.push({ text: " " });
         }
         continue;

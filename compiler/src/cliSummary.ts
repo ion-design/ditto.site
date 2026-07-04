@@ -20,6 +20,9 @@ export type DoneSummaryInput = {
   framework: "next" | "vite";
   /** Stable path (a `runs/<site>/latest` symlink target) preferred as the `cd` target when present. */
   stableAppDir?: string;
+  /** Visual assets (image/svg/video) that failed to download — those boxes paint as
+   *  placeholders in the clone. 0/undefined → line omitted. */
+  visualAssetsMissing?: number;
 };
 
 /** Double-quote a path for a POSIX shell so spaces and wrapping don't break copy-paste. */
@@ -46,6 +49,12 @@ export function doneSummary(input: DoneSummaryInput): string {
     "  Or re-run with --serve to install deps and start the dev server for you",
     "  (add --open to launch the browser too).",
   ];
+  if (input.visualAssetsMissing) {
+    const n = input.visualAssetsMissing;
+    lines.push("");
+    lines.push(`  ⚠ ${n} visual asset${n === 1 ? "" : "s"} could not be downloaded and will render as`);
+    lines.push(`    placeholders — see generated/assets.json (classification "skipped").`);
+  }
   if (input.stableAppDir && input.stableAppDir !== input.appDir) {
     lines.push("");
     lines.push(`  The path above is a stable pointer to the newest clone. This exact run:`);

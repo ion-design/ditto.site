@@ -91,6 +91,11 @@ const GENERIC: Array<{ prop: string; def: string | string[] }> = [
   { prop: "bottom", def: "auto" }, { prop: "left", def: "auto" },
   { prop: "float", def: "none" }, { prop: "clear", def: "none" },
   { prop: "zIndex", def: "auto" },
+  // visibility is INHERITED, so the parent-equality skip keeps descendants of a
+  // hidden subtree clean; without this entry a node hidden at the canonical
+  // viewport could never emit `visibility:hidden` at all (the only other path is
+  // per-band and gated on being shown at base).
+  { prop: "visibility", def: "visible" },
   { prop: "opacity", def: "1" }, { prop: "isolation", def: "auto" },
   { prop: "mixBlendMode", def: "normal" },
   { prop: "minWidth", def: ["0px", "auto"] }, { prop: "maxWidth", def: "none" },
@@ -2305,7 +2310,14 @@ function declsForViewport(
     }
 
     // Inherited: skip when equal to parent's value (inheritance handles it).
-    if (INHERITED.has(prop) && parentComputed && parentComputed[prop] === value) continue;
+    // Exception: the reset (`ul, ol, menu { list-style: none; }`) breaks the list-marker
+    // inheritance chain on those tags, so parent-equality is not a safe elision there —
+    // a source <ul> with `disc` equals its parent's initial `disc` yet must still emit
+    // or the reset erases the markers. <li> inherits from the ul, which now emits.
+    if (INHERITED.has(prop) && parentComputed && parentComputed[prop] === value) {
+      const listMarkerReset = (prop === "listStyleType" || prop === "listStylePosition") && /^(ul|ol|menu)$/.test(tag);
+      if (!listMarkerReset) continue;
+    }
 
     let outValue = value;
     if (prop === "backgroundImage" || prop === "maskImage" || prop === "filter" || prop === "clipPath") {
@@ -2586,7 +2598,41 @@ function pseudoDecls(style: StyleMap, assetMap: Map<string, string>): Map<string
 // the grouped class produces identical computed styles (fidelity-neutral).
 export type BandRule = { media: string; decls: Map<string, string> };
 export type PseudoRule = { base: Map<string, string>; bands: BandRule[] };
-export type NodeRule = { base: Map<string, string>; bands: BandRule[]; before?: PseudoRule; after?: PseudoRule };
+export type NodeRule = { base: Map<string, string>; bands: BandRule[]; before?: PseudoRule; after?: PseudoRule; placeholder?: PseudoRule };
+
+/** ::placeholder declarations for a form control. Color always emits (the UA default is
+ *  its own gray, NOT inherited from the input, so equality with the host proves nothing);
+ *  font/spacing props DO inherit from the input inside the pseudo, so they emit only when
+ *  they differ from the host's own computed value. */
+function placeholderDecls(style: StyleMap, host: StyleMap | undefined): Map<string, string> {
+  const decls = new Map<string, string>();
+  if (style.color) decls.set("color", style.color);
+  if (style.opacity && style.opacity !== "1") decls.set("opacity", style.opacity);
+  for (const prop of ["fontFamily", "fontSize", "fontWeight", "fontStyle", "letterSpacing", "textTransform"]) {
+    const v = style[prop];
+    if (!v || (host && host[prop] === v)) continue;
+    decls.set(kebab(prop), v);
+  }
+  return decls;
+}
+
+/** Banded ::placeholder rule (mirrors collectPseudoRule's base+delta shape). */
+function collectPlaceholderRule(styleByVp: Record<number, StyleMap>, hostByVp: Record<number, StyleMap>, baseVp: number, bands: Band[], tokenResolver?: TokenResolver): PseudoRule | undefined {
+  const baseStyle = styleByVp[baseVp] ?? Object.values(styleByVp)[0];
+  if (!baseStyle) return undefined;
+  const out: PseudoRule = { base: finalizeDecls(placeholderDecls(baseStyle, hostByVp[baseVp]), tokenResolver), bands: [] };
+  for (const b of bands) {
+    if (!b.media) continue;
+    const st = styleByVp[b.vp];
+    if (!st) continue; // control not rendered at this width — the host rule already hides it
+    const vpDecls = finalizeDecls(placeholderDecls(st, hostByVp[b.vp]), tokenResolver);
+    const delta = new Map<string, string>();
+    for (const [k, v] of vpDecls) if (out.base.get(k) !== v) delta.set(k, v);
+    for (const [k] of out.base) if (!vpDecls.has(k)) delta.set(k, resetValue(k));
+    if (delta.size > 0) out.bands.push({ media: b.media, decls: delta });
+  }
+  return out.base.size > 0 ? out : undefined;
+}
 
 /** Collect a pseudo-element's banded rule (its size/position can be responsive —
  * e.g. flex spacer pseudo-elements in horizontal scrollers). `hostContentWidthByVp`
@@ -2940,20 +2986,47 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       // Node was not in the observed DOM at this width (responsive conditional
       // rendering): hide it so the clone matches the source at this viewport.
       if (!node.computedByVp[b.vp]) { nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) }); continue; }
-      // The node isn't PAINTED at this width — either it goes `display:none` itself, or an ancestor
-      // hides the whole subtree. Its box renders nothing, so any width/height/inset/padding override
-      // here is invisible: pure breakpoint noise. Emit ONLY the hide, and only when the node ITSELF
-      // is the one turning off (was shown at base); if an ancestor hides it, emit nothing at all —
-      // that ancestor's own `display:none` already removes this node with it.
-      const ownNone = (node.computedByVp[b.vp]?.display || "") === "none";
-      if (ownNone || !node.visibleByVp[b.vp]) {
+      // The node isn't PAINTED at this width. HOW it is hidden decides what to emit, because only
+      // `display:none` takes the box out of layout — a `visibility:hidden` box still occupies space
+      // and can extend the scrollable area. The base rule bakes CANONICAL geometry unconditionally,
+      // so skipping every override here can park e.g. a desktop `left:548px` slider arrow inside a
+      // 375px viewport: invisible, but +210px of sideways scroll.
+      const vpCs = node.computedByVp[b.vp]!;
+      const ownNone = (vpCs.display || "") === "none";
+      // The node ITSELF is visibility:hidden here (its parent isn't → not inherited from an
+      // ancestor whose own rule already carries the hide).
+      const ownHidden = !ownNone && /^(hidden|collapse)$/.test(vpCs.visibility || "") &&
+        !/^(hidden|collapse)$/.test(parentNode?.computedByVp[b.vp]?.visibility || "");
+      if (ownHidden) {
+        const bb = node.bboxByVp[b.vp];
+        if (!bb || bb.width <= 0 || bb.height <= 0) {
+          // The hidden box occupied NOTHING in the capture (0×0 — e.g. an uninitialised swiper
+          // arrow collapsed by its container). `display:none` reproduces "invisible, takes no
+          // space" exactly and guarantees it cannot extend scroll bounds at this width.
+          nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+          continue;
+        }
+        // Non-zero bbox: the invisible box occupies real layout space. Fall through to the normal
+        // per-viewport delta so it sits where the capture measured it at THIS width — not at the
+        // canonical geometry the base rule baked. The hide itself rides along in the delta
+        // (declsForViewport emits `visibility:hidden`; parent-equality keeps it own-only).
+      } else if (ownNone || !node.visibleByVp[b.vp]) {
         const shownAtBase = node.visibleByVp[baseVp] && (node.computedByVp[baseVp]?.display || "") !== "none";
-        if (ownNone && shownAtBase) nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
-        else if (shownAtBase) {
-          const vpCs = node.computedByVp[b.vp];
+        if (ownNone) {
+          // Own display:none removes the box from layout entirely. Emit the hide even when the node
+          // is ALSO hidden at base — a visibility:hidden base still bakes an OCCUPYING box (see
+          // above), so without this band the canonical geometry would render at this width. Skip
+          // only when the base itself is display:none (the band would be redundant).
+          if ((node.computedByVp[baseVp]?.display || "") !== "none") {
+            nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+          }
+        } else if (shownAtBase) {
+          // Hidden by an ancestor (or zero-size / opacity:0): geometry overrides are breakpoint
+          // noise — the ancestor's own hide (or the reveal replay, for scroll-reveal opacity)
+          // covers it. Emit only the hide the node itself carries.
           const hide = new Map<string, string>();
-          if (vpCs && pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
-          if (vpCs && /^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
+          if (pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
+          if (/^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
           if (hide.size) nr.bands.push({ media: b.media, decls: hide });
         }
         continue;
@@ -2997,6 +3070,9 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
         nr.after = collectPseudoRule(node.afterByVp, baseVp, bands, assetMap, tokenResolver, hostCW, padW, padH);
       }
     }
+    if (node.placeholderByVp) {
+      nr.placeholder = collectPlaceholderRule(node.placeholderByVp, node.computedByVp, baseVp, bands, tokenResolver);
+    }
     rules.set(node.id, nr);
 
     for (const c of node.children) if (!isTextChild(c)) walk(c, node, childFluid, childLayoutParent, childCb, childDefiniteHeight);
@@ -3026,9 +3102,11 @@ export function assembleCss(
     if (nr.base.size > 0) baseRules.push(formatRule(sel, nr.base));
     if (nr.before) baseRules.push(formatRule(`${sel}::before`, nr.before.base));
     if (nr.after) baseRules.push(formatRule(`${sel}::after`, nr.after.base));
+    if (nr.placeholder) baseRules.push(formatRule(`${sel}::placeholder`, nr.placeholder.base));
     for (const b of nr.bands) bandRules.get(b.media)?.push(formatRule(sel, b.decls));
     if (nr.before) for (const b of nr.before.bands) bandRules.get(b.media)?.push(formatRule(`${sel}::before`, b.decls));
     if (nr.after) for (const b of nr.after.bands) bandRules.get(b.media)?.push(formatRule(`${sel}::after`, b.decls));
+    if (nr.placeholder) for (const b of nr.placeholder.bands) bandRules.get(b.media)?.push(formatRule(`${sel}::placeholder`, b.decls));
   }
   const parts: string[] = [];
   if (keyframes) parts.push(keyframes);

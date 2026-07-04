@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Newsletter embed</title>
+<style>
+  body { margin: 0; background: #1a1a2e; color: #ffffff; font-family: Arial, sans-serif; }
+  form { padding: 12px; }
+  label { display: block; margin-bottom: 6px; font-size: 13px; }
+  input { display: block; width: 200px; color: #ffffff; background: #333344; border: 1px solid #555577; padding: 6px; }
+  input::placeholder { color: rgb(200, 150, 100); }
+  button { margin-top: 8px; background: #e94560; color: #ffffff; border: 0; padding: 8px 16px; }
+  a { color: #8888ff; font-size: 12px; }
+</style>
+</head>
+<body>
+  <form id="signup" action="/subscribe">
+    <label for="email">Email</label>
+    <input id="email" type="email" placeholder="Enter your email">
+    <button type="submit">Sign up</button>
+    <a href="#terms">Terms</a>
+    <img src="/pixel.png" alt="" width="10" height="10">
+  </form>
+</body>
+</html>

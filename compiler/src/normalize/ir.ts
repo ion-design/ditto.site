@@ -34,6 +34,9 @@ export type IRNode = {
   sizingByVp?: Record<number, RawSizing>;
   beforeByVp?: Record<number, StyleMap>;
   afterByVp?: Record<number, StyleMap>;
+  // ::placeholder computed style (input/textarea with placeholder text) — emitted as a
+  // `::placeholder` rule so form controls keep their authored placeholder color.
+  placeholderByVp?: Record<number, StyleMap>;
   children: IRChild[];
 };
 
@@ -156,10 +159,12 @@ function resolveLazyAttrs(attrs: Record<string, string> | undefined): Record<str
   return out;
 }
 
-// `<iframe>` is intentionally NOT noise: it is kept as a sized placeholder box (its
-// external document is dropped at generation — see propsList — so the clone stays
-// self-contained while preserving the layout the embed occupied). Truly invisible
-// iframes (tracking/chat, 0-size or display:none) are removed by the visibility prune.
+// `<iframe>` is intentionally NOT noise: capture grafts an embedded document's subtree
+// as the iframe's children (capture/graft.ts) so form embeds (Klaviyo et al) render as
+// real content — generation then emits the iframe as a positioned <div>. When the graft
+// wasn't possible the iframe is kept as a sized placeholder box (document-loading attrs
+// dropped at generation — see propsList — so the clone stays self-contained). Truly
+// invisible iframes (tracking/chat, 0-size or display:none) are removed by the prune.
 const NOISE_TAGS = new Set(["next-route-announcer"]);
 
 // Third-party overlay widgets (chat launchers, cookie/consent bars, captcha badges) are
@@ -306,6 +311,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     const sizingByVp: Record<number, RawSizing> = {};
     const beforeByVp: Record<number, StyleMap> = {};
     const afterByVp: Record<number, StyleMap> = {};
+    const placeholderByVp: Record<number, StyleMap> = {};
 
     for (const vw of viewports) {
       const match = matched[vw];
@@ -316,6 +322,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       if (match.sizing) sizingByVp[vw] = match.sizing;
       if (match.before) beforeByVp[vw] = match.before;
       if (match.after) afterByVp[vw] = match.after;
+      if (match.placeholder) placeholderByVp[vw] = match.placeholder;
     }
 
     const node: IRNode = {
@@ -333,6 +340,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     if (Object.keys(sizingByVp).length) node.sizingByVp = sizingByVp;
     if (Object.keys(beforeByVp).length) node.beforeByVp = beforeByVp;
     if (Object.keys(afterByVp).length) node.afterByVp = afterByVp;
+    if (Object.keys(placeholderByVp).length) node.placeholderByVp = placeholderByVp;
 
     if (!raw.rawHTML) {
       const canonKids = elementChildren(raw);
@@ -381,11 +389,16 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
         keptChildren.push(c);
         continue;
       }
+      // `<source>` carries a <picture>/<video>'s media/art-direction candidates but never
+      // paints (0×0 at every viewport), so the visibility prune would always drop it —
+      // losing responsive variants (the lazy-loaded mobile img.src then serves every
+      // width). Keep it structurally; generation emits it only when its file materialized.
+      const keepSource = c.tag === "source" && (node.tag === "picture" || node.tag === "video");
       if (keepAll) {
         prune(c, true);
         keptChildren.push(c);
         if (Object.values(c.visibleByVp).some(Boolean) || childHasVisible(c)) hasVisibleDescendant = true;
-      } else if (prune(c, false)) {
+      } else if (prune(c, false) || keepSource) {
         keptChildren.push(c);
         if (Object.values(c.visibleByVp).some(Boolean) || childHasVisible(c)) hasVisibleDescendant = true;
       }

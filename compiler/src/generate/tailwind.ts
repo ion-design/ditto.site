@@ -99,6 +99,14 @@ const SPACE_SCALE = new Set<string>([
 ]);
 // Props that take 100% → the `-full` named utility (exact: w-full ≡ width:100%).
 const PCT_FULL = new Set<string>(["width", "height", "min-width", "max-width", "min-height", "max-height"]);
+// ARB props whose named Tailwind v4 scale really includes a bare `0` step: the spacing-scale props
+// (w-0, top-0, leading-0, indent-0, …) plus the numeric scales grow/shrink/basis/order/z/opacity.
+// font-size, letter-spacing, the radius corners and object-position have NO `-0` utility — `text-0`
+// / `tracking-0` compile to NOTHING in v4 (a silent no-op: a map label captured at font-size:0
+// painted at the inherited 20px) — so their zeros must stay arbitrary (`text-[0px]`).
+const ZERO_NAMED = new Set<string>([
+  ...SPACE_SCALE, "flex-grow", "flex-shrink", "flex-basis", "order", "z-index", "opacity",
+]);
 const ORIGIN_NAMED: Record<string, string> = {
   center: "origin-center", top: "origin-top", "top right": "origin-top-right", right: "origin-right",
   "bottom right": "origin-bottom-right", bottom: "origin-bottom", "bottom left": "origin-bottom-left",
@@ -141,8 +149,9 @@ function transformNeedsOrigin(v: string | undefined): boolean {
   return !!v && v !== "none" && translateOffsets(v) === null;
 }
 
-/** Translate ONE computed declaration into a Tailwind utility (no responsive prefix). */
-function declToUtil(prop: string, value: string): string {
+/** Translate ONE computed declaration into a Tailwind utility (no responsive prefix).
+ *  Exported for tests (the zero-value gating is load-bearing: an invalid utility is a SILENT no-op). */
+export function declToUtil(prop: string, value: string): string {
   // Colors → named theme tokens when tokenized (bg-primary), else arbitrary value.
   if (prop === "color") { const n = tokenName(value); return n ? `text-${n}` : `text-[color:${arb(value)}]`; }
   if (prop === "background-color") { const n = tokenName(value); return n ? `bg-${n}` : `bg-[${arb(value)}]`; }
@@ -229,7 +238,11 @@ function declToUtil(prop: string, value: string): string {
       const n = spacingSteps(value);
       if (n !== null) return n < 0 ? `-${ARB[prop]}-${-n}` : `${ARB[prop]}-${n}`;
     }
-    if (value === "0" || value === "0px" || value === "0rem") return `${ARB[prop]}-0`; // bare/unitless zero
+    // Bare/unitless zero — the named `-0` only where that utility actually exists (ZERO_NAMED);
+    // elsewhere emit the exact arbitrary length so the declaration really compiles.
+    if (value === "0" || value === "0px" || value === "0rem") {
+      return ZERO_NAMED.has(prop) ? `${ARB[prop]}-0` : `${ARB[prop]}-[0px]`;
+    }
     return `${ARB[prop]}-[${arb(value)}]`;
   }
   if (/^border-(top|right|bottom|left)-width$/.test(prop)) {
@@ -261,23 +274,45 @@ function declToUtil(prop: string, value: string): string {
 
 /** Responsive variant prefix for a band's media query. For the standard capture ladder
  *  (375/768/1280/1920, canonical 1280) the per-viewport bands are the midpoints 571/1024/1600,
- *  which we map to the CONVENTIONAL Tailwind breakpoints a human would author — `max-md:`
- *  (mobile, <768), `md:max-lg:` (tablet, 768–1023), `2xl:` (wide, ≥1536) — leaving 1280 as the
- *  unprefixed base. Each reproduces the captured width EXACTLY (the style gate measures only at
- *  375/768/1280/1920), while between-width behaviour follows the standard breakpoints instead of
- *  arbitrary midpoint pixels. Non-standard viewport sets fall back to the exact arbitrary band. */
-function prefixFor(media: string): string {
+ *  which we map to the CONVENTIONAL Tailwind breakpoint NAMES a human would author — `max-md:`
+ *  (mobile), `md:max-lg:` (tablet), `2xl:` (wide) — leaving 1280 as the unprefixed base. The
+ *  generated @theme redefines those screens to the band boundaries (bandScreens), so every named
+ *  variant flips at EXACTLY the same width as the ditto.css band media query (Tailwind's stock
+ *  768/1024/1536 would open windows — e.g. 1536–1600 — where utilities and ditto.css rules
+ *  disagree). Non-standard viewport sets fall back to the exact arbitrary band. */
+export function prefixFor(media: string): string {
   const min = /min-width:\s*(\d+)px/.exec(media);
   const max = /max-width:\s*(\d+)px/.exec(media);
   const lo = min ? +min[1]! : 0;
   const hi = max ? +max[1]! : Infinity;
-  if (!min && hi === 571) return "max-md:";            // 375 sample → below md (768)
-  if (lo === 572 && hi === 1024) return "md:max-lg:";  // 768 sample → md … below lg (1024)
-  if (lo === 1601 && !max) return "2xl:";              // 1920 sample → at/above 2xl (1536)
+  if (!min && hi === 571) return "max-md:";            // 375 sample band (md pinned to 572)
+  if (lo === 572 && hi === 1024) return "md:max-lg:";  // 768 sample band (lg pinned to 1025)
+  if (lo === 1601 && !max) return "2xl:";              // 1920 sample band (2xl pinned to 1601)
   let p = "";
   if (min) p += `min-[${lo}px]:`;
-  if (max) p += `max-[${hi}px]:`;
+  // v4 max-* is STRICT (`width < X`) while the band's max-width is inclusive → pin to hi+1.
+  if (max) p += `max-[${hi + 1}px]:`;
   return p;
+}
+
+/** Named-screen overrides for the generated @theme, derived from the SAME bands prefixFor
+ *  names. Invariant: for every band, the Tailwind variant prefix and the ditto.css media
+ *  query produce the same min/max boundaries. Tailwind v4 compiles `X:` to `width >= X`
+ *  and `max-X:` to `width < X`, so a band min pins the screen directly and a band max pins
+ *  it to max+1. Bands prefixFor leaves arbitrary (`min-[…px]:`) embed their exact bounds
+ *  and need no override. */
+export function bandScreens(viewports: number[], canonical: number): Array<[string, number]> {
+  const out = new Map<string, number>();
+  for (const b of computeBands(viewports, canonical)) {
+    if (!b.media) continue;
+    const min = /min-width:\s*(\d+)px/.exec(b.media);
+    const max = /max-width:\s*(\d+)px/.exec(b.media);
+    for (const m of prefixFor(b.media).matchAll(/(max-)?(sm|md|lg|xl|2xl):/g)) {
+      out.set(m[2]!, m[1] ? +max![1]! + 1 : +min![1]!);
+    }
+  }
+  const order = ["sm", "md", "lg", "xl", "2xl"];
+  return [...out.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]));
 }
 
 function fmtRule(sel: string, decls: Map<string, string>): string {
@@ -1141,6 +1176,13 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
       classOf.set(cid, dedupeUtils([...(classOf.get(cid) ?? "").split(" ").filter(Boolean), ...filteredPseudoUtils]).join(" "));
       utilCount += filteredPseudoUtils.length;
     }
+    // ::placeholder → a raw [data-cid] ditto.css rule (rare — only styled form controls),
+    // matching the pseudo fallback path above: exact colors, no Tailwind-escape round-trip.
+    if (nr.placeholder) {
+      const psel = `${sel}::placeholder`;
+      if (nr.placeholder.base.size) extraParts.push(fmtRule(psel, nr.placeholder.base));
+      for (const b of nr.placeholder.bands) extraParts.push(`${b.media} {\n${fmtRule(psel, b.decls)}\n}`);
+    }
   }
 
   // Stage 4 hover/focus → Tailwind variant utilities folded into each node's className (replacing the
@@ -1181,9 +1223,14 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
  *  so utilities override them. */
 export function tailwindGlobalsCss(opts: {
   reset: string; fontCss: string; tokensCss: string; htmlBg: string; bodyFont: string;
-  clip: string; colorTokens: string[]; viewports: number[];
+  clip: string; colorTokens: string[]; viewports: number[]; canonical: number;
 }): string {
-  const screens = [...opts.viewports].sort((a, b) => a - b).map((v) => `  --breakpoint-vp${v}: ${v}px;`).join("\n");
+  const screens = [
+    ...[...opts.viewports].sort((a, b) => a - b).map((v) => `  --breakpoint-vp${v}: ${v}px;`),
+    // Named screens pinned to the ditto.css band boundaries so `md:`/`2xl:` utilities
+    // and the banded rules flip at the same width (see bandScreens).
+    ...bandScreens(opts.viewports, opts.canonical).map(([n, px]) => `  --breakpoint-${n}: ${px}px;`),
+  ].join("\n");
   const colors = opts.colorTokens.map((n) => `  --color-${n}: var(--${n});`).join("\n");
   return `@layer theme, base, components, utilities;
 @import "tailwindcss/theme.css" layer(theme);

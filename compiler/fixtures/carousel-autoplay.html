@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Autoplay carousel fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #1a1a1a; }
+    main { max-width: 720px; margin: 0 auto; padding: 40px 24px; }
+
+    /* Splide-like autoplaying carousel: clipped track, flex list moved by translateX,
+       pagination bullets, pause-on-hover (the library default this fixture mimics). */
+    .splide { position: relative; }
+    .splide__track { overflow: hidden; border-radius: 10px; }
+    .splide__list { display: flex; transition: transform .2s ease; margin: 0; padding: 0; list-style: none; }
+    .splide__slide { flex: 0 0 100%; min-width: 100%; height: 200px; display: flex; align-items: center; justify-content: center; font-size: 34px; color: #fff; }
+    .a0 { background: #4f46e5; } .a1 { background: #0891b2; } .a2 { background: #16a34a; } .a3 { background: #db2777; }
+    .splide__pagination { display: flex; gap: 8px; justify-content: center; margin-top: 12px; padding: 0; list-style: none; }
+    .splide__pagination__bullet { width: 10px; height: 10px; border-radius: 50%; border: 0; padding: 0; cursor: pointer; background: #d1d5db; }
+    .splide__pagination__bullet.is-active { background: #4f46e5; }
+
+    /* A control-less advanced track (what an interaction pass can leave behind):
+       no bullets, no arrows, not loop-mode — settle must pin it back to home. */
+    .swiper { overflow: hidden; border-radius: 10px; margin-top: 32px; }
+    .swiper-wrapper { display: flex; }
+    .swiper-slide { flex: 0 0 100%; min-width: 100%; height: 120px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #fff; background: #ea580c; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Autoplay carousel</h1>
+
+    <div id="auto" class="splide" aria-roledescription="carousel" aria-label="Autoplay">
+      <div class="splide__track">
+        <ul class="splide__list">
+          <li class="splide__slide a0 is-active">Slide 1</li>
+          <li class="splide__slide a1">Slide 2</li>
+          <li class="splide__slide a2">Slide 3</li>
+          <li class="splide__slide a3">Slide 4</li>
+        </ul>
+      </div>
+      <ul class="splide__pagination">
+        <li><button class="splide__pagination__bullet is-active" aria-label="Go to slide 1"></button></li>
+        <li><button class="splide__pagination__bullet" aria-label="Go to slide 2"></button></li>
+        <li><button class="splide__pagination__bullet" aria-label="Go to slide 3"></button></li>
+        <li><button class="splide__pagination__bullet" aria-label="Go to slide 4"></button></li>
+      </ul>
+    </div>
+
+    <div id="stuck" class="swiper">
+      <div class="swiper-wrapper" style="transform: translateX(-100%);">
+        <div class="swiper-slide">A</div>
+        <div class="swiper-slide">B</div>
+        <div class="swiper-slide">C</div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      const root = document.getElementById("auto");
+      const list = root.querySelector(".splide__list");
+      const slides = [...root.querySelectorAll(".splide__slide")];
+      const bullets = [...root.querySelectorAll(".splide__pagination__bullet")];
+      let i = 0;
+      let paused = false;
+      const go = (n) => {
+        i = ((n % slides.length) + slides.length) % slides.length;
+        list.style.transform = "translateX(-" + (i * 100) + "%)";
+        slides.forEach((s, k) => s.classList.toggle("is-active", k === i));
+        bullets.forEach((b, k) => b.classList.toggle("is-active", k === i));
+      };
+      bullets.forEach((b, k) => b.addEventListener("click", () => go(k)));
+      // pause-on-hover, the Splide/Slick default this fixture mimics
+      root.addEventListener("mouseenter", () => { paused = true; });
+      root.addEventListener("mouseleave", () => { paused = false; });
+      window.__autoplayTicks = 0;
+      setInterval(() => { if (!paused) { window.__autoplayTicks++; go(i + 1); } }, 250);
+    })();
+  </script>
+</body>
+</html>

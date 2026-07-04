@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Placeholder styling</title>
+<style>
+  body { margin: 0; font-family: Arial, sans-serif; }
+  input.styled { color: rgb(10, 20, 30); font-size: 16px; }
+  input.styled::placeholder { color: rgb(120, 30, 200); font-size: 14px; }
+  textarea.styled::placeholder { color: rgb(5, 100, 5); }
+</style>
+</head>
+<body>
+  <input class="styled" type="email" placeholder="Enter your email">
+  <textarea class="styled" placeholder="Your message"></textarea>
+  <input class="plain" type="text" value="no placeholder here">
+</body>
+</html>
