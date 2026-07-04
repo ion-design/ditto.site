@@ -4,6 +4,7 @@ import type { InteractionCapture } from "../capture/interactions.js";
 import { buildRuntimeSpecs, specKey } from "../generate/interactive.js";
 import { buildMenuSpecs } from "../generate/menu.js";
 import type { GateResult } from "./gates.js";
+import { gotoAndSettle } from "./render.js";
 
 /**
  * Stage 4 interaction gate. Drives the SAME interactions in the built clone that
@@ -61,7 +62,10 @@ export async function driveInteractionGate(opts: {
     const ctx = await browser.newContext({ viewport: { width: vp, height: vh }, deviceScaleFactor: 1 });
     const page = await ctx.newPage();
     await page.addInitScript("globalThis.__name = globalThis.__name || ((fn) => fn);");
-    await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
+    // `load` + bounded network-quiet wait (not strict `networkidle`) so an autoplaying
+    // long hero video — which keeps issuing bounded range fetches — can't make navigation
+    // time out and fail the interaction gate before any interaction is even driven.
+    await gotoAndSettle(page, url);
     await page.waitForTimeout(300);
 
     const styleOf = (cid: string, props: string[]): Promise<Record<string, string> | null> =>

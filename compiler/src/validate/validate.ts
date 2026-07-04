@@ -122,6 +122,13 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
         motionGate = await driveMotionGate({ url: server.url + "/", viewports, ir, motion: capture.motion });
         log({ event: "motion_gate", pass: motionGate.pass, metrics: motionGate.metrics });
       }
+    } catch (e) {
+      // A render crash (e.g. a page.goto timeout on trickling media, or a Playwright fault)
+      // must NOT escape reportless — otherwise validation/ stays empty and the run looks
+      // un-validated. Record the error as a runtime error so httpStatus stays 0, gate 0 fails
+      // with a visible issue, and the normal downstream path writes report.json as usual.
+      runtimeErrors.push(`render error: ${e instanceof Error ? e.message : String(e)}`);
+      log({ event: "render_error", error: e instanceof Error ? e.message : String(e) });
     } finally {
       await server.close();
     }

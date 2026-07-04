@@ -146,6 +146,50 @@ async function readLimited(p: string): Promise<Buffer> {
   }
 }
 
+/** Result of interpreting a `Range` header against a known resource size.
+ *  - `kind: "full"`  → no (usable) Range header; answer with a normal 200 full body.
+ *  - `kind: "range"` → a single satisfiable `bytes=start-end`; answer 206 with [start,end].
+ *  - `kind: "unsatisfiable"` → a syntactically valid range wholly past EOF; answer 416. */
+export type RangeResolution =
+  | { kind: "full" }
+  | { kind: "range"; start: number; end: number }
+  | { kind: "unsatisfiable" };
+
+/** Parse a single-range HTTP `Range` header ("bytes=start-end", "bytes=start-",
+ *  "bytes=-suffix") against a resource of `size` bytes. Multi-range ("a-b,c-d") is
+ *  intentionally collapsed to a full 200 (Chromium's media element only ever asks for a
+ *  single range, and RFC 7233 lets a server ignore Range and reply 200). Anything the
+ *  spec calls malformed (missing "bytes=", non-numeric, inverted, both bounds empty) is
+ *  also treated as "full" — the safe fallback. A well-formed range that starts at or past
+ *  EOF is "unsatisfiable" → 416. `end` is inclusive and clamped to size-1. */
+export function parseRangeHeader(header: string | undefined, size: number): RangeResolution {
+  if (!header) return { kind: "full" };
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m) return { kind: "full" }; // absent/malformed/multi-range → serve full body
+  const startStr = m[1]!;
+  const endStr = m[2]!;
+  if (startStr === "" && endStr === "") return { kind: "full" }; // "bytes=-" is malformed
+  if (size <= 0) return { kind: "unsatisfiable" };
+  let start: number;
+  let end: number;
+  if (startStr === "") {
+    // Suffix range: "bytes=-N" → last N bytes.
+    const suffix = Number(endStr);
+    if (!Number.isFinite(suffix) || suffix <= 0) return { kind: "full" };
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(startStr);
+    if (!Number.isFinite(start)) return { kind: "full" };
+    if (start >= size) return { kind: "unsatisfiable" }; // start past EOF
+    end = endStr === "" ? size - 1 : Number(endStr);
+    if (!Number.isFinite(end)) return { kind: "full" };
+    if (end < start) return { kind: "full" }; // inverted → ignore Range
+    end = Math.min(end, size - 1);
+  }
+  return { kind: "range", start, end };
+}
+
 export function serveStatic(rootDir: string): Promise<{ url: string; close: () => Promise<void> }> {
   const server: Server = createServer(async (req, res) => {
     try {
@@ -168,8 +212,32 @@ export function serveStatic(rootDir: string): Promise<{ url: string; close: () =
         if (existsSync(fallback)) { res.writeHead(404, { "content-type": "text/html" }); res.end(await readLimited(fallback)); return; }
         res.writeHead(404); res.end("not found"); return;
       }
+      const contentType = CONTENT_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream";
+      const size = statSync(filePath).size;
+      // HTTP Range support (RFC 7233). Chromium requests <video>/<audio> with `Range: bytes=0-`
+      // and, absent a 206, holds the single progressive stream open throttled to playback — a
+      // long autoplay hero (76s) then means `waitUntil:"networkidle"` can mathematically never
+      // fire. Answering 206 with bounded chunks lets Chromium fetch in pieces so the network
+      // goes idle between reads. A HEAD-style range far past EOF gets a 416.
+      const range = parseRangeHeader(req.headers.range as string | undefined, size);
+      if (range.kind === "unsatisfiable") {
+        res.writeHead(416, { "content-type": contentType, "content-range": `bytes */${size}`, "accept-ranges": "bytes" });
+        res.end();
+        return;
+      }
       const data = await readLimited(filePath);
-      res.writeHead(200, { "content-type": CONTENT_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream" });
+      if (range.kind === "range") {
+        const chunk = data.subarray(range.start, range.end + 1);
+        res.writeHead(206, {
+          "content-type": contentType,
+          "content-range": `bytes ${range.start}-${range.end}/${size}`,
+          "accept-ranges": "bytes",
+          "content-length": String(chunk.length),
+        });
+        res.end(chunk);
+        return;
+      }
+      res.writeHead(200, { "content-type": contentType, "accept-ranges": "bytes", "content-length": String(data.length) });
       res.end(data);
     } catch {
       res.writeHead(500); res.end("error");
@@ -193,6 +261,54 @@ export type RenderResult = {
   httpStatus: number;
   failedResources: string[];
 };
+
+/** Navigate with `waitUntil:"load"` then wait for a bounded window of network quiet, so
+ *  validation NEVER hard-fails on media that trickles requests. `waitUntil:"networkidle"`
+ *  is a hard timeout: an autoplaying long video (even chunked via 206) keeps issuing bounded
+ *  range fetches, so a strict networkidle can miss its 500ms-idle window and throw at 45s,
+ *  leaving validation reportless. Instead we (1) `goto load` (fires on DOM+subresources, not
+ *  on ongoing media), then (2) poll for `maxQuietMs` of 500ms network silence up to a
+ *  `settleCapMs` ceiling, then proceed regardless. Normal pages reach quiet in well under a
+ *  second, so total time stays comparable; only trickle-media pages spend the extra budget and
+ *  then continue (the video is frame-0-normalized before the screenshot, so determinism holds).
+ *  Returns the goto response (for httpStatus). */
+export async function gotoAndSettle(
+  page: import("playwright").Page,
+  url: string,
+  opts?: { gotoTimeout?: number; settleCapMs?: number; quietMs?: number; pollMs?: number },
+): Promise<import("playwright").Response | null> {
+  const gotoTimeout = opts?.gotoTimeout ?? 45000;
+  const settleCapMs = opts?.settleCapMs ?? 10000;
+  const quietMs = opts?.quietMs ?? 500;
+  const pollMs = opts?.pollMs ?? 500;
+  const resp = await page.goto(url, { waitUntil: "load", timeout: gotoTimeout });
+  // Count in-flight requests so we can detect network quiet without relying on the
+  // strict networkidle heuristic (which throws on trickle-media).
+  let inflight = 0;
+  const onReq = (): void => { inflight++; };
+  const onDone = (): void => { inflight = Math.max(0, inflight - 1); };
+  page.on("request", onReq);
+  page.on("requestfinished", onDone);
+  page.on("requestfailed", onDone);
+  try {
+    const deadline = Date.now() + settleCapMs;
+    let quietSince = inflight === 0 ? Date.now() : 0;
+    while (Date.now() < deadline) {
+      if (inflight === 0) {
+        if (quietSince === 0) quietSince = Date.now();
+        if (Date.now() - quietSince >= quietMs) break; // sustained quiet reached
+      } else {
+        quietSince = 0;
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+  } finally {
+    page.off("request", onReq);
+    page.off("requestfinished", onDone);
+    page.off("requestfailed", onDone);
+  }
+  return resp;
+}
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
@@ -227,7 +343,7 @@ export async function renderApp(opts: {
         page.on("pageerror", (e) => runtimeErrors.push(String(e)));
         page.on("response", (r) => { if (r.status() >= 400) failedResources.add(`${r.status()} ${r.url()}`); });
         page.on("requestfailed", (r) => failedResources.add(`failed ${r.url()}`));
-        const resp = await page.goto(opts.url, { waitUntil: "networkidle", timeout: 45000 });
+        const resp = await gotoAndSettle(page, opts.url);
         if (resp) httpStatus = resp.status();
         try { await page.evaluate(() => (document as Document).fonts?.ready); } catch { /* ignore */ }
         // Scroll to settle any lazy effects, then back to top.
@@ -308,7 +424,7 @@ export async function measureProbeWidths(opts: { url: string; widths: number[] }
         const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: viewportHeight(w) }, deviceScaleFactor: 1 });
         const page = await ctx.newPage();
         await page.addInitScript(ESBUILD_SHIM);
-        await page.goto(opts.url, { waitUntil: "networkidle", timeout: 45000 });
+        await gotoAndSettle(page, opts.url);
         try { await page.evaluate(() => (document as Document).fonts?.ready); } catch { /* ignore */ }
         await page.evaluate(() => {
           const win = window as unknown as { __dittoMotionStopped?: boolean; __dittoMotionStop?: () => void };
