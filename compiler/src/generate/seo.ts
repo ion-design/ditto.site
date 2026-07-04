@@ -273,6 +273,15 @@ function iconUrl(icon: SeoInventory["icons"][number]): string {
   return icon.localPath || icon.href;
 }
 
+// Next validates metadata.openGraph.type against this fixed enum and THROWS at
+// render on anything else (e.g. Shopify's `product.group`). Unsupported values
+// are emitted via metadata.other instead so the tag survives without the crash.
+const NEXT_OG_TYPES = new Set([
+  "website", "article", "book", "profile",
+  "music.song", "music.album", "music.playlist", "music.radio_station",
+  "video.movie", "video.episode", "video.tv_show", "video.other",
+]);
+
 function metadataObject(report: SeoInventory): Record<string, unknown> {
   const metadata: Record<string, unknown> = { title: report.title || "Cloned Page" };
   if (report.description) metadata.description = report.description;
@@ -297,9 +306,13 @@ function metadataObject(report: SeoInventory): Record<string, unknown> {
   const ogSiteName = firstValue(ogEntries, "og:site_name");
   const ogUrl = firstValue(ogEntries, "og:url");
   const ogImages = ogEntries.filter((entry) => entry.property?.toLowerCase() === "og:image").map((entry) => entry.content);
+  const other: Record<string, string> = {};
   if (ogTitle) og.title = ogTitle;
   if (ogDescription) og.description = ogDescription;
-  if (ogType) og.type = ogType;
+  if (ogType) {
+    if (NEXT_OG_TYPES.has(ogType)) og.type = ogType;
+    else other["og:type"] = ogType;
+  }
   if (ogSiteName) og.siteName = ogSiteName;
   if (ogUrl) og.url = ogUrl;
   if (ogImages.length) og.images = ogImages;
@@ -335,6 +348,7 @@ function metadataObject(report: SeoInventory): Record<string, unknown> {
   }
   if (Object.keys(icons).length) metadata.icons = icons;
   if (report.manifest) metadata.manifest = report.manifest.localPath || report.manifest.href;
+  if (Object.keys(other).length) metadata.other = other;
   return metadata;
 }
 

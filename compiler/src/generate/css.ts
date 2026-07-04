@@ -91,6 +91,11 @@ const GENERIC: Array<{ prop: string; def: string | string[] }> = [
   { prop: "bottom", def: "auto" }, { prop: "left", def: "auto" },
   { prop: "float", def: "none" }, { prop: "clear", def: "none" },
   { prop: "zIndex", def: "auto" },
+  // visibility is INHERITED, so the parent-equality skip keeps descendants of a
+  // hidden subtree clean; without this entry a node hidden at the canonical
+  // viewport could never emit `visibility:hidden` at all (the only other path is
+  // per-band and gated on being shown at base).
+  { prop: "visibility", def: "visible" },
   { prop: "opacity", def: "1" }, { prop: "isolation", def: "auto" },
   { prop: "mixBlendMode", def: "normal" },
   { prop: "minWidth", def: ["0px", "auto"] }, { prop: "maxWidth", def: "none" },
@@ -289,7 +294,7 @@ function isFluidFillItem(node: IRNode, layoutParent: IRNode | undefined, viewpor
  *  captured viewport (so gates 0–6, measured only at those widths, are unmoved) yet scales
  *  fluidly everywhere else — the same generalisation `isFluidFullBleed` already applies to
  *  full-viewport elements, extended to "fills/centres within its container". */
-export type WidthPlan = { kind: "fixed" } | { kind: "auto" } | { kind: "percent"; pct: string } | { kind: "percentVp"; pctByVp: Record<number, string> } | { kind: "flexfill" } | { kind: "fill" } | { kind: "fillcap"; cap: string } | { kind: "basis"; px: string };
+export type WidthPlan = { kind: "fixed" } | { kind: "auto" } | { kind: "percent"; pct: string } | { kind: "percentVp"; pctByVp: Record<number, string> } | { kind: "flexfill" } | { kind: "fill" } | { kind: "fillcap"; cap: string } | { kind: "basis"; px: string } | { kind: "basisFull" };
 const PLAN_FIXED: WidthPlan = { kind: "fixed" };
 
 const pf = (v: string | undefined): number => { const n = parseFloat(v ?? ""); return Number.isFinite(n) ? n : 0; };
@@ -525,6 +530,35 @@ function gridAutoTrackMask(node: IRNode, vps: number[], count: number): boolean[
 }
 
 function fluidGridColumns(node: IRNode, viewports: number[]): Map<number, string> | null {
+  // A SINGLE fixed-px grid track that FILLS its container at every sampled viewport is a full-bleed
+  // fill column baked as `grid-cols-[Npx]` (a full-viewport hero carousel `uwp-carousel` with one
+  // track = the viewport width, re-baked per breakpoint). It freezes at the nearest band's px, so the
+  // grid — and everything it lays out — over-widens at any unsampled width (the splide02 hero measuring
+  // 768px inside a 572px window: the whole hero subtree inherits the frozen track). Re-express the lone
+  // track as `minmax(0,1fr)` (fills, reproduces the captured px exactly — gate-neutral). This is proven
+  // purely from the box geometry (track == content), so it is safe even on a REPLACED/custom-element
+  // grid, which the general solver below (it walks children) correctly still skips.
+  {
+    const filled: { vp: number; content: number }[] = [];
+    for (const vp of viewports) {
+      const cs = node.computedByVp[vp]; const nb = node.bboxByVp[vp];
+      if (!cs || !nb) continue;
+      if (!/^(grid|inline-grid)$/.test(cs.display || "")) continue;
+      const tracks = parseTracks(cs.gridTemplateColumns);
+      if (!tracks || tracks.length !== 1) { filled.length = 0; break; }        // must be single-track at EVERY grid vp
+      const gap = pf(cs.columnGap && cs.columnGap !== "normal" ? cs.columnGap : cs.gap);
+      if (gap !== 0) { filled.length = 0; break; }
+      const content = nb.width - pf(cs.paddingLeft) - pf(cs.paddingRight) - pf(cs.borderLeftWidth) - pf(cs.borderRightWidth);
+      if (content <= 0) { filled.length = 0; break; }
+      if (Math.abs(tracks[0]! - content) > Math.max(1.5, 0.01 * content)) { filled.length = 0; break; } // track must FILL
+      filled.push({ vp, content });
+    }
+    if (filled.length >= 2) {
+      const m = new Map<number, string>();
+      for (const f of filled) m.set(f.vp, "minmax(0, 1fr)");
+      return m;
+    }
+  }
   if (REPLACED.has(node.tag) || node.tag.includes("-")) return null;
   type S = { vp: number; tracks: number[]; gap: number; content: number };
   // Replace a solved template's fixed `Npx` tracks with `auto` where the column provably sizes to its
@@ -580,10 +614,17 @@ function fluidGridColumns(node: IRNode, viewports: number[]): Map<number, string
   for (const s of perVp) { const c = s.tracks.length; const g = byCount.get(c); if (g) g.push(s); else byCount.set(c, [s]); }
   const result = new Map<number, string>();
   for (const [count, samples] of byCount) {
-    // Every sample in the regime has ~equal tracks ⇒ a clean `repeat(N, 1fr)`. (1fr divides the
+    // Every sample in the regime has ~equal tracks ⇒ a candidate `repeat(N, 1fr)`. (1fr divides the
     // container content evenly, reproducing the equal baked px at each captured width.)
     const allEqual = samples.every((s) => Math.max(...s.tracks) - Math.min(...s.tracks) <= Math.max(1.5, 0.02 * Math.max(...s.tracks)));
-    const tmpl = allEqual ? `repeat(${count}, minmax(0, 1fr))` : (samples.length >= 2 ? frTemplate(samples, count) : null);
+    // `repeat(N,1fr)` divides the CONTAINER content among the tracks — valid only when the tracks +
+    // gaps actually FILL the container (the same fill law frTemplate enforces before solving an fr
+    // model). A fixed-track scrolling list (`overflow-x:auto` with `grid-cols-[173.5px…]` × 50 summing
+    // to 8675px inside a 1066px container) has equal tracks too, but rewriting it as `repeat(50,1fr)`
+    // shrinks every slide to viewport/50 and kills the horizontal scroll. When the equal tracks
+    // OVERFLOW the container, keep the baked fixed-px template (fall through, leaving these vps unset).
+    const fillsContainer = samples.every((s) => Math.abs(s.tracks.reduce((a, b) => a + b, 0) + (count - 1) * s.gap - s.content) <= Math.max(2, 0.01 * s.content));
+    const tmpl = (allEqual && fillsContainer) ? `repeat(${count}, minmax(0, 1fr))` : (samples.length >= 2 ? frTemplate(samples, count) : null);
     if (tmpl) { const t2 = withAuto(tmpl, samples); for (const s of samples) result.set(s.vp, t2); continue; }
     // Rescue a MIXED-track regime where frTemplate bailed only because the column PROPORTIONS
     // change at a breakpoint — the ridge footer signup grid is 70/30 (`2.333fr 1fr`) at ≥768 but
@@ -903,6 +944,90 @@ function isFlexFillItem(node: IRNode, parentNode: IRNode | undefined, viewports:
     widths.push(pf(cs.width));
   }
   return widths.length >= 2 && Math.max(...widths) - Math.min(...widths) > 8;
+}
+
+/** A CIRCULAR-DEPENDENCY flex/grid item whose width has NO in-flow source and would collapse to 0.
+ *
+ *  A Splide (and similar JS carousel) slide is a `shrink-0` flex item whose width is set only by the
+ *  library's INJECTED inline `width:Npx`. The sizing probe therefore reads it as content/fill-sized
+ *  (`wAuto`/`wFill` both true), so generation drops the width. But the slide's only in-flow children
+ *  FILL it (`w-full h-full`, often `aspect-square`) — they take their width FROM the slide. With the
+ *  slide's width dropped and every child filling, nothing establishes a definite width: the slide, the
+ *  fill children, and the track all resolve to 0×0 (the "Explore Our Oven Range" carousel collapsing
+ *  to a −640px hole).
+ *
+ *  Detect exactly that circular case and pin the captured px so the fill children have a definite basis:
+ *    - the node is an IN-FLOW flex or grid ITEM with `flex-shrink:0` (a carousel slide, never shrinks),
+ *    - it has a definite positive captured width at every painted viewport,
+ *    - it has NO in-flow width source: every in-flow ELEMENT child either FILLS it
+ *      (probe `wFill && !wAuto` → width derives from the slide) or is absolutely/fixed positioned,
+ *      and at least one such fill child exists (the thing that would collapse).
+ *  Requires probe data (older captures return false → inert). Scoped hard so it fires only on the
+ *  genuine circular collapse, never on a normal content-sized shrink-0 item. */
+function isCircularShrinkSlide(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
+  if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return false;
+  let painted = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp]; const nb = node.bboxByVp[vp];
+    if (!cs || !pcs || !nb) continue;
+    if (!node.visibleByVp[vp] || (cs.display || "") === "none") continue; // judge only where painted
+    if (!/^(flex|inline-flex|grid|inline-grid)$/.test(pcs.display || "")) return false; // parent must lay it out as a flex/grid item
+    const pos = cs.position || "static";
+    if (pos !== "static" && pos !== "relative") return false;               // in-flow item only
+    if ((cs.float || "none") !== "none") return false;
+    if (pf(cs.flexShrink) !== 0) return false;                              // a slide is shrink-0 (never collapses to content)
+    if (!(nb.width > 0) || !(pf(cs.width) > 0)) return false;               // need a definite captured px to pin
+    // No in-flow width source: every in-flow element child fills the slide (its width derives from the
+    // slide) or is out of flow; at least one fill child must exist (else nothing collapses).
+    let fillChildren = 0;
+    for (const c of node.children) {
+      if (isTextChild(c)) continue;
+      const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
+      if (!ccs || !cb || !c.visibleByVp[vp] || (ccs.display || "") === "none") continue;
+      const cpos = ccs.position || "static";
+      if (cpos === "absolute" || cpos === "fixed") continue;                // out of flow → no width contribution
+      const csz = c.sizingByVp?.[vp];
+      if (csz && csz.wFill === true && csz.wAuto === false) { fillChildren++; continue; } // fills the slide → derives width from it
+      return false;                                                         // a genuine in-flow width source → not circular
+    }
+    if (fillChildren === 0) return false;
+    painted++;
+  }
+  return painted >= 1;
+}
+
+/** A FULL-WIDTH carousel slide: a `shrink-0` flex-ROW item whose border box FILLS its flex
+ *  container's content width at every painted viewport (a full-viewport hero slide in a Splide list;
+ *  the slides sit side by side and the track clips via overflow). The naive emission `width:100%` on
+ *  a `shrink-0` flex item does NOT stay at 100%: flex sizes the item from its MAX-CONTENT (the
+ *  shrink-0 item can't drop below it), and a full-bleed slide's max-content (its absolutely-positioned
+ *  aspect-ratio media) freezes the whole list wider than the container at any unsampled width (the
+ *  splide02 hero list measuring 768px inside a 572px window). Emitting `flex-basis:100%` gives the
+ *  slide a DEFINITE main size = the container content width, so the flex row stays exactly one
+ *  container wide at every width (gate-neutral at samples, correct in between). Distinct from
+ *  isCircularShrinkSlide (a FIXED-width sub-container slide that pins its captured px). */
+function isFullWidthShrinkSlide(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
+  if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return false;
+  let painted = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp];
+    const nb = node.bboxByVp[vp]; const pb = parentNode.bboxByVp[vp];
+    if (!cs || !pcs || !nb || !pb) continue;
+    if (!node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    if (!/^(flex|inline-flex)$/.test(pcs.display || "")) return false;       // flex parent
+    const dir = pcs.flexDirection || "row";
+    if (dir !== "row" && dir !== "row-reverse") return false;                // width is the main axis
+    const pos = cs.position || "static";
+    if (pos !== "static" && pos !== "relative") return false;
+    if ((cs.float || "none") !== "none") return false;
+    if (pf(cs.flexShrink) !== 0) return false;                              // a slide is shrink-0
+    if (pf(cs.marginLeft) !== 0 || pf(cs.marginRight) !== 0) return false;   // margins make the width load-bearing
+    if ((cs.boxSizing || "border-box") === "content-box") return false;     // basis:100% would overflow by padding
+    const content = pb.width - pf(pcs.paddingLeft) - pf(pcs.paddingRight) - pf(pcs.borderLeftWidth) - pf(pcs.borderRightWidth);
+    if (Math.abs(nb.width - content) > 1.5) return false;                    // must actually FILL the flex container
+    painted++;
+  }
+  return painted >= 1;
 }
 
 /** A flex/grid ITEM whose border box fills its container's content width at every viewport —
@@ -1867,6 +1992,12 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
     // child's trailing margin-bottom, because whether that margin extends the box (height includes
     // it) or collapses through depends on the box; we accept the box if its height matches EITHER.
     let bottom = nb.y + pf(cs.paddingTop) + pf(cs.borderTopWidth); let bottomMargin = bottom; let hasChild = false;
+    // Are ALL in-flow element children FILL children (height:100% / probe hFill) whose height DERIVES
+    // from THIS box? Then their extent reaching the box bottom is not content evidence — it is the
+    // box's own authored height reflected back (a `h-full aspect-video` hero image inside a fixed-height
+    // header). Dropping the height then lets the fill child re-derive from its aspect ratio and inflate
+    // (a 240px hero → 720px @16/9). Do NOT flow such a box's height.
+    let allInflowFill = true;
     for (const c of node.children) {
       if (isTextChild(c)) continue;
       const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
@@ -1874,9 +2005,15 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
       if (ccs.position === "absolute" || ccs.position === "fixed") continue;
       if ((ccs.float || "none") !== "none") continue;
       hasChild = true;
+      const csz = c.sizingByVp?.[vp];
+      if (!(csz && csz.hFill === true && csz.hAuto === false)) allInflowFill = false;
       bottom = Math.max(bottom, cb.y + cb.height);
       bottomMargin = Math.max(bottomMargin, cb.y + cb.height + Math.max(0, pf(ccs.marginBottom)));
     }
+    // Authored height whose only in-flow children fill it (circular): keep the height (don't flow).
+    // Guarded by the parent's own probe: hAuto===false means auto did NOT reproduce the box → real
+    // authored height, not a content coincidence.
+    if (hasChild && allInflowFill && node.sizingByVp?.[vp]?.hAuto === false) return false;
     const pad = pf(cs.paddingBottom) + pf(cs.borderBottomWidth);
     const contentH = bottom - nb.y + pad; const contentHMargin = bottomMargin - nb.y + pad;
     // Content-driven when the box is exactly its in-flow children's extent — with OR without their
@@ -2092,6 +2229,18 @@ function declsForViewport(
   const ov = cs.overflowY || cs.overflow || "visible";
   const parentDisp = parentComputed?.display || "";
   const isFlexGridItem = /flex|grid/.test(parentDisp);
+  // A chip in a horizontally-scrollable flex strip (an overflow-x:auto/scroll flex parent) relies on
+  // the CSS default `min-width:auto` to stay at its content width so the strip scrolls. The base
+  // viewport can report `min-width:0px` on such an item (e.g. a mobile-only strip collapsed to 0 at
+  // desktop), which would emit `min-w-0` and let the item shrink below its content — collapsing the
+  // strip and colliding its nowrap text. Suppress `min-w-0` for a nowrap flex item whose flex parent
+  // scrolls horizontally. This is scoped away from legitimate `min-w-0` truncation (overflow:hidden +
+  // ellipsis on the item itself, whose parent does NOT scroll-x), so it is safe.
+  const parentOverflowX = parentComputed ? (parentComputed.overflowX || parentComputed.overflow || "visible") : "visible";
+  const inScrollXFlexStrip =
+    /flex/.test(parentDisp) &&
+    /^(auto|scroll)$/.test(parentOverflowX) &&
+    (cs.whiteSpace || "normal") === "nowrap";
   const isLeaf = !hasElementChild(node);
   const hasText = node.children.some((c) => isTextChild(c) && c.text.trim() !== "");
   const isTextLeaf = isLeaf && hasText && !REPLACED.has(tag) && tag !== "canvas" && !tag.includes("-");
@@ -2110,6 +2259,9 @@ function declsForViewport(
   // The band-delta machinery collapses equal neighbours, so equal regimes emit a single rule.
   else if (widthPlan.kind === "percentVp") { const p = widthPlan.pctByVp[vp]; if (p) out.set("width", p); }
   else if (widthPlan.kind === "flexfill") { out.set("flex-grow", "1"); out.set("flex-basis", "0%"); }
+  // A full-width shrink-0 carousel slide: definite main size = container content width, so the flex
+  // row stays exactly one container wide (no max-content over-widening). Keeps flex-shrink:0 (source).
+  else if (widthPlan.kind === "basisFull") { out.set("flex-basis", "100%"); out.set("flex-shrink", "0"); }
   // A flex-line item's RECOVERED natural width (its flex base size), emitted as a constant at
   // every viewport so the captured per-viewport px collapse to one value — flex-grow/shrink then
   // re-derives the resolved widths. Verified to reproduce every sample before being chosen.
@@ -2147,6 +2299,11 @@ function declsForViewport(
     let contentBottom = top;       // includes trailing margins (for taller detection)
     let borderBottom = top;        // border-box extent only (for overflow detection)
     let inflowCount = 0;
+    // Are ALL the in-flow element children fill children whose height DERIVES from this
+    // node (height:100% / probe hFill)? If so their measured extent equals this box's
+    // height only BECAUSE they fill it — it is not content-derived evidence, so it must
+    // not be allowed to "explain away" an authored height below.
+    let allInflowFill = true;
     for (const c of node.children) {
       if (isTextChild(c)) continue;
       const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
@@ -2157,6 +2314,10 @@ function declsForViewport(
       if (ccs.position === "absolute" || ccs.position === "fixed") continue;
       if ((ccs.float || "none") !== "none") continue;
       inflowCount++;
+      const csz = c.sizingByVp?.[vp];
+      // A fill child: the probe measured height:100% reproduces AND auto does not (hFill && !hAuto).
+      // No probe data (older captures) ⇒ treat as real content (conservative: leave allInflowFill off).
+      if (!(csz && csz.hFill === true && csz.hAuto === false)) allInflowFill = false;
       contentBottom = Math.max(contentBottom, cb.y + cb.height + (parseFloat(ccs.marginBottom || "0") || 0));
       borderBottom = Math.max(borderBottom, cb.y + cb.height);
     }
@@ -2164,6 +2325,13 @@ function declsForViewport(
     const contentHeight = contentBottom - nb.y + padBottom;
     if (nb.height > contentHeight + 2) explicitHeight = true;
     if (inflowCount === 0 && nb.height > 2) explicitHeight = true;
+    // Authored height whose only in-flow children FILL it (height:100%). The child extent measured
+    // the parent's own height back at it (circular), so the "taller than content" test above can never
+    // fire — yet dropping the height lets each fill child re-derive its height from content/aspect
+    // (a `h-full aspect-video` child then resolves 16/9 of its width, inflating a 240px hero to 720px).
+    // Keep the authored height so the fill chain has a definite basis. Probe hFill (not `!hAuto` on the
+    // parent) is the guard: hAuto:false on the parent means auto did NOT reproduce, i.e. real authored.
+    if (inflowCount > 0 && allInflowFill && node.sizingByVp?.[vp]?.hAuto === false && nb.height > 2) explicitHeight = true;
     // Overflow case: the box is meaningfully SHORTER than its in-flow content's
     // border boxes. Content cannot shrink a box below its own size, so the height
     // is authored (e.g. html,body{height:100%} with overflowing content). Compare
@@ -2261,7 +2429,16 @@ function declsForViewport(
   }
 
   const hasTransform = cs.transform && cs.transform !== "none";
-  const hasAnimation = cs.animationName && cs.animationName !== "none";
+  // A scroll/view-timeline-driven animation reports its resolved `animation-duration` as
+  // `auto` (the duration is derived from the timeline range, not a time). The clone has no
+  // scroll timeline, so emitting such an animation makes it jump straight to its END keyframe
+  // (`fill-mode:both` + a 0s time-based duration), freezing the element at the fully-progressed
+  // state (e.g. a scroll-linked text-fill stuck 100% filled). We do NOT replay scroll-linked
+  // animations; the goal is the correct AT-REST render. So suppress the animation-* props for
+  // an animation whose duration is `auto`, and let the captured static properties (now recorded
+  // at-rest, scroll reset + timeline animations canceled before the snapshot) stand.
+  const isScrollTimelineAnim = (cs.animationDuration || "").split(",").some((d) => d.trim() === "auto");
+  const hasAnimation = cs.animationName && cs.animationName !== "none" && !isScrollTimelineAnim;
 
   for (const { prop, def } of GENERIC) {
     const value = cs[prop];
@@ -2297,7 +2474,7 @@ function declsForViewport(
       if (!/^(ul|ol|li|menu)$/.test(tag)) continue;
       // list reset is none; emit whatever the source uses (incl. none).
     } else if (prop === "minWidth") {
-      if (value === "auto" || (value === "0px" && !isFlexGridItem)) continue;
+      if (value === "auto" || (value === "0px" && !isFlexGridItem) || (value === "0px" && inScrollXFlexStrip)) continue;
     } else if (def === "__never__") {
       // always emit (display/color/fontFamily/fontSize handled below for inherit)
     } else if (isDefault(def, value)) {
@@ -2305,7 +2482,14 @@ function declsForViewport(
     }
 
     // Inherited: skip when equal to parent's value (inheritance handles it).
-    if (INHERITED.has(prop) && parentComputed && parentComputed[prop] === value) continue;
+    // Exception: the reset (`ul, ol, menu { list-style: none; }`) breaks the list-marker
+    // inheritance chain on those tags, so parent-equality is not a safe elision there —
+    // a source <ul> with `disc` equals its parent's initial `disc` yet must still emit
+    // or the reset erases the markers. <li> inherits from the ul, which now emits.
+    if (INHERITED.has(prop) && parentComputed && parentComputed[prop] === value) {
+      const listMarkerReset = (prop === "listStyleType" || prop === "listStylePosition") && /^(ul|ol|menu)$/.test(tag);
+      if (!listMarkerReset) continue;
+    }
 
     let outValue = value;
     if (prop === "backgroundImage" || prop === "maskImage" || prop === "filter" || prop === "clipPath") {
@@ -2586,7 +2770,41 @@ function pseudoDecls(style: StyleMap, assetMap: Map<string, string>): Map<string
 // the grouped class produces identical computed styles (fidelity-neutral).
 export type BandRule = { media: string; decls: Map<string, string> };
 export type PseudoRule = { base: Map<string, string>; bands: BandRule[] };
-export type NodeRule = { base: Map<string, string>; bands: BandRule[]; before?: PseudoRule; after?: PseudoRule };
+export type NodeRule = { base: Map<string, string>; bands: BandRule[]; before?: PseudoRule; after?: PseudoRule; placeholder?: PseudoRule };
+
+/** ::placeholder declarations for a form control. Color always emits (the UA default is
+ *  its own gray, NOT inherited from the input, so equality with the host proves nothing);
+ *  font/spacing props DO inherit from the input inside the pseudo, so they emit only when
+ *  they differ from the host's own computed value. */
+function placeholderDecls(style: StyleMap, host: StyleMap | undefined): Map<string, string> {
+  const decls = new Map<string, string>();
+  if (style.color) decls.set("color", style.color);
+  if (style.opacity && style.opacity !== "1") decls.set("opacity", style.opacity);
+  for (const prop of ["fontFamily", "fontSize", "fontWeight", "fontStyle", "letterSpacing", "textTransform"]) {
+    const v = style[prop];
+    if (!v || (host && host[prop] === v)) continue;
+    decls.set(kebab(prop), v);
+  }
+  return decls;
+}
+
+/** Banded ::placeholder rule (mirrors collectPseudoRule's base+delta shape). */
+function collectPlaceholderRule(styleByVp: Record<number, StyleMap>, hostByVp: Record<number, StyleMap>, baseVp: number, bands: Band[], tokenResolver?: TokenResolver): PseudoRule | undefined {
+  const baseStyle = styleByVp[baseVp] ?? Object.values(styleByVp)[0];
+  if (!baseStyle) return undefined;
+  const out: PseudoRule = { base: finalizeDecls(placeholderDecls(baseStyle, hostByVp[baseVp]), tokenResolver), bands: [] };
+  for (const b of bands) {
+    if (!b.media) continue;
+    const st = styleByVp[b.vp];
+    if (!st) continue; // control not rendered at this width — the host rule already hides it
+    const vpDecls = finalizeDecls(placeholderDecls(st, hostByVp[b.vp]), tokenResolver);
+    const delta = new Map<string, string>();
+    for (const [k, v] of vpDecls) if (out.base.get(k) !== v) delta.set(k, v);
+    for (const [k] of out.base) if (!vpDecls.has(k)) delta.set(k, resetValue(k));
+    if (delta.size > 0) out.bands.push({ media: b.media, decls: delta });
+  }
+  return out.base.size > 0 ? out : undefined;
+}
 
 /** Collect a pseudo-element's banded rule (its size/position can be responsive —
  * e.g. flex spacer pseudo-elements in horizontal scrollers). `hostContentWidthByVp`
@@ -2804,7 +3022,15 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // track. A `flex gap w-1/3` equal-fill row item: re-express as flex:1 1 0 so it scales.
     const gridFill = isGridItemFill(node, parentNode, sampleVps);
     const flexFill = !gridFill && isFlexFillItem(node, parentNode, sampleVps);
-    const fillsContainer = !gridFill && !flexFill && isFillsContainerWidth(node, parentNode, sampleVps);
+    // A carousel slide (`shrink-0` flex/grid item) whose width was set only by the library's injected
+    // inline px and whose children all FILL it → the probe reads it as fill/content and drops the
+    // width, collapsing the slide + its fill children + the track to 0×0. Pin the captured px so the
+    // fill chain has a definite basis. Wins over the probe/fill detectors below (it IS the width source).
+    const circularSlide = !isContents && !gridFill && !flexFill && isCircularShrinkSlide(node, parentNode, sampleVps);
+    // A full-VIEWPORT-width shrink-0 carousel slide → flex-basis:100% (definite main size) instead of
+    // width:100%, so the flex row can't over-widen from the slide's max-content (the splide02 hero).
+    const fullWidthSlide = !isContents && !gridFill && !flexFill && !circularSlide && isFullWidthShrinkSlide(node, parentNode, sampleVps);
+    const fillsContainer = !gridFill && !flexFill && !circularSlide && !fullWidthSlide && isFillsContainerWidth(node, parentNode, sampleVps);
     const replacedFill = replacedFillsContainer(node, parentNode, sampleVps); // an img/video filling its cell → w-full
     const sourceFill = sourceWidthFillIntent(node);
     // A full-bleed banner image (width ≈ viewport, grows) baked to per-vp px → w-full so it keeps
@@ -2818,6 +3044,18 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const blockFill = !gridFill && !flexFill && !fillsContainer && !maxWidthFill && fillsBlockContainer(node, parentNode, sampleVps);
     // An absolute box pinned by both left+right insets → drop width (auto stretches between them).
     const insetSpanned = !isContents && insetSpannedAbsolute(node, parentNode, sampleVps);
+    // If that inset-spanned box ALSO carries an authored aspect-ratio (a full-bleed hero slide:
+    // `absolute inset-x-0 aspect-video min-h-[…]`), `width:auto` does NOT stay pinned to the insets:
+    // with a definite height (min-height) and a definite aspect-ratio, the width BACK-COMPUTES from
+    // height × aspect and over-widens at any width the capture didn't sample (the splide02 hero
+    // measuring 768/641px wide inside a 572px window — the responsive full-bleed violations). Emit an
+    // explicit `width:100%` instead: it fills the containing block (identical to the inset-0 span at
+    // every sampled width, gate-neutral) and, being definite, WINS the width axis so the aspect-ratio
+    // drives only the height. Scoped to inset-spanned boxes that actually have an aspect-ratio.
+    const insetSpannedAspect = insetSpanned && sampleVps.some((vp) => {
+      const ar = node.computedByVp[vp]?.aspectRatio;
+      return !!ar && ar !== "auto" && node.visibleByVp[vp];
+    });
     // Combine: the full-bleed chain wins (it proved the box spans the viewport), then grid/flex
     // fill, then "fills its container" / "fills under a max-width cap" (→ width:100%), then the
     // inferred generalisations.
@@ -2845,6 +3083,9 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const widthPlan: WidthPlan =
       fillCap ? { kind: "fillcap", cap: fillCap }
       : sourceFixedSize ? inferred.plan
+      : circularSlide ? { kind: "fixed" }
+      : fullWidthSlide ? { kind: "basisFull" }
+      : insetSpannedAspect ? { kind: "fill" }
       : probe === "auto" ? { kind: "auto" }
       : probe === "fill" ? { kind: "fill" }
       : (!lockWidth && autoWidthFlex.has(node.id)) ? { kind: "auto" }
@@ -2940,23 +3181,67 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       // Node was not in the observed DOM at this width (responsive conditional
       // rendering): hide it so the clone matches the source at this viewport.
       if (!node.computedByVp[b.vp]) { nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) }); continue; }
-      // The node isn't PAINTED at this width — either it goes `display:none` itself, or an ancestor
-      // hides the whole subtree. Its box renders nothing, so any width/height/inset/padding override
-      // here is invisible: pure breakpoint noise. Emit ONLY the hide, and only when the node ITSELF
-      // is the one turning off (was shown at base); if an ancestor hides it, emit nothing at all —
-      // that ancestor's own `display:none` already removes this node with it.
-      const ownNone = (node.computedByVp[b.vp]?.display || "") === "none";
-      if (ownNone || !node.visibleByVp[b.vp]) {
-        const shownAtBase = node.visibleByVp[baseVp] && (node.computedByVp[baseVp]?.display || "") !== "none";
-        if (ownNone && shownAtBase) nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
-        else if (shownAtBase) {
-          const vpCs = node.computedByVp[b.vp];
-          const hide = new Map<string, string>();
-          if (vpCs && pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
-          if (vpCs && /^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
-          if (hide.size) nr.bands.push({ media: b.media, decls: hide });
+      // The node isn't PAINTED at this width. HOW it is hidden decides what to emit, because only
+      // `display:none` takes the box out of layout — a `visibility:hidden` box still occupies space
+      // and can extend the scrollable area. The base rule bakes CANONICAL geometry unconditionally,
+      // so skipping every override here can park e.g. a desktop `left:548px` slider arrow inside a
+      // 375px viewport: invisible, but +210px of sideways scroll.
+      const vpCs = node.computedByVp[b.vp]!;
+      const ownNone = (vpCs.display || "") === "none";
+      // The node ITSELF is visibility:hidden here (its parent isn't → not inherited from an
+      // ancestor whose own rule already carries the hide).
+      const ownHidden = !ownNone && /^(hidden|collapse)$/.test(vpCs.visibility || "") &&
+        !/^(hidden|collapse)$/.test(parentNode?.computedByVp[b.vp]?.visibility || "");
+      if (ownHidden) {
+        const bb = node.bboxByVp[b.vp];
+        if (!bb || bb.width <= 0 || bb.height <= 0) {
+          // The hidden box occupied NOTHING in the capture (0×0 — e.g. an uninitialised swiper
+          // arrow collapsed by its container). `display:none` reproduces "invisible, takes no
+          // space" exactly and guarantees it cannot extend scroll bounds at this width.
+          nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+          continue;
         }
-        continue;
+        // Non-zero bbox: the invisible box occupies real layout space. Fall through to the normal
+        // per-viewport delta so it sits where the capture measured it at THIS width — not at the
+        // canonical geometry the base rule baked. The hide itself rides along in the delta
+        // (declsForViewport emits `visibility:hidden`; parent-equality keeps it own-only).
+      } else if (ownNone || !node.visibleByVp[b.vp]) {
+        const shownAtBase = node.visibleByVp[baseVp] && (node.computedByVp[baseVp]?.display || "") !== "none";
+        // Hidden by an ANCESTOR's visibility here AND at base (the ancestor's own rule carries
+        // the hide at every width) — but a visibility:hidden box still PARTICIPATES in layout,
+        // and the base rule bakes CANONICAL geometry. Same policy as the own-hidden path above:
+        // a 0x0 box gets display:none; an occupying box falls through to the per-viewport delta
+        // so it sits where the capture measured it at THIS width — not parked at e.g. a desktop
+        // left:548px inside a 375px viewport (the cropin.com/cotton slider arrow, +210px of
+        // sideways scroll at 375 with the hide inherited from an elementor-widget ancestor).
+        const ancestorHiddenHere = !ownNone && /^(hidden|collapse)$/.test(vpCs.visibility || "");
+        if (ancestorHiddenHere && !shownAtBase) {
+          const bb = node.bboxByVp[b.vp];
+          if (!bb || bb.width <= 0 || bb.height <= 0) {
+            nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+            continue;
+          }
+          // Occupying: fall through to the normal per-viewport delta below.
+        } else {
+          if (ownNone) {
+            // Own display:none removes the box from layout entirely. Emit the hide even when the node
+            // is ALSO hidden at base — a visibility:hidden base still bakes an OCCUPYING box (see
+            // above), so without this band the canonical geometry would render at this width. Skip
+            // only when the base itself is display:none (the band would be redundant).
+            if ((node.computedByVp[baseVp]?.display || "") !== "none") {
+              nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+            }
+          } else if (shownAtBase) {
+            // Hidden by an ancestor (or zero-size / opacity:0) but visible at base: geometry
+            // overrides are breakpoint noise — the ancestor's own hide (or the reveal replay,
+            // for scroll-reveal opacity) covers it. Emit only the hide the node itself carries.
+            const hide = new Map<string, string>();
+            if (pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
+            if (/^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
+            if (hide.size) nr.bands.push({ media: b.media, decls: hide });
+          }
+          continue;
+        }
       }
       const centeredVp = stableCenter || (layoutParent ? centeredAtVp(node, layoutParent, b.vp) : false);
       const vpDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[b.vp], b.vp, assetMap, centeredVp, colorVar, ir.doc.perViewport[b.vp]?.scrollHeight, widthPlan, gridColsByVp?.get(b.vp), gridRowsByVp?.get(b.vp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth), tokenResolver);
@@ -2997,6 +3282,9 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
         nr.after = collectPseudoRule(node.afterByVp, baseVp, bands, assetMap, tokenResolver, hostCW, padW, padH);
       }
     }
+    if (node.placeholderByVp) {
+      nr.placeholder = collectPlaceholderRule(node.placeholderByVp, node.computedByVp, baseVp, bands, tokenResolver);
+    }
     rules.set(node.id, nr);
 
     for (const c of node.children) if (!isTextChild(c)) walk(c, node, childFluid, childLayoutParent, childCb, childDefiniteHeight);
@@ -3026,9 +3314,11 @@ export function assembleCss(
     if (nr.base.size > 0) baseRules.push(formatRule(sel, nr.base));
     if (nr.before) baseRules.push(formatRule(`${sel}::before`, nr.before.base));
     if (nr.after) baseRules.push(formatRule(`${sel}::after`, nr.after.base));
+    if (nr.placeholder) baseRules.push(formatRule(`${sel}::placeholder`, nr.placeholder.base));
     for (const b of nr.bands) bandRules.get(b.media)?.push(formatRule(sel, b.decls));
     if (nr.before) for (const b of nr.before.bands) bandRules.get(b.media)?.push(formatRule(`${sel}::before`, b.decls));
     if (nr.after) for (const b of nr.after.bands) bandRules.get(b.media)?.push(formatRule(`${sel}::after`, b.decls));
+    if (nr.placeholder) for (const b of nr.placeholder.bands) bandRules.get(b.media)?.push(formatRule(`${sel}::placeholder`, b.decls));
   }
   const parts: string[] = [];
   if (keyframes) parts.push(keyframes);

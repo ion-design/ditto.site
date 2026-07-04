@@ -96,11 +96,9 @@ export function materializeAssets(graph: AssetGraph, sourceDir: string, appPubli
   for (const e of graph.entries) {
     if (e.classification !== "downloaded" || !e.storedFile || !e.localPath) continue;
     if (e.type === "css") continue; // not served by the app
-    // A <video> is rendered as its poster still (streaming sources are dropped in
-    // generation), so the materialized video file is never referenced — skip
-    // copying it to public/ to save disk and build time. Its first-frame poster is
-    // a separate image asset that is still materialized.
-    if (e.type === "video") continue;
+    // Video files ARE copied: generation emits a local <video src>/<source src>
+    // whenever the file materialized (only streaming/undownloaded videos fall back
+    // to poster-only rendering).
     if (seenPublicPaths?.has(e.localPath)) continue;
     const src = join(storeDir, e.storedFile);
     const from = fileExists(src) ? src : join(cssDir, e.storedFile);

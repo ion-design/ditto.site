@@ -44,6 +44,7 @@ function signature(nr: NodeRule): string {
   for (const b of nr.bands) s += `@${b.media}{${serDecls(b.decls)}}`;
   if (nr.before) { s += "::before{" + serDecls(nr.before.base); for (const b of nr.before.bands) s += `@${b.media}{${serDecls(b.decls)}}`; s += "}"; }
   if (nr.after) { s += "::after{" + serDecls(nr.after.base); for (const b of nr.after.bands) s += `@${b.media}{${serDecls(b.decls)}}`; s += "}"; }
+  if (nr.placeholder) { s += "::placeholder{" + serDecls(nr.placeholder.base); for (const b of nr.placeholder.bands) s += `@${b.media}{${serDecls(b.decls)}}`; s += "}"; }
   return s;
 }
 
@@ -125,7 +126,7 @@ function splitRule(nr: NodeRule): { typo: NodeRule; layout: NodeRule; box: NodeR
   const b0 = partition(nr.base);
   const typo: NodeRule = { base: b0.typo, bands: [] };
   const layout: NodeRule = { base: b0.layout, bands: [] };
-  const box: NodeRule = { base: b0.box, bands: [], before: nr.before, after: nr.after };
+  const box: NodeRule = { base: b0.box, bands: [], before: nr.before, after: nr.after, placeholder: nr.placeholder };
   for (const band of nr.bands) {
     const bs = partition(band.decls);
     if (bs.typo.size) typo.bands.push({ media: band.media, decls: bs.typo });

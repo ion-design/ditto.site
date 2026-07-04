@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Reveal fixture</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  .spacer { height: 2200px; background: linear-gradient(#eee, #ddd); }
+  /* Elementor pattern: content wrappers hidden at load, revealed by a waypoint class
+     swap that applies an entrance keyframe animation. */
+  .elementor-invisible { visibility: hidden; }
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translate3d(0, 40px, 0); }
+    to { opacity: 1; transform: none; }
+  }
+  .animated { animation-duration: 0.4s; animation-fill-mode: both; }
+  .fadeInUp { animation-name: fadeInUp; }
+  .reveal-box { height: 220px; background: #2e8b57; color: #fff; padding: 20px; }
+  #never { visibility: hidden; height: 60px; background: #999; }
+</style>
+</head>
+<body>
+<h1>Reveal fixture</h1>
+<div class="spacer"></div>
+<!-- Waypoint reveal: hidden at load, class-swapped when scrolled into view. -->
+<div id="reveal-io" class="reveal-box elementor-invisible" data-io-reveal data-settings='{"_animation":"fadeInUp"}'>
+  <p>Scroll-revealed content (IntersectionObserver)</p>
+</div>
+<div class="spacer"></div>
+<!-- Same pre-reveal marker but keyed to a trigger the dwell walk cannot fire:
+     only the known-library neutralization reveals it. -->
+<div id="reveal-far" class="reveal-box elementor-invisible" data-settings='{"_animation":"fadeInUp"}'>
+  <p>Reveal keyed to a non-scroll trigger</p>
+</div>
+<!-- Genuinely hidden, non-library content: must STAY hidden in the capture. -->
+<div id="never">permanently hidden</div>
+<script>
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      e.target.classList.remove("elementor-invisible");
+      e.target.classList.add("animated", "fadeInUp");
+      io.unobserve(e.target);
+    }
+  }, { threshold: 0.1 });
+  for (const el of document.querySelectorAll("[data-io-reveal]")) io.observe(el);
+</script>
+</body>
+</html>

@@ -38,6 +38,9 @@ export type CloneResult = {
   /** A stable, timestamp-free path to the app (via the `runs/<site>/latest` symlink),
    *  present in runs-layout mode when the symlink could be created. */
   stableAppDir?: string;
+  /** Visual assets (image/svg/video) that could not be downloaded — those boxes render
+   *  as placeholders. Surfaced in the CLI summary; details in generated/assets.json. */
+  visualAssetsMissing?: number;
 };
 
 export function siteIdFromUrl(url: string): string {
@@ -455,7 +458,8 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
   const gen = generateAll({ sourceDir, capture, viewports, sampleViewports: captureViewports, url: opts.url, outDir: generatedDir });
   logBoth({ event: "ir_built", nodes: gen.ir.doc.nodeCount });
   logBoth({ event: "inferred", sections: gen.sections.length, assets: gen.assetGraph.entries.length, fonts: gen.fontGraph.entries.length });
-  logBoth({ event: "generated", assetsCopied: gen.assetsCopied, assetsMissing: gen.assetsMissing.length });
+  const visualAssetsMissing = gen.assetGraph.entries.filter((e) => e.impact === "visual_missing").length;
+  logBoth({ event: "generated", assetsCopied: gen.assetsCopied, assetsMissing: gen.assetsMissing.length, visualAssetsMissing });
 
   // When the source capture lacks native probe flags (this sandbox can't reach the
   // live site through the egress proxy), optionally iterate render→regen so the LOCAL clone-probe
@@ -479,7 +483,7 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
     stableAppDir = writeLatestPointer(runsDir, siteId, runDir);
   }
 
-  return { runDir, sourceDir, appDir: out ? out.appDir : appDir, sourceUrl: opts.url, stableAppDir };
+  return { runDir, sourceDir, appDir: out ? out.appDir : appDir, sourceUrl: opts.url, stableAppDir, visualAssetsMissing };
 }
 
 /** Record the newest run for a site in the runs layout: a `latest.json` breadcrumb (used by
@@ -576,11 +580,11 @@ async function main(): Promise<void> {
   // --serve installs deps + starts the dev server after cloning; --open also launches the browser.
   const open = hasAnyFlag(args, ["--open"]);
   const serve = open || hasAnyFlag(args, ["--serve"]);
-  const finish = async (res: { appDir: string; stableAppDir?: string }) => {
+  const finish = async (res: { appDir: string; stableAppDir?: string; visualAssetsMissing?: number }) => {
     if (serve) {
       await serveApp(res.appDir, { open });
     } else {
-      process.stderr.write(doneSummary({ url, appDir: res.appDir, framework, stableAppDir: res.stableAppDir }));
+      process.stderr.write(doneSummary({ url, appDir: res.appDir, framework, stableAppDir: res.stableAppDir, visualAssetsMissing: res.visualAssetsMissing }));
     }
   };
   const vpArg = firstFlagValue(args, ["--dev-viewports", "--viewports"]);

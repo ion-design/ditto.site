@@ -195,6 +195,35 @@ function resolveUrl(url: string, base: string): string {
   try { return new URL(url, base).href; } catch { return url; }
 }
 
+/** Srcset candidates rewritten to materialized local assets, order preserved;
+ *  candidates whose URL did not materialize are dropped (never placeholders —
+ *  srcset wins over src, so a placeholder would beat the rewritten fallback). */
+function keptSrcsetCandidates(value: string, assetMap: Map<string, string>, sourceUrl: string): string[] {
+  return value.split(",").map((p) => p.trim()).filter(Boolean).map((seg) => {
+    const sp = seg.split(/\s+/);
+    const abs = resolveUrl(sp[0] ?? "", sourceUrl);
+    const local = assetMap.get(abs);
+    return local ? [local, ...sp.slice(1)].join(" ") : null;
+  }).filter((x): x is string => x !== null);
+}
+
+/** True when a <video>'s own src or any child <source src> materialized locally —
+ *  the clone can then ship the real file instead of the poster-only fallback. */
+function videoHasLocalSource(node: IRNode, assetMap: Map<string, string>, sourceUrl: string): boolean {
+  if (node.attrs.src && assetMap.get(resolveUrl(node.attrs.src, sourceUrl))) return true;
+  return node.children.some((c) => !isTextChild(c) && c.tag === "source"
+    && !!c.attrs.src && !!assetMap.get(resolveUrl(c.attrs.src, sourceUrl)));
+}
+
+/** Whether a <source> element still points at anything after asset rewriting
+ *  (materialized src, or ≥1 surviving srcset candidate). A source with none is
+ *  omitted rather than emitted pointing at placeholders. */
+function sourceHasLocalCandidate(c: IRNode, assetMap: Map<string, string>, sourceUrl: string): boolean {
+  if (c.attrs.src && assetMap.get(resolveUrl(c.attrs.src, sourceUrl))) return true;
+  if (c.attrs.srcset && keptSrcsetCandidates(c.attrs.srcset, assetMap, sourceUrl).length > 0) return true;
+  return false;
+}
+
 /** Default single-page link rewrite: a clone is self-contained, so a link that points
  *  back to the SOURCE origin is rewritten to an app-relative path (`/enterprise`) instead
  *  of the absolute source URL (`https://www.source.com/enterprise`) — otherwise every nav
@@ -284,39 +313,48 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
   const prim = ctx?.primitives?.get(node.id);
   if (prim) props.push(['"data-component"', JSON.stringify(prim)]);
 
-  // Stage 2: a <video> is rendered as its (first-frame) poster — a streamed source
-  // has no deterministic frame and its request aborts at snapshot time. Drop the
-  // streaming src + autoplay so only the poster paints; keep the poster (rewritten
-  // to a local still below). <source>/<track> children are dropped in renderNode.
+  // A <video> whose file materialized locally ships it, mirroring the captured
+  // playback attrs (autoplay/loop/muted/playsInline) faithfully. Otherwise it is
+  // rendered as its (first-frame) poster — a streamed source has no deterministic
+  // frame and its request aborts at snapshot time — dropping the streaming src +
+  // autoplay so only the poster paints; keep the poster (rewritten to a local
+  // still below). <source>/<track> children are filtered in emitChildren.
   const isVideo = node.tag === "video";
-  // An <iframe> embeds a third-party, non-deterministic document; reproducing it
+  const videoLocal = isVideo && videoHasLocalSource(node, assetMap, sourceUrl);
+  // An <iframe> embeds a third-party, non-deterministic document; reproducing it live
   // would break self-containment (rubric Gate 2) and can't be deterministic anyway.
-  // Keep the element as a placeholder sized by its captured box, but drop the
-  // document-loading attrs so it paints an empty frame instead of pulling content.
+  // When capture grafted the embedded document's subtree (graft.ts) the node renders as
+  // a <div> with those children (see resolveTag) — drop the frame-only attrs entirely
+  // (width/height would be invalid on a div; CSS keys the box). Otherwise keep the
+  // element as a placeholder sized by its captured box, minus the document-loading
+  // attrs, so it paints an empty frame instead of pulling content.
   const isIframe = node.tag === "iframe";
+  const iframeGrafted = isIframe && node.children.some((c) => !isTextChild(c));
   const attrKeys = Object.keys(node.attrs).sort();
   for (const key of attrKeys) {
     let value = node.attrs[key]!;
     if (key === "class" || key === "style" || key === "data-cid-cap") continue;
-    if (isVideo && (key === "src" || key === "autoplay" || key === "loop" || key === "preload")) continue;
+    if (isVideo && !videoLocal && (key === "src" || key === "autoplay" || key === "loop" || key === "preload")) continue;
     if (isIframe && (key === "src" || key === "srcdoc" || key === "name")) continue;
+    if (iframeGrafted && (key === "width" || key === "height")) continue;
 
     if (ASSET_ATTRS.has(key)) {
       const abs = resolveUrl(value, sourceUrl);
       const local = assetMap.get(abs);
-      value = local ?? TRANSPARENT_GIF; // never point back to a remote origin
+      // A poster that missed the asset map is DROPPED — a guaranteed-blank overlay
+      // hides the element's own background, strictly worse than showing it. A missed
+      // video/source src likewise (a placeholder is not playable; a local <source>
+      // child may still carry the file). Only <img> keeps the transparent-GIF
+      // fallback: never point back to a remote origin.
+      if (!local && (key === "poster" || node.tag === "video" || node.tag === "source")) continue;
+      value = local ?? TRANSPARENT_GIF;
     } else if (key === "srcset") {
       // Keep only candidates we actually materialized; drop the rest. Lazy-load
       // libraries seed srcset with 1x1 placeholders (data: GIFs) and swap in the
       // real URLs via JS — replaying those placeholders would beat the rewritten
       // `src` (srcset wins over src) and paint a blank box. If nothing survives,
       // omit srcset so the browser falls back to the real local `src`.
-      const kept = value.split(",").map((p) => p.trim()).filter(Boolean).map((seg) => {
-        const sp = seg.split(/\s+/);
-        const abs = resolveUrl(sp[0] ?? "", sourceUrl);
-        const local = assetMap.get(abs);
-        return local ? [local, ...sp.slice(1)].join(" ") : null;
-      }).filter((x): x is string => x !== null);
+      const kept = keptSrcsetCandidates(value, assetMap, sourceUrl);
       if (kept.length === 0) continue;
       value = kept.join(", ");
     } else if (key === "href") {
@@ -340,7 +378,7 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
     }
   }
 
-  if (isVideo && !props.some(([k]) => k === "preload")) props.push(["preload", JSON.stringify("none")]);
+  if (isVideo && !videoLocal && !props.some(([k]) => k === "preload")) props.push(["preload", JSON.stringify("none")]);
 
   if (node.rawHTML && node.tag === "svg") {
     // Strip the Stage-4 capture-id (`data-cid-cap`) the interaction pass stamps on
@@ -504,6 +542,10 @@ export function resolveTag(node: IRNode, insideInteractive: boolean, insideTable
     const disp = (node.computedByVp[1280] ?? Object.values(node.computedByVp)[0])?.display ?? "";
     tag = /inline(?!-block|-flex|-grid)/.test(disp) ? "span" : "div";
   }
+  // An iframe with grafted children (capture/graft.ts) is a real subtree, not an embed:
+  // children inside <iframe> are unrendered fallback content, so emit a <div> container
+  // carrying the iframe's box/styles (CSS is keyed by cid, so the geometry is identical).
+  if (tag === "iframe" && node.children.some((c) => !isTextChild(c))) tag = "div";
   if (TABLE_SCOPED.has(tag) && !insideTable) tag = "div"; // orphan table element → neutral box
   if (violatesContentModel(node, tag)) tag = "div";
   return tag;
@@ -579,7 +621,11 @@ function emitChildren(children: IRChild[], parentTag: string | null, assetMap: M
       textBuf += c.text;
       continue;
     }
-    if (parentTag === "video" && (c.tag === "source" || c.tag === "track")) continue;
+    if (parentTag === "video" && c.tag === "track") continue; // caption files are not captured
+    // A <picture>/<video> `<source>` is emitted only when a candidate materialized
+    // locally: a video source otherwise falls back to poster-only rendering, a
+    // picture source must never point its media band at a placeholder.
+    if ((parentTag === "video" || parentTag === "picture") && c.tag === "source" && !sourceHasLocalCandidate(c, assetMap, sourceUrl)) continue;
     // Section split: a section-root child is hoisted into its own module and replaced
     // by a `<HeroSection />` placeholder. Rendered once (subtree → module body); the
     // composed DOM is identical to inlining (same tags/cids/classes).
@@ -1117,8 +1163,11 @@ function emitVariantSkeleton(componentName: string, instances: IRNode[], variant
       instances.forEach((n, k) => { runText![k] += (n.children[i] as IRTextNode).text; });
       continue;
     }
-    if (tag === "video" && (repr.children[i] as IRNode).tag === "source") continue;
     if (tag === "video" && (repr.children[i] as IRNode).tag === "track") continue;
+    // Mirror emitChildren: a <source> child survives only with a materialized candidate
+    // (judged on the representative — instances share the capture's asset set).
+    if ((tag === "video" || tag === "picture") && (repr.children[i] as IRNode).tag === "source"
+      && !sourceHasLocalCandidate(repr.children[i] as IRNode, assetMap, sourceUrl)) continue;
     flushText();
     const subNodes = instances.map((n) => n.children[i] as IRNode);
     const sub = emitVariantSkeleton(componentName, subNodes, variants, childInteractive, indent + 1, dataRows, styleRows, cids, gen, styleGen, slots, assetMap, sourceUrl, ctx, childTable, [...ancestors, repr.tag]);
@@ -1498,8 +1547,11 @@ function emitSkeleton(instances: IRNode[], insideInteractive: boolean, indent: n
       instances.forEach((n, k) => { runText![k] += (n.children[i] as IRTextNode).text; });
       continue;
     }
-    if (tag === "video" && (repr.children[i] as IRNode).tag === "source") continue;
     if (tag === "video" && (repr.children[i] as IRNode).tag === "track") continue;
+    // Mirror emitChildren: a <source> child survives only with a materialized candidate
+    // (judged on the representative — instances share the capture's asset set).
+    if ((tag === "video" || tag === "picture") && (repr.children[i] as IRNode).tag === "source"
+      && !sourceHasLocalCandidate(repr.children[i] as IRNode, assetMap, sourceUrl)) continue;
     flushText();
     const sub = emitSkeleton(instances.map((n) => n.children[i] as IRNode), childInteractive, indent + 1, dataRows, styleRows, cids, gen, styleGen, assetMap, sourceUrl, ctx, childTable, [...ancestors, repr.tag]);
     if (sub === null) return null;
@@ -2001,7 +2053,10 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
     let body = jsx;
     for (const v of usedData) {
       const p = dataProps.get(v) ?? camelVar(v);
-      if (p !== v) body = body.split(`${v}.map(`).join(`${p}.map(`);
+      // Word-boundary rewrite: a plain substring replace of `${v}.map(` would also match
+      // inside a longer var (e.g. `Tile2_data` is a suffix of `MediaTile2_data`), corrupting
+      // it. Anchor on a non-identifier char before the name so only the whole var is renamed.
+      if (p !== v) body = body.replace(new RegExp(`(^|[^\\w$])${escapeRegExp(v)}\\.map\\(`, "g"), `$1${p}.map(`);
       const binding = contentBindings.get(v);
       if (binding) {
         const alias = safeIdent(`${p}Content`, "contentData");
@@ -2478,6 +2533,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
     const globals = tailwindGlobalsCss({
       reset: RESET_CSS, fontCss: fontGraph.css, tokensCss: tokensCss + (tw.colorDefsCss ? "\n" + tw.colorDefsCss : ""),
       htmlBg, bodyFont: SYSTEM_FALLBACK, clip, colorTokens: tw.colorTokens, viewports: ir.doc.viewports,
+      canonical: ir.doc.canonicalViewport,
     });
     writeText(join(rootDir, "globals.css"), framework === "vite" ? viteGlobalsCss(globals) : globals);
   } else {
@@ -2685,6 +2741,8 @@ const nextConfig = {
   reactStrictMode: false,
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: true },
+  // The dev-tools badge would leak into reviewer/validator screenshots.
+  devIndicators: false,
 };
 export default nextConfig;
 `;

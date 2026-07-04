@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Iframe host</title>
+<style>
+  body { margin: 0; font-family: Arial, sans-serif; background: #ffffff; }
+  h1 { margin: 20px; font-size: 24px; }
+  iframe.signup {
+    display: block;
+    margin: 30px 0 0 40px;
+    width: 320px;
+    height: 160px;
+    border: 0;
+  }
+</style>
+</head>
+<body>
+  <h1>Host page</h1>
+  <!-- {{FRAME_ORIGIN}} is replaced by the test server with the second (cross-origin) server's origin. -->
+  <iframe class="signup" title="Newsletter" aria-label="Modal Overlay Box Frame" src="{{FRAME_ORIGIN}}/iframe-embed.html"></iframe>
+</body>
+</html>

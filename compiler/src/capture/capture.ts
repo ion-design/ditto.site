@@ -3,6 +3,14 @@ import { join } from "node:path";
 import { collectPage, type PageSnapshot, type FontFace } from "./walker.js";
 import { tagElements, captureInteractions, type InteractionCapture } from "./interactions.js";
 import { captureMotion, probeReveals, type MotionCapture } from "./motion.js";
+import {
+  promoteLazyMedia, settleCarousels, settleScrollReveals, neutralizePreReveal,
+  forceRevealForShot, restoreRevealForShot, neutralizeScrollTimelineAnimations,
+} from "./stabilize.js";
+import {
+  enumerateFramesInPage, planForFrameUrl, graftFrameIntoSnapshot, frameHasRenderableContent,
+  MAX_GRAFT_FRAMES, FRAME_GRAFT_MAX_NODES, type FrameCandidate,
+} from "./graft.js";
 import { discoverBreakpoints } from "./breakpoints.js";
 import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.js";
 import { sha1_12, round } from "../util/canonical.js";
@@ -90,6 +98,23 @@ function viewportHeight(width: number): number {
   return VIEWPORT_HEIGHTS[width] ?? Math.round(width * 0.66);
 }
 
+// ---- Asset download retry (Fix: transient failures silently degrade to placeholders) ----
+
+/** Types whose absence is visible in the clone (image → transparent GIF, video → blank,
+ *  font → fallback face). These earn one retry; css/manifest/lottie degrade gracefully. */
+const RETRYABLE_ASSET_TYPES = new Set(["image", "svg", "video", "font"]);
+/** Fixed, bounded delay before the single retry — deterministic (no jitter/backoff). */
+export const ASSET_RETRY_DELAY_MS = 750;
+
+/** Should a failed download of `type` with HTTP `status` (null = network error / no
+ *  response) be retried once? Transient states only: connection failures, 5xx, and 429.
+ *  4xx (404/403/…) are authoritative — retrying can't change them. */
+export function isRetryableAssetFailure(type: string, status: number | null): boolean {
+  if (!RETRYABLE_ASSET_TYPES.has(type)) return false;
+  if (status === null) return true;
+  return status >= 500 || status === 429;
+}
+
 function extFromUrl(url: string): string {
   try {
     const p = new URL(url).pathname;
@@ -135,6 +160,19 @@ function classifyAsset(url: string, contentType: string | null): string | null {
 
 function isCss(url: string, contentType: string | null): boolean {
   return classifyAsset(url, contentType) === "css";
+}
+
+/** Container-magic check for accepted video bytes: ISO-BMFF (`ftyp` within the first
+ *  12 bytes — mp4/m4v/mov), webm/mkv (EBML 0x1A45DFA3), or ogg (`OggS`). A range
+ *  fragment (e.g. an mp4's moov-atom tail served as a 206) fails all three, so a
+ *  corrupt partial body is never stored as the asset. */
+export function looksLikeVideoFile(bytes: Buffer): boolean {
+  if (bytes.length < 12) return false;
+  const head = bytes.subarray(0, 12);
+  if (head.includes("ftyp")) return true;
+  if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return true; // EBML (webm/mkv)
+  if (head[0] === 0x4f && head[1] === 0x67 && head[2] === 0x67 && head[3] === 0x53) return true; // "OggS"
+  return false;
 }
 
 async function autoScroll(page: import("playwright").Page, vpHeight: number): Promise<void> {
@@ -535,6 +573,10 @@ export async function captureSite(opts: {
 
   const storeBytes = (url: string, type: string, bytes: Buffer): void => {
     if (!bytes || bytes.length === 0) return;
+    // Reject non-container bytes for video from EVERY path (a range fragment or error
+    // page stored under first-stored-wins ships a corrupt file). Left unstored, the
+    // asset surfaces in visual_assets_missing instead.
+    if (type === "video" && !looksLikeVideoFile(bytes)) return;
     const a = assetMap.get(url) ?? recordAsset(url, type, null, null, "network");
     if (a.storedAs) return;
     const ext = extFromUrl(url) || extFromContentType(a.contentType) ||
@@ -655,6 +697,10 @@ export async function captureSite(opts: {
         const existing = assetMap.get(url);
         if (existing?.storedAs) return;
         if (status >= 400) return;
+        // A 206 body is a RANGE FRAGMENT (media seek), not the asset — storing it would
+        // ship a corrupt file under first-stored-wins and the full-download fallback
+        // would then skip the asset. Record only; the fallback pass fetches the 200 body.
+        if (status === 206) return;
         bodyPromises.push(
           (async () => {
             try {
@@ -684,6 +730,42 @@ export async function captureSite(opts: {
     if (!navigated) throw navErr;
     await settle(page);
 
+    // Stage 2: lazy-loader promotion. WP Rocket/lazysizes keep a 0-size placeholder in
+    // `src` with the real URL in data attrs; autoScroll outruns their IntersectionObserver
+    // (collapsed sections in the snapshot) and the interaction pass can trigger the swap
+    // midway (viewports then DISAGREE about the section's size). Promote once, before any
+    // snapshot, so every viewport measures the same loaded media.
+    const lazyPromoted = await promoteLazyMedia(page);
+    if (lazyPromoted) {
+      log({ event: "lazy_promoted", count: lazyPromoted });
+      await settle(page, 2000); // newly-real images reflow the layout
+    }
+
+    // Stage 2: reveal settling. Scroll reveals (Elementor waypoints, WOW/AOS class swaps)
+    // are the same class of one-shot load-state as lazy media: fire them ONCE, before any
+    // viewport snapshot, so every width records the POST-REVEAL steady state — otherwise
+    // the snapshot bakes `visibility:hidden` wrappers (or a mid-fade opacity) with no JS
+    // to ever reveal them, and the clone renders below-fold content blank.
+    // A scroll-locking consent wall would defeat the dwell walk, so clear it first (the
+    // per-viewport dismissal below still runs and owns the audit trail).
+    const preClicked = await clickDismiss(page);
+    if (preClicked.length) {
+      for (const d of preClicked) if (!dismissUnion.dismissed.includes(d)) dismissUnion.dismissed.push(d);
+      await settle(page, 1000);
+    }
+    // Motion capture needs the PRE-reveal hidden state, observable only before the first
+    // scroll — tag + probe now (captureMotion confirms the candidates at the canonical
+    // snapshot, reading each revealed element's entrance animation from computed style).
+    if (opts.motion) { await tagElements(page); await probeReveals(page); }
+    const revealSettle = await settleScrollReveals(page);
+    log({ event: "reveals_settled", ...revealSettle });
+    // Belt-and-braces: reveal any element STILL carrying a known-library pre-reveal marker
+    // (below the step bound, or keyed to a non-scroll trigger) via the library's own
+    // revealed state, so captured computed styles are genuine post-reveal values.
+    const neutralized = await neutralizePreReveal(page);
+    if (neutralized) log({ event: "prereveal_neutralized", count: neutralized });
+    await settle(page, 1500); // revealed content reflows the layout
+
     for (const vw of viewports) {
       const vh = viewportHeight(vw);
       await page.setViewportSize({ width: vw, height: vh });
@@ -710,12 +792,8 @@ export async function captureSite(opts: {
       };
       await applyDismiss("load");
 
-      // Stage 5 (scroll reveals): at the FIRST viewport, before any scroll, tag elements
-      // and snapshot the pre-reveal hidden state — scroll reveals fire on the first
-      // autoScroll and stay revealed, so this is the only moment their hidden state is
-      // observable. Idempotent + motion-gated; the settled snapshot is unchanged.
-      if (opts.motion && vw === viewports[0]) { await tagElements(page); await probeReveals(page); }
-
+      // (Scroll-reveal probing happens once, before the viewport loop — see the reveal
+      // settling pass above; by this point all one-shot reveals have already fired.)
       await autoScroll(page, vh);
       await settle(page, 1500);
       await applyDismiss("post-scroll");
@@ -737,6 +815,15 @@ export async function captureSite(opts: {
       });
       await page.waitForTimeout(150);
 
+      // Stage 2: settle autoplaying carousels (pause + navigate to the home slide)
+      // before EVERY snapshot — otherwise each viewport freezes a different track
+      // offset (per-band CSS then bakes four different slides), and the interaction
+      // pass between the canonical and last snapshots would leave the final viewport
+      // contaminated. Scoped to named-library tracks so motion.ts's marquee/rotator
+      // capture (which runs after the canonical snapshot) observes them unchanged.
+      const carousels = await settleCarousels(page);
+      if (carousels.roots) log({ event: "carousels_settled", viewport: vw, ...carousels });
+
       // Stage 2: dynamic-media first frame. Materialize a still for poster-less
       // videos so they don't render blank — canvas where the frame is readable, else
       // an element screenshot (the page cannot screenshot itself). Done once at the
@@ -755,12 +842,27 @@ export async function captureSite(opts: {
           } catch { /* ignore */ }
         }
         for (const s of plan.shots) {
+          // A visibility:hidden video (entrance animation not yet fired) passes the size
+          // gate, but locator.screenshot auto-waits for visibility and times out —
+          // force-reveal the hidden ancestor chain for the shot, restore exactly after.
+          let shot = false;
           try {
+            await page.evaluate(forceRevealForShot, s.sel);
             const buf = await page.locator(s.sel).first().screenshot({ type: "jpeg", quality: 82, timeout: 5000, animations: "disabled" });
             recordAsset(s.url, "image", "image/jpeg", 200, "video-still");
             storeBytes(s.url, "image", buf);
             dismissUnion.videoStills++;
-          } catch { /* element not shootable (off-screen/detached) — poster falls back to placeholder */ }
+            shot = true;
+          } catch (e) {
+            log({ event: "video_still_error", viewport: vw, sel: s.sel, error: String(e).slice(0, 200) });
+          } finally {
+            await page.evaluate(restoreRevealForShot).catch(() => { /* ignore */ });
+          }
+          // A synthetic poster with no bytes behind it generates a transparent tile —
+          // on failure, remove the attr so the video renders as it did pre-capture.
+          if (!shot) {
+            await page.evaluate((sel) => { document.querySelector(sel)?.removeAttribute("poster"); }, s.sel).catch(() => { /* ignore */ });
+          }
         }
         // Element screenshots scroll the target into view; restore scroll 0 so the
         // canonical DOM walk + screenshot match the generated app's default render.
@@ -774,12 +876,116 @@ export async function captureSite(opts: {
       // them (whitelisted), enabling interaction deltas + motion specs to map to cids.
       if ((opts.interactions || opts.motion) && vw === canonical) await tagElements(page);
 
+      // Stage 2.6: cross-origin iframe content. The in-page walker cannot see into a
+      // cross-origin frame (newsletter/form embeds), but Node CAN evaluate in it — run the
+      // SAME collectPage per meaningful frame here, then graft each subtree into this
+      // viewport's snapshot below (graft.ts). Frames that can't be grafted (media players,
+      // dead frames) get an element-screenshot recorded as the iframe's background at the
+      // canonical viewport, so the box at least PAINTS. Runs before the main collectPage so
+      // the fallback's inline background is part of the canonical computed style.
+      const frameCands: FrameCandidate[] = await Promise.race([
+        page.evaluate(enumerateFramesInPage),
+        new Promise<FrameCandidate[]>((res) => setTimeout(() => res([]), 8000)),
+      ]).catch(() => [] as FrameCandidate[]);
+      const frameGrafts: Array<{ cand: FrameCandidate; snap: PageSnapshot }> = [];
+      let graftBudget = MAX_GRAFT_FRAMES;
+      let stillBudget = MAX_GRAFT_FRAMES; // fallback stills share the same per-page bound
+      let frameShotScrolled = false;
+      for (const cand of frameCands) {
+        if (!cand.visible) continue;
+        const plan = planForFrameUrl(cand.url);
+        if (plan === "skip") continue;
+        let frameSnap: PageSnapshot | null = null;
+        if (plan === "graft" && graftBudget > 0) {
+          try {
+            const handle = await page.$(`iframe[data-ditto-frame="${cand.idx}"]`);
+            const frame = handle ? await handle.contentFrame() : null;
+            if (frame) {
+              await frame.evaluate(ESBUILD_SHIM);
+              frameSnap = await Promise.race([
+                frame.evaluate(collectPage, { maxNodes: FRAME_GRAFT_MAX_NODES }),
+                new Promise<never>((_, rej) => setTimeout(() => rej(new Error("frame collect timeout")), 20_000)),
+              ]);
+            }
+            await handle?.dispose();
+          } catch (e) {
+            log({ event: "frame_graft_error", viewport: vw, frame: cand.idx, url: cand.url.slice(0, 160), error: String(e).slice(0, 200) });
+            frameSnap = null;
+          }
+        }
+        if (frameSnap && frameHasRenderableContent(frameSnap.root)) {
+          graftBudget--;
+          frameGrafts.push({ cand, snap: frameSnap });
+          // Merge the frame's discoveries exactly like the main document's below: its
+          // assets/fonts flow through the same pipeline so grafted <img>/@font-face resolve.
+          for (const da of frameSnap.domAssets) {
+            const t = classifyAsset(da.url, null) ?? (da.kind === "video" ? "video" : da.kind === "svg" ? "svg" : "image");
+            recordAsset(da.url, t, null, null, `frame${cand.idx}:${da.via}`);
+          }
+          for (const u of frameSnap.cssUrls) {
+            const t = classifyAsset(u, null) ?? "other";
+            recordAsset(u, t, null, null, "css-url");
+          }
+          for (const ff of frameSnap.fontFaces) {
+            const key = `${ff.family}|${ff.weight ?? ""}|${ff.style ?? ""}|${ff.src}`;
+            if (!fontFaceMap.has(key)) fontFaceMap.set(key, ff);
+          }
+        } else if (vw === canonical && stillBudget > 0) {
+          stillBudget--;
+          // Screenshot fallback — synthetic-poster pattern (see captureVideoStills): the
+          // still's bytes ride the normal asset pipeline under a synthetic URL; the iframe's
+          // inline background then rewrites to the local file at generation.
+          const stillUrl = `https://clone-frame.local/${cand.idx}-${sha1_12(cand.url || String(cand.idx))}.jpg`;
+          const sel = `iframe[data-ditto-frame="${cand.idx}"]`;
+          try {
+            await page.evaluate(forceRevealForShot, sel);
+            const buf = await page.locator(sel).first().screenshot({ type: "jpeg", quality: 82, timeout: 5000, animations: "disabled" });
+            recordAsset(stillUrl, "image", "image/jpeg", 200, "iframe-still");
+            storeBytes(stillUrl, "image", buf);
+            frameShotScrolled = true;
+            await page.evaluate(({ s, u }) => {
+              const el = document.querySelector(s) as HTMLElement | null;
+              if (el) {
+                el.style.backgroundImage = `url("${u}")`;
+                el.style.backgroundSize = "100% 100%";
+                el.style.backgroundRepeat = "no-repeat";
+              }
+            }, { s: sel, u: stillUrl });
+            log({ event: "frame_still", viewport: vw, frame: cand.idx, url: cand.url.slice(0, 160) });
+          } catch (e) {
+            log({ event: "frame_still_error", viewport: vw, frame: cand.idx, error: String(e).slice(0, 200) });
+          } finally {
+            await page.evaluate(restoreRevealForShot).catch(() => { /* ignore */ });
+          }
+        }
+      }
+      // Element screenshots scroll the target into view; restore scroll 0 before the walk.
+      if (frameShotScrolled) {
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.waitForTimeout(80);
+      }
+
+      // Scroll-linked animations (animation-timeline: scroll()/view()) are held at their
+      // end keyframe by `fill-mode:both` after the dwell-scroll pass, even with scroll reset
+      // to 0 — so the walk would bake the frozen END state (e.g. a text-fill stuck at 100%).
+      // Cancel them here so the snapshot records the genuine AT-REST (unscrolled, 0%) values.
+      // Time-based reveals use the default document timeline and are untouched.
+      const scrollAnimsCanceled = await neutralizeScrollTimelineAnimations(page);
+      if (scrollAnimsCanceled) log({ event: "scroll_timeline_anims_canceled", viewport: vw, count: scrollAnimsCanceled });
+
       // Bound the in-page DOM walk: page.evaluate has no default timeout, so a
       // pathologically large/animated DOM (e.g. asana.com) could hang forever.
       const snapshot: PageSnapshot = await Promise.race([
         page.evaluate(collectPage),
         new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`collectPage timeout vp${vw}`)), 60_000)),
       ]);
+
+      // Graft the captured frame subtrees into this viewport's snapshot (offset bboxes,
+      // namespaced ids, frame-URL-absolutized src/href — see graft.ts).
+      for (const g of frameGrafts) {
+        const ok = graftFrameIntoSnapshot(snapshot, g.cand, g.snap);
+        log({ event: ok ? "frame_grafted" : "frame_graft_orphaned", viewport: vw, frame: g.cand.idx, url: g.cand.url.slice(0, 160), nodes: g.snap.doc.nodeCount });
+      }
 
       // Merge discovered references from the snapshot (DOM + accessible CSS).
       for (const da of snapshot.domAssets) {
@@ -895,21 +1101,38 @@ export async function captureSite(opts: {
       if (a.storedAs) continue;
       if (a.url.startsWith("data:")) continue;
       if (!["image", "svg", "video", "font", "lottie", "css", "manifest"].includes(a.type)) continue;
-      try {
-        const resp = await fallbackCtx.request.get(a.url, { timeout: 30000 });
-        a.status = resp.status();
-        if (resp.ok()) {
-          const buf = await resp.body();
-          a.contentType = a.contentType ?? (resp.headers()["content-type"] || null);
-          storeBytes(a.url, a.type, buf);
-          if (a.type === "css") parseCssForFonts(buf.toString("utf8"), a.url, fontFaceMap, (u) => {
-            const t = classifyAsset(u, null) ?? "other";
-            recordAsset(u, t, null, null, "css-text");
-          });
-          if (a.type === "manifest") parseManifestForAssets(buf.toString("utf8"), a.url);
-        }
-      } catch { /* unreachable/signed — left as skipped */ }
+      // One bounded retry for transiently-failed VISUAL assets (network error / 5xx / 429):
+      // a single flaky fetch otherwise degrades an image to the transparent-GIF placeholder.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let failStatus: number | null = null;
+        try {
+          const resp = await fallbackCtx.request.get(a.url, { timeout: 30000 });
+          a.status = resp.status();
+          if (resp.ok()) {
+            const buf = await resp.body();
+            a.contentType = a.contentType ?? (resp.headers()["content-type"] || null);
+            storeBytes(a.url, a.type, buf);
+            if (a.type === "css") parseCssForFonts(buf.toString("utf8"), a.url, fontFaceMap, (u) => {
+              const t = classifyAsset(u, null) ?? "other";
+              recordAsset(u, t, null, null, "css-text");
+            });
+            if (a.type === "manifest") parseManifestForAssets(buf.toString("utf8"), a.url);
+            break;
+          }
+          failStatus = resp.status();
+        } catch { failStatus = null; /* unreachable/signed — left as skipped */ }
+        if (attempt > 0 || !isRetryableAssetFailure(a.type, failStatus)) break;
+        log({ event: "asset_retry", url: a.url, type: a.type, status: failStatus });
+        await new Promise((r) => setTimeout(r, ASSET_RETRY_DELAY_MS));
+      }
     }
+    // Every visual asset that ultimately failed, in one machine-readable event: these are
+    // the boxes that will paint as placeholders (image → transparent GIF, video → blank).
+    const visualMissing = [...assetMap.values()]
+      .filter((a) => !a.storedAs && !a.url.startsWith("data:") && (a.type === "image" || a.type === "svg" || a.type === "video"))
+      .map((a) => ({ url: a.url, type: a.type, status: a.status }))
+      .sort((x, y) => x.url.localeCompare(y.url));
+    if (visualMissing.length) log({ event: "visual_assets_missing", count: visualMissing.length, assets: visualMissing });
     const seoResources: SeoResource[] = [];
     const fetchedSeo = new Set<string>();
     const fetchSeoResource = async (url: string, kind: SeoResource["kind"]): Promise<void> => {
