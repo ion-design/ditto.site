@@ -127,6 +127,42 @@ describe("recipe grid geometry: computed tracks/spans are ground truth", () => {
     assert.equal(itemOut, "col-start-1 col-end-3 flex flex-col", "span-2 item className is unchanged");
   });
 
+  it("does not override an ASYMMETRIC 2-track sidebar grid with a grid-cols-2 plan", () => {
+    // A sidebar layout: `grid-template-columns: 260px 1020px` (authored `260px 1fr`). The item-count
+    // heuristic sees 2 items in one row → 2 columns, which agrees with the 2 computed tracks by COUNT.
+    // But `grid-cols-2` = two EQUAL 640px tracks, which destroys the 260/1020 geometry. The plan must be
+    // rejected and the authored template kept.
+    const sidebar = node("n2", "aside", {
+      768: { gridColumnStart: "auto", gridColumnEnd: "auto" },
+      1280: { gridColumnStart: "auto", gridColumnEnd: "auto" },
+    });
+    const main = node("n3", "div", {
+      768: { gridColumnStart: "auto", gridColumnEnd: "auto" },
+      1280: { gridColumnStart: "auto", gridColumnEnd: "auto" },
+    });
+    const parent = node("n1", "div", {
+      768: { display: "grid", gridTemplateColumns: "220px 500px" },
+      1280: { display: "grid", gridTemplateColumns: "260px 1020px" },
+    }, [sidebar, main]);
+    const ir = irWith(node("n0", "section", {}, [parent]));
+    const c = candidate({
+      itemParentCid: "n1",
+      itemCount: 2,
+      responsiveRegimes: [regime(768, 2, 2), regime(1280, 2, 2)],
+      repeatedItems: [
+        { cid: "n2", tag: "aside", textSample: "", mediaCount: 0, headingCount: 0, bbox: { x: 0, y: 0, width: 260, height: 300 } },
+        { cid: "n3", tag: "div", textSample: "", mediaCount: 0, headingCount: 1, bbox: { x: 276, y: 0, width: 1020, height: 300 } },
+      ],
+    });
+    const clean = recipeResponsiveClassCleaner(ir, report([c]), { tailwind: true });
+    // The emitter baked the authored asymmetric template as an arbitrary grid-template-columns utility.
+    const containerIn = "grid grid-cols-[260px_1020px] gap-6";
+    const out = clean("n1", containerIn)!.split(/\s+/);
+    assert.ok(out.includes("grid-cols-[260px_1020px]"), `authored asymmetric template must survive, got: ${out.join(" ")}`);
+    assert.ok(!out.some((t) => /(?:^|:)grid-cols-2$/.test(t)), `no equal-halves grid-cols-2 override, got: ${out.join(" ")}`);
+    assert.ok(!out.some((t) => /^(?:md|lg|2xl):grid-cols-/.test(t)), `no responsive grid-cols plan appended, got: ${out.join(" ")}`);
+  });
+
   it("still re-flows a genuinely uniform grid whose computed tracks match the heuristic", () => {
     // 2-track grid at 768, 3-track at 1280, no spanning items → heuristic agrees with computed.
     const item = (id: string): IRNode => node(id, "article", {

@@ -2496,6 +2496,36 @@ function computedTrackCount(value: string | undefined): number {
   return value.trim().split(/\s+/).filter(Boolean).length;
 }
 
+// Resolved px widths of the explicit column tracks in a computed `grid-template-columns` value. The
+// capture resolves the property to a used track list (`260px 1020px`), so each token is a definite
+// px length. Non-px tokens (`auto`, `min-content`, a leftover `1fr`) make the track set unquantifiable
+// and yield null — the plan then cannot claim the tracks are uniform.
+function computedTrackWidths(value: string | undefined): number[] | null {
+  if (!value || value === "none") return null;
+  const toks = value.trim().split(/\s+/).filter(Boolean);
+  const out: number[] = [];
+  for (const t of toks) {
+    const m = /^(-?\d*\.?\d+)px$/.exec(t);
+    if (!m) return null;
+    out.push(parseFloat(m[1]!));
+  }
+  return out.length ? out : null;
+}
+
+// A `grid-cols-N` plan rewrites the container to `repeat(N, minmax(0, 1fr))` — N EQUAL tracks. It is
+// only a faithful replacement for the authored template when the computed tracks actually are ~equal
+// width. An asymmetric template (`260px 1fr` → a 260/1020 sidebar layout) has the same track COUNT as
+// the heuristic column count but a different geometry; collapsing it to equal halves destroys the
+// authored layout, so such templates always keep their computed tracks.
+function tracksNearEqual(widths: number[]): boolean {
+  if (widths.length <= 1) return true;
+  const max = Math.max(...widths);
+  const min = Math.min(...widths);
+  if (!(max > 0)) return false;
+  // Tolerance: a couple of px (gap/rounding) or 2% of the widest track, whichever is larger.
+  return max - min <= Math.max(1.5, 0.02 * max);
+}
+
 // Track span of a grid item from its resolved `grid-column-start`/`grid-column-end`. A spanning
 // item (`span 2`, or an explicit line pair `1 / 3`) means row-length item-counting under-reports
 // the real track count, so the column-count heuristic is not trustworthy for this container.
@@ -2536,12 +2566,20 @@ export function recipeResponsiveClassCleaner(ir: IR, recipes: RecipeReport | und
     if (!parent) return false;
     const itemCids = (c.repeatedItems ?? []).map((i) => i.cid);
     for (const vp of regimeVps) {
-      const tracks = computedTrackCount(parent.computedByVp[vp]?.["gridTemplateColumns"]);
+      const gtc = parent.computedByVp[vp]?.["gridTemplateColumns"];
+      const tracks = computedTrackCount(gtc);
       // Only trust the heuristic where the computed grid actually is a track grid at this viewport.
       if (tracks === 0) continue;
       const regime = c.responsiveRegimes.find((r) => r.viewport === vp);
       const heuristicCols = regime?.columns ?? 0;
       if (heuristicCols > 0 && heuristicCols !== tracks) return false;
+      // A `grid-cols-N` plan means N EQUAL tracks. If the computed tracks are asymmetric (a sidebar
+      // template like `260px 1020px`), the count agrees but the geometry does not — collapsing to
+      // equal columns would destroy the authored layout. Keep the authored template in that case.
+      if (tracks >= 2) {
+        const widths = computedTrackWidths(gtc);
+        if (!widths || !tracksNearEqual(widths)) return false;
+      }
       for (const cid of itemCids) {
         if (computedColumnSpan(nodeByCid.get(cid)?.computedByVp[vp]) > 1) return false;
       }

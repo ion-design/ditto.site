@@ -86,6 +86,32 @@ function hasVisibleElementChild(node: IRNode, vp: number): boolean {
   return false;
 }
 
+/** A source text node that the capture painted VISIBLE but the clone rendered HIDDEN at the same
+ *  viewport is a high-signal regression: the words are in the markup yet fall in an invisible gen
+ *  subtree (off-viewport-shifted, banded-hidden, or width-frozen off-screen). Cheap to detect —
+ *  the gen node exists (matched by cid) but reports `visible === false`. Counts DISTINCT source
+ *  cids over the run (a node hidden at several viewports counts once) so the number reads as
+ *  "how many text nodes went dark", not "hidden-node×viewport". Non-blocking: reported as a metric
+ *  only. Pure + input-driven → deterministic. */
+export function countVisibleInCaptureHiddenInClone(
+  ir: IR,
+  genSnaps: Record<number, PageSnapshot>,
+  viewports: number[],
+): number {
+  const hiddenCids = new Set<string>();
+  for (const vp of viewports) {
+    if (!genSnaps[vp]) continue;
+    const gen = indexByCid(genSnaps[vp]!);
+    for (const s of collectSrcNodes(ir, vp)) {
+      if (!s.visible) continue;
+      if (normText(s.directText).length === 0) continue;
+      const g = gen.get(s.node.id);
+      if (g && !g.visible) hiddenCids.add(s.node.id);
+    }
+  }
+  return hiddenCids.size;
+}
+
 // ---------- Pollution gate (stage 2): is the captured page degenerate? ----------
 // A clone can pass every structural gate while faithfully reproducing the WRONG
 // page: an egress/bot wall, a near-empty shell, or a cookie/consent modal that was
@@ -278,6 +304,12 @@ export function gate3Dom(ir: IR, genSnaps: Record<number, PageSnapshot>, viewpor
     }
   }
 
+  // Non-blocking, high-signal diagnostic: source text the capture painted VISIBLE that the clone
+  // renders HIDDEN at the same viewport (off-screen-shifted / banded / width-frozen subtree). Does
+  // NOT gate pass — text presence already covers markup fidelity — but surfaces the "went dark"
+  // count so a banner/feed row vanishing is legible in the report instead of hiding inside a 99.x.
+  const textHiddenInClone = countVisibleInCaptureHiddenInClone(ir, genSnaps, viewports);
+
   const matchPct = totalVisible ? matched / totalVisible : 1;
   const textPct = textTotal ? textPresent / textTotal : 1;
   const linkPct = linksTotal ? linksOk / linksTotal : 1;
@@ -296,6 +328,7 @@ export function gate3Dom(ir: IR, genSnaps: Record<number, PageSnapshot>, viewpor
       nodeMatchPct: round4(matchPct), textPresentPct: round4(textPct),
       linkPct: round4(linkPct), mediaPct: round4(mediaPct),
       totalVisible, matched, textTotal, textPresent, linksTotal, mediaTotal, inventedText,
+      textHiddenInClone,
     },
     issues,
   };

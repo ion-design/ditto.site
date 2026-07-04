@@ -747,6 +747,25 @@ function sourceVariantActive(variant: string, vp: number): boolean {
   return true;
 }
 
+// Tailwind cascade specificity of an ACTIVE variant at a viewport: the effective min-width its media
+// query opens at, so a more-specific (higher) breakpoint wins over a lower one. Tailwind emits its
+// utilities sorted by breakpoint (min-width ascending), NOT by class-attribute order, so when both
+// `md:` and `lg:` apply at 1280 the `lg:` rule wins regardless of which appears first in the class
+// string. `min-[Npx]:` embeds N; a bare min breakpoint uses its threshold; `max-*` variants are
+// upper-bounded windows that a plain min variant out-specifies, so they score below any min. The
+// unprefixed base scores 0. Only meaningful for variants already known active at `vp`.
+function sourceVariantSpecificity(variant: string, vp: number): number {
+  if (!variant) return 0;
+  let score = 0;
+  for (const part of variant.split(":").filter(Boolean)) {
+    const minArb = /^min-\[(\d+)px\]$/.exec(part);
+    if (minArb) { score = Math.max(score, +minArb[1]!); continue; }
+    if (part in SOURCE_BP) { score = Math.max(score, SOURCE_BP[part]!); continue; }
+    // max-* windows are less specific than any min breakpoint; leave score as-is (a min wins).
+  }
+  return score;
+}
+
 function sourceArbitraryInner(suffix: string): string | null {
   return suffix.startsWith("[") && suffix.endsWith("]") ? suffix.slice(1, -1) : null;
 }
@@ -811,6 +830,67 @@ function fixedLengthUtilAsPx(util: string, node: IRNode, vp: number): string {
   if (!val || !/px$/.test(val)) return util;
   const px = Math.round(pf(val) * 100) / 100;
   return `${prefix}${sm[1]}-[${px}px]`;
+}
+
+// Tailwind v4's `max-w-*` / `w-*` / `h-*` / `max-h-*` NAMED size scale (the `--container-*` theme
+// values), in px at a 16px root. A source built on an OLDER Tailwind authored these names against a
+// DIFFERENT scale (e.g. v0–v2 `max-w-md` = 640px vs v4's 448px), so re-emitting the name verbatim
+// silently re-sizes the box. The source-intent pass validates the modern px below and falls back to
+// the captured computed px when they disagree.
+const CONTAINER_NAMED_PX: Record<string, number> = {
+  "3xs": 256, "2xs": 288, xs: 320, sm: 384, md: 448, lg: 512, xl: 576,
+  "2xl": 672, "3xl": 768, "4xl": 896, "5xl": 1024, "6xl": 1152, "7xl": 1280,
+};
+
+// The px a `w-`/`h-`/`max-w-`/`max-h-` NAMED or numeric-scale suffix resolves to under THIS clone's
+// Tailwind v4 (16px root). Covers the `--container-*` names (`md`→448) and the numeric spacing scale
+// (`24`→96px, `2.5`→10px). Returns null for relative/keyword/arbitrary suffixes (`full`, `1/2`,
+// `screen`, `[…]`, `prose`) — those re-derive from context and are not px-fixed, so they need no
+// value validation and are re-emitted verbatim.
+function namedLengthPx(suffix: string): number | null {
+  if (suffix in CONTAINER_NAMED_PX) return CONTAINER_NAMED_PX[suffix]!;
+  if (suffix === "px") return 1;
+  if (/^\d+(?:\.\d+)?$/.test(suffix)) return parseFloat(suffix) * 4; // spacing scale: n × 0.25rem
+  return null;
+}
+
+// A source utility on a length axis whose suffix is a NAMED/numeric-scale token (px-fixed under
+// v4) rather than a relative/keyword/arbitrary one. Only these need modern-value validation; e.g.
+// `max-w-md`, `w-24`, `h-px` — but not `max-w-full`, `w-1/2`, `h-[4rem]`.
+function namedScaleCore(core: string): { axis: "w" | "h" | "max-w" | "max-h"; px: number } | null {
+  const m = /^(max-w|max-h|w|h)-(.+)$/.exec(core);
+  if (!m) return null;
+  const px = namedLengthPx(m[2]!);
+  return px === null ? null : { axis: m[1] as "w" | "h" | "max-w" | "max-h", px };
+}
+
+// Captured computed px on the axis at a viewport, when definite (`…px`, not `auto`/`none`). The
+// property a length axis constrains: `max-width` / `max-height` / `width` / `height`.
+function computedAxisPx(node: IRNode, axis: SourceAxis, vp: number): number | null {
+  const cs = node.computedByVp[vp];
+  if (!cs) return null;
+  const raw = axis === "max-w" ? cs.maxWidth : axis === "max-h" ? cs.maxHeight
+    : axis === "w" ? cs.width : axis === "h" ? cs.height : undefined;
+  if (!raw || raw === "auto" || raw === "none" || !/px$/.test(raw)) return null;
+  return pf(raw);
+}
+
+// Re-emit a source length utility for one viewport. When the suffix is a NAMED/numeric-scale token
+// (px-fixed under v4) and its modern px does NOT match the captured computed px (within tolerance),
+// the authored name meant a different length on the source's older Tailwind — emit the captured px
+// as an arbitrary value instead of the mis-resolving name. Fluid/keyword/fixed-arbitrary suffixes
+// (and the already-handled fixed w/h path) pass through unchanged.
+function namedLengthUtilChecked(util: string, node: IRNode, axis: SourceAxis, vp: number): string {
+  const m = VARIANT_PREFIX.exec(util);
+  const prefix = m ? m[1]! : "";
+  const core = m ? m[2]! : util;
+  const named = namedScaleCore(core);
+  if (!named) return util;
+  const computed = computedAxisPx(node, axis, vp);
+  if (computed === null) return util; // no definite computed px to check against — keep authored name
+  if (Math.abs(named.px - computed) <= Math.max(1.5, 0.02 * computed)) return util; // modern value agrees
+  const rem = pxToRem(computed);
+  return `${prefix}${named.axis}-[${rem ?? computed + "px"}]`;
 }
 
 function sourceAspectUtility(core: string): string | null {
@@ -1042,6 +1122,13 @@ function sourceIntentVarCss(node: IRNode, axis: SourceAxis, values: Map<number, 
 
 function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewports: number[], canonical: number): SourceIntent {
   const perAxis = new Map<SourceAxis, Map<number, string>>();
+  // Per (axis, vp): the cascade specificity of the currently-chosen active token, so a later token in
+  // the class string can only override an earlier one when it is at least as specific. Tailwind sorts
+  // its emitted rules by breakpoint (min-width), so when both `md:` and `lg:` apply at a wide viewport
+  // the `lg:` value wins — regardless of the class-attribute order. Picking the LAST active token
+  // instead (class-string order) silently takes `md:grid-cols-2` at 1280 for `lg:grid-cols-3
+  // md:grid-cols-2`, dropping the desktop column count.
+  const specAt = new Map<SourceAxis, Map<number, number>>();
   for (const tok of parseSourceClass(node.srcClass)) {
     const parsed = sourceAxisForCore(tok.core);
     if (!parsed) continue;
@@ -1049,7 +1136,12 @@ function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewpor
       if (!sourceVariantActive(tok.variant, vp)) continue;
       let m = perAxis.get(parsed.axis);
       if (!m) { m = new Map<number, string>(); perAxis.set(parsed.axis, m); }
-      m.set(vp, parsed.utility);
+      let s = specAt.get(parsed.axis);
+      if (!s) { s = new Map<number, number>(); specAt.set(parsed.axis, s); }
+      const spec = sourceVariantSpecificity(tok.variant, vp);
+      // `>=` so a later token at EQUAL specificity still wins (matches source order for same-breakpoint
+      // duplicates), but a lower breakpoint can never displace a higher one already chosen.
+      if (!m.has(vp) || spec >= (s.get(vp) ?? -1)) { m.set(vp, parsed.utility); s.set(vp, spec); }
     }
   }
   const axes = new Set<SourceAxis>();
@@ -1081,10 +1173,16 @@ function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewpor
     }
     if (!sourceAxisCompatible(node, parent, axis, byVp, viewports)) continue;
     // A fixed-length w/h axis re-emits the CAPTURED computed px per band (root-font-size independent),
-    // not the source rem token; every other axis keeps its authored utility verbatim.
-    const asEmit = (vp: number): string =>
-      (axis === "w" || axis === "h") && isFixedLengthUtil(byVp.get(vp)!)
-        ? fixedLengthUtilAsPx(byVp.get(vp)!, node, vp) : byVp.get(vp)!;
+    // not the source rem token. A NAMED/numeric-scale length token (`max-w-md`, `w-24`) is re-emitted
+    // only when its modern Tailwind-v4 px matches the captured computed px; otherwise the authored
+    // name meant a different length on the source's older Tailwind and the captured px is emitted as an
+    // arbitrary value. Every other axis keeps its authored utility verbatim.
+    const asEmit = (vp: number): string => {
+      const u = byVp.get(vp)!;
+      if ((axis === "w" || axis === "h") && isFixedLengthUtil(u)) return fixedLengthUtilAsPx(u, node, vp);
+      if (axis === "w" || axis === "h" || axis === "max-w" || axis === "max-h") return namedLengthUtilChecked(u, node, axis, vp);
+      return u;
+    };
     const base = asEmit(canonical);
     axes.add(axis);
     if (axis === "aspect") axes.add("grid-rows");

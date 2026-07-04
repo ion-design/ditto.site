@@ -136,3 +136,97 @@ describe("buildTailwind recovers authored banded fixed height as computed px (FI
     assert.ok(/h-\[60px\]|h-\[3\.75rem\]/.test(cls), `mobile height (60px/3.75rem@16root) must appear, got class: "${cls}"`);
   });
 });
+
+// FIX 2 (source-intent named-token validation) — a source built on an OLDER Tailwind authored
+// `max-w-md`, whose scale resolved `md` to 640px; the clone's Tailwind v4 resolves `max-w-md` to
+// 448px. Re-emitting the name verbatim silently re-sizes the box (640→448). The source-intent pass
+// must validate the modern named-token px against the captured computed px and, on mismatch, emit
+// the captured px as an arbitrary value instead of the mis-resolving name.
+describe("buildTailwind validates named length tokens against captured px (FIX 2)", () => {
+  // A max-width node whose computed maxWidth is `capPx` at every viewport, carrying `srcClass`.
+  function maxWNode(capPx: number, srcClass: string): IRNode {
+    const computedByVp: Record<number, StyleMap> = {};
+    const bboxByVp: Record<number, BBox> = {};
+    const visibleByVp: Record<number, boolean> = {};
+    for (const vp of VPS) {
+      computedByVp[vp] = computed({ maxWidth: `${capPx}px` });
+      bboxByVp[vp] = { x: 0, y: 0, width: Math.min(vp, capPx), height: 100 };
+      visibleByVp[vp] = true;
+    }
+    const n: IRNode = { id: "n1", tag: "div", attrs: {}, visibleByVp, bboxByVp, computedByVp, children: [{ text: "col" } as IRChild] };
+    n.srcClass = srcClass;
+    return n;
+  }
+
+  it("re-emits max-w-md as the captured px when the modern token value disagrees (640 ≠ 448)", () => {
+    // Modern max-w-md = 28rem = 448px, but the source computed a 640px cap → arbitrary px, not the name.
+    const el = maxWNode(640, "max-w-md");
+    const root = pvNode("n0", "body", { 375: {}, 1280: {} }, [el]);
+    const tw = buildTailwind(irWith(root), new Map());
+    const cls = tw.classOf.get("n1") || "";
+    assert.ok(!/\bmax-w-md\b/.test(cls), `mis-resolving max-w-md name must not survive, got class: "${cls}"`);
+    assert.ok(/max-w-\[640px\]|max-w-\[40rem\]/.test(cls), `captured 640px cap must be emitted arbitrarily, got class: "${cls}"`);
+  });
+
+  it("keeps max-w-lg verbatim when the modern token value matches the captured px (512 == 512)", () => {
+    // Modern max-w-lg = 32rem = 512px, and the source computed a 512px cap → the authored name is faithful.
+    const el = maxWNode(512, "max-w-lg");
+    const root = pvNode("n0", "body", { 375: {}, 1280: {} }, [el]);
+    const tw = buildTailwind(irWith(root), new Map());
+    const cls = tw.classOf.get("n1") || "";
+    assert.ok(/\bmax-w-lg\b/.test(cls), `matching max-w-lg name must survive, got class: "${cls}"`);
+    assert.ok(!/max-w-\[/.test(cls), `no arbitrary max-w should be emitted when the name matches, got class: "${cls}"`);
+  });
+});
+
+// FIX 3 (source-intent breakpoint specificity) — an authored gallery grid
+// `grid-cols-1 md:grid-cols-2 lg:grid-cols-3` (both `md:` and `lg:` are min-width variants, so BOTH
+// are active at 1280). Tailwind emits its rules sorted by breakpoint, so `lg:` wins there — the base
+// (canonical=1280) is grid-cols-3. Choosing the LAST active token in class-attribute order instead
+// (`… lg:grid-cols-3 md:grid-cols-2`) wrongly takes md's grid-cols-2 as base and drops the desktop
+// grid-cols-3 band entirely. The pass must pick the highest-min-width active variant per viewport.
+describe("buildTailwind source-intent picks the highest active breakpoint per viewport (FIX 3)", () => {
+  const GVPS = [375, 768, 1280, 1920];
+  function gridIr(srcClass: string): IR {
+    const gtc: Record<number, string> = {
+      375: "343px", 768: "348px 348px",
+      1280: "346.66px 346.66px 346.66px", 1920: "346.66px 346.66px 346.66px",
+    };
+    const gridW: Record<number, number> = { 375: 343, 768: 720, 1280: 1064, 1920: 1064 };
+    const mk = (id: string, byVp: Record<number, StyleMap>, w: Record<number, number>, kids: IRChild[] = [], sc?: string): IRNode => {
+      const computedByVp: Record<number, StyleMap> = {};
+      const bboxByVp: Record<number, BBox> = {};
+      const visibleByVp: Record<number, boolean> = {};
+      for (const vp of GVPS) {
+        computedByVp[vp] = computed(byVp[vp]);
+        bboxByVp[vp] = { x: 0, y: 0, width: w[vp]!, height: 100 };
+        visibleByVp[vp] = true;
+      }
+      const n: IRNode = { id, tag: "div", attrs: {}, visibleByVp, bboxByVp, computedByVp, children: kids };
+      if (sc) n.srcClass = sc;
+      return n;
+    };
+    const items = [0, 1, 2].map((i) => mk(`c${i}`, Object.fromEntries(GVPS.map((vp) => [vp, { display: "block" }])), Object.fromEntries(GVPS.map((vp) => [vp, 340])), [{ text: "x" } as IRChild]));
+    const grid = mk("n123", Object.fromEntries(GVPS.map((vp) => [vp, { display: "grid", gridTemplateColumns: gtc[vp], columnGap: "24px", rowGap: "24px", gap: "24px" }])), gridW, items, srcClass);
+    const root = mk("n0", Object.fromEntries(GVPS.map((vp) => [vp, {}])), Object.fromEntries(GVPS.map((vp) => [vp, vp])), [grid]);
+    return {
+      doc: {
+        sourceUrl: "https://example.test/grid", title: "Grid", lang: "en", charset: "UTF-8",
+        metaViewport: "width=device-width, initial-scale=1", viewports: GVPS, sampleViewports: GVPS, canonicalViewport: 1280,
+        perViewport: Object.fromEntries(GVPS.map((vp) => [vp, { scrollHeight: 800, scrollWidth: vp, htmlBg: "rgb(255, 255, 255)", bodyBg: "rgb(255, 255, 255)", bodyColor: "rgb(0, 0, 0)", bodyFont: "Arial" }])),
+        nodeCount: 5, keyframes: [],
+      },
+      root,
+    };
+  }
+
+  it("emits base grid-cols-3 (lg wins at 1280) even when md: follows lg: in the class string", () => {
+    const tw = buildTailwind(gridIr("grid grid-cols-1 gap-6 lg:grid-cols-3 md:grid-cols-2"), new Map());
+    const cls = tw.classOf.get("n123") || "";
+    const toks = cls.split(/\s+/);
+    assert.ok(toks.includes("grid-cols-3"), `desktop base must be grid-cols-3 (lg wins at 1280), got class: "${cls}"`);
+    assert.ok(!toks.some((t) => /(?:^|:)grid-cols-2$/.test(t) && !t.includes("md:max-lg:")), `md's grid-cols-2 must not become the base, got class: "${cls}"`);
+    assert.ok(toks.includes("md:max-lg:grid-cols-2"), `tablet band must be grid-cols-2, got class: "${cls}"`);
+    assert.ok(toks.includes("max-md:grid-cols-1"), `mobile band must be grid-cols-1, got class: "${cls}"`);
+  });
+});
