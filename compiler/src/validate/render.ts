@@ -21,9 +21,54 @@ export type BuildResult = {
   durationMs: number;
 };
 
+/** Dependencies the app's package.json declares that are absent from the harness's
+ *  preinstalled node_modules. The harness copies app SOURCE over its own tree but keeps its
+ *  preinstalled node_modules/package.json (for speed + determinism), so a dep the generator
+ *  injects for this clone but that the harness was never provisioned with (e.g. `lottie-web`,
+ *  added by injectLottieDep only for clones with Lottie content) would be missing at build time
+ *  → "Module not found" webpack error. Returns each such dep pinned to the app's exact version. */
+export function missingHarnessDeps(appDir: string, harnessDir: string): Array<{ name: string; version: string }> {
+  const pkgPath = join(appDir, "package.json");
+  if (!existsSync(pkgPath)) return [];
+  let deps: Record<string, string> = {};
+  try { deps = (JSON.parse(readFileSync(pkgPath, "utf8")).dependencies ?? {}) as Record<string, string>; }
+  catch { return []; }
+  const out: Array<{ name: string; version: string }> = [];
+  for (const [name, version] of Object.entries(deps)) {
+    // A dep is present iff its package.json resolves under the harness node_modules.
+    if (!existsSync(join(harnessDir, "node_modules", name, "package.json"))) {
+      out.push({ name, version: String(version).replace(/^[\^~]/, "") });
+    }
+  }
+  return out;
+}
+
+/** Install any app-declared dependency missing from the harness node_modules, pinned to the
+ *  app's exact version. --no-save keeps the harness package.json/lockfile untouched (the install
+ *  is per-clone and idempotent); returns an error string if the install failed (surfaced as a
+ *  build-gate issue) or null on success/no-op. */
+function ensureHarnessDeps(appDir: string, harnessDir: string): string | null {
+  const missing = missingHarnessDeps(appDir, harnessDir);
+  if (!missing.length) return null;
+  const specs = missing.map((d) => `${d.name}@${d.version}`);
+  const res = spawnSync("npm", ["install", "--no-save", "--no-audit", "--no-fund", ...specs], {
+    cwd: harnessDir,
+    encoding: "utf8",
+    env: { ...process.env },
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 180000,
+  });
+  if (res.status !== 0) {
+    return `harness dep install failed for ${specs.join(", ")}: ${(res.stderr || res.stdout || "").split("\n").filter(Boolean).slice(-3).join(" | ")}`;
+  }
+  return null;
+}
+
 /** Build the generated app inside the shared harness (deps preinstalled). */
 export function buildApp(appDir: string, harnessDir: string): BuildResult {
   const t0 = Date.now();
+  const depErr = ensureHarnessDeps(appDir, harnessDir);
+  if (depErr) return { ok: false, outDir: null, stderr: depErr, durationMs: Date.now() - t0 };
   const isVite = existsSync(join(appDir, "vite.config.ts")) || existsSync(join(appDir, "index.html"));
   if (isVite) {
     for (const entry of readdirSync(harnessDir, { withFileTypes: true })) {

@@ -12,6 +12,11 @@ import type { GateResult } from "./gates.js";
  *     on the node, register the referenced @keyframes, and (decisively for infinite
  *     loops) actually be running it (`document.getAnimations()`); a keyframes set we
  *     could not capture (cross-origin sheet) is counted "frozen" — honestly left static.
+ *     A captured CSS entrance animation that the clone instead REPLAYS through a
+ *     DittoMotion reveal (visibility+entrance-class: start hidden, restart the entrance
+ *     @keyframes on scroll-into-view) is NOT emitted as a static decl — it is deliberately
+ *     driven by the reveal replay and graded by the scroll-reveal check below, so it is
+ *     excluded from the static-CSS expectation instead of failing `emitted=false`.
  *   - WAAPI animations + rotating text (from motion.json): the clone's DittoMotion
  *     controller must instantiate the same running animation / cycle the same texts.
  * No wall-clock: the check reads the declared spec (names/timing/keyframe registration)
@@ -46,8 +51,21 @@ function capToCid(ir: IR): Map<string, string> {
   return m;
 }
 
+/** A captured CSS entrance is reveal-REPLAYED (not statically emitted) when the node has a
+ *  DittoMotion reveal spec that replays a matching entrance animationName. Such cids are graded
+ *  by the scroll-reveal check, so they must be excluded from the static-CSS expectation rather
+ *  than failing `emitted=false`. `revealAnimByCid` maps cid → the animationName its reveal replays. */
+export function cssReplayedByReveal(
+  cid: string,
+  names: string[],
+  revealAnimByCid: Map<string, string>,
+): boolean {
+  const revealAnim = revealAnimByCid.get(cid);
+  return !!revealAnim && names.includes(revealAnim);
+}
+
 /** CSS-animated nodes expected from the IR (computed animation-name ≠ none). */
-function collectExpectedCss(ir: IR): ExpectedCss[] {
+export function collectExpectedCss(ir: IR): ExpectedCss[] {
   const vp = ir.doc.canonicalViewport;
   const out: ExpectedCss[] = [];
   const walk = (n: IRNode): void => {
@@ -100,7 +118,7 @@ export async function driveMotionGate(opts: {
   const vh = VIEWPORT_HEIGHTS[vp] ?? Math.round(vp * 0.66);
 
   const issues: string[] = [];
-  let cssReproduced = 0, cssFrozen = 0, cssRunning = 0;
+  let cssReproduced = 0, cssFrozen = 0, cssReplayed = 0, cssRunning = 0;
   let waapiReproduced = 0, rotatorsReproduced = 0, revealsReproduced = 0, marqueesReproduced = 0;
   const browser = await chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
   try {
@@ -146,8 +164,21 @@ export async function driveMotionGate(opts: {
     const presentKf = new Set(probe.kf);
     const runningSet = new Set(probe.runningCids);
 
+    // Entrance animations the clone drives through a DittoMotion reveal (visibility+entrance-class):
+    // it re-hides the node on mount and restarts the entrance @keyframes on scroll-into-view, so the
+    // static `animation-name` is deliberately NOT emitted. Such cids are graded by the scroll-reveal
+    // check (opacity → visible), not the static-CSS decl check — record their names so a matching
+    // captured CSS animation is excluded from the static expectation rather than failing emitted=false.
+    const revealAnimByCid = new Map<string, string>();
+    for (const rv of reveals) {
+      if (rv.animationName) revealAnimByCid.set(rv.cid, rv.animationName);
+    }
+
     // ---- declarative CSS @keyframes ----
     for (const e of expectedCss) {
+      // Reveal-replayed entrance: covered by the scroll-reveal check, not static CSS. Excluded
+      // when the captured animation name matches the name the reveal replays for this cid.
+      if (cssReplayedByReveal(e.cid, e.names, revealAnimByCid)) { cssReplayed++; continue; }
       const reproducible = e.names.filter((n) => capturedKf.has(n));
       if (reproducible.length === 0) { cssFrozen++; continue; } // keyframes not captured → frozen (honest)
       const cloneAn = probe.animName[e.cid] ?? "";
@@ -191,9 +222,13 @@ export async function driveMotionGate(opts: {
     }
 
     // ---- scroll reveals — scrolling each into view must reveal it (opacity → visible) ----
+    // Grade EVERY captured reveal: the pass check compares revealsReproduced against
+    // reveals.length, so capping the drive at a subset would make any page with more reveals
+    // than the cap unable to pass (its later reveals silently ungraded). (This was the cause
+    // of the spurious "reveals 16/24" — 24 reveals, only 16 driven.)
     const opacityOf = (cid: string): Promise<number> =>
       page.evaluate((c) => { const el = document.querySelector(`[data-cid="${c}"]`); return el ? parseFloat(getComputedStyle(el).opacity || "1") : -1; }, cid);
-    for (const rv of reveals.slice(0, 16)) {
+    for (const rv of reveals) {
       try {
         await page.evaluate((c) => document.querySelector(`[data-cid="${c}"]`)?.scrollIntoView({ block: "center" }), rv.cid);
         await page.waitForTimeout(650); // allow the reveal transition to complete
@@ -212,10 +247,11 @@ export async function driveMotionGate(opts: {
 
   const cssExpected = expectedCss.length;
   const droveOk = !issues.some((i) => i.startsWith("motion drive error"));
-  // Pass: every captured animation is either faithfully reproduced or honestly frozen
-  // (keyframes uncapturable), every WAAPI/rotator reproduced, and the driver didn't crash.
+  // Pass: every captured animation is either faithfully reproduced as static CSS, honestly
+  // frozen (keyframes uncapturable), or replayed through a DittoMotion reveal (graded by the
+  // scroll-reveal check); every WAAPI/rotator/reveal reproduced; and the driver didn't crash.
   const pass = droveOk
-    && cssReproduced + cssFrozen === cssExpected
+    && cssReproduced + cssFrozen + cssReplayed === cssExpected
     && waapiReproduced === waapi.length
     && rotatorsReproduced === rotators.length
     && revealsReproduced === reveals.length
@@ -225,7 +261,7 @@ export async function driveMotionGate(opts: {
     pass,
     metrics: {
       animations: cssExpected + waapi.length + rotators.length + reveals.length + marquees.length,
-      css: `${cssReproduced}/${cssExpected}`, cssReproduced, cssFrozen, cssRunning,
+      css: `${cssReproduced}/${cssExpected}`, cssReproduced, cssFrozen, cssReplayed, cssRunning,
       waapi: `${waapiReproduced}/${waapi.length}`,
       rotators: `${rotatorsReproduced}/${rotators.length}`,
       reveals: `${revealsReproduced}/${reveals.length}`,
