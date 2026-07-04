@@ -244,9 +244,13 @@ function isFluidFullBleed(node: IRNode, parentNode: IRNode | undefined, viewport
     const pos = cs.position || "static";
     if (pos === "absolute" || pos === "fixed") {
       if (!(nearZero(cs.left) && nearZero(cs.right))) return false; // width is real unless both insets pin it
-    } else if (pos === "sticky") {
-      return false;
     } else {
+      // static | relative | sticky. A sticky box generates a normal in-flow box: its WIDTH fills the
+      // containing block exactly as static/relative does (position:sticky only shifts the box's offset
+      // while scrolling, never its resolved width). So a sticky wrapper that spans the viewport at
+      // every captured width was authored fluid (width:100%/auto) and must NOT freeze to the canonical
+      // px — frozen at 1280, a `justify-content:center` sticky banner pushes its inner content off a
+      // 375 viewport. Treat sticky identically to the static/relative fluid-fill branch.
       if (!(zeroOrAuto(cs.left) && zeroOrAuto(cs.right))) return false; // positioned breakout: width is real
       const pdisp = parentNode?.computedByVp[vp]?.display || "";
       if (/flex|grid/.test(pdisp)) return false; // flex/grid item: auto width ≠ fill

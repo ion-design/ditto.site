@@ -1210,3 +1210,63 @@ describe("collectNodeRules picture fill child keeps authored height (T2)", () =>
     assert.ok(/560px|500px|480px/.test(all), `authored height must survive with a picture fill child, got: ${all}`);
   });
 });
+
+// A `position:sticky` full-width banner wrapper: its box spans the viewport at EVERY captured width
+// (375/768/1280), so it was authored fluid (width:100%/auto) — sticky only shifts the box's offset
+// while scrolling, never its resolved width. Freezing it to the canonical 1280px means at a 375
+// viewport its `justify-content:center` pushes the inner content off-screen. A viewport-tracking
+// sticky wrapper must emit no frozen width (→ fluid `width:auto`, resolving to the identical px at
+// every captured width, so gates 0–6 stay unmoved).
+describe("generateCss sticky full-width wrapper is viewport-tracking (no px freeze)", () => {
+  // Sticky banner directly under <body>; spans the full viewport width at every width, centred inner.
+  function stickyBanner() {
+    const inner = xNode("n2", "span", {
+      375: { cs: { display: "inline-block" }, bbox: { x: 120, y: 8, width: 135, height: 20 } },
+      768: { cs: { display: "inline-block" }, bbox: { x: 316, y: 8, width: 135, height: 20 } },
+      1280: { cs: { display: "inline-block" }, bbox: { x: 572, y: 8, width: 135, height: 20 } },
+    }, [{ text: "Enrollment is open" } as IRChild]);
+    const banner = xNode("n1", "div", {
+      375: { cs: { display: "flex", position: "sticky", justifyContent: "center", top: "0px", width: "375px" }, bbox: { x: 0, y: 0, width: 375, height: 36 } },
+      768: { cs: { display: "flex", position: "sticky", justifyContent: "center", top: "0px", width: "768px" }, bbox: { x: 0, y: 0, width: 768, height: 36 } },
+      1280: { cs: { display: "flex", position: "sticky", justifyContent: "center", top: "0px", width: "1280px" }, bbox: { x: 0, y: 0, width: 1280, height: 36 } },
+    }, [inner]);
+    return xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 800 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 800 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 800 } },
+    }, [banner]);
+  }
+
+  it("does not freeze the sticky banner width to the canonical px", () => {
+    const css = generateCss(xIr(stickyBanner()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/width:1280px/.test(all), `sticky full-width banner must not freeze to canonical px, got: ${all}`);
+    assert.ok(!/width:768px/.test(all) && !/width:375px/.test(all), `no per-band px freeze either, got: ${all}`);
+  });
+
+  it("does not inject auto margins (fix drops the width only, not centring)", () => {
+    // The d3ec154 guard: mx-auto only for true auto-margin centring. A sticky banner centres its
+    // INNER content via justify-content, so the wrapper itself must not gain auto side margins.
+    const css = generateCss(xIr(stickyBanner()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/margin-left:auto/.test(all) && !/margin-right:auto/.test(all), `must not add auto margins, got: ${all}`);
+  });
+
+  it("still freezes a genuinely fixed-width sticky element (not viewport-spanning)", () => {
+    // A sticky sidebar rail whose width is a real fixed px (constant 280px, never == the viewport)
+    // must keep its baked width — the fluid-full-bleed detector only fires when the box spans the
+    // viewport at every width.
+    const rail = xNode("n1", "div", {
+      375: { cs: { display: "block", position: "sticky", top: "0px", width: "280px" }, bbox: { x: 0, y: 0, width: 280, height: 400 } },
+      768: { cs: { display: "block", position: "sticky", top: "0px", width: "280px" }, bbox: { x: 0, y: 0, width: 280, height: 400 } },
+      1280: { cs: { display: "block", position: "sticky", top: "0px", width: "280px" }, bbox: { x: 0, y: 0, width: 280, height: 400 } },
+    });
+    const root = xNode("n0", "body", {
+      375: { bbox: { x: 0, y: 0, width: 375, height: 800 } },
+      768: { bbox: { x: 0, y: 0, width: 768, height: 800 } },
+      1280: { bbox: { x: 0, y: 0, width: 1280, height: 800 } },
+    }, [rail]);
+    const css = generateCss(xIr(root), new Map());
+    assert.ok(/width:280px/.test(allRulesX(css, "n1")), `a fixed-width sticky rail keeps its px, got: ${allRulesX(css, "n1")}`);
+  });
+});

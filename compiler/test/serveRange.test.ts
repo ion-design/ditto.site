@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { serveStatic, parseRangeHeader } from "../src/validate/render.js";
+import { serveStatic, parseRangeHeader, pendingFontFamilies, type FontFaceStatus } from "../src/validate/render.js";
 
 // ---- Pure helper: parseRangeHeader ----
 describe("parseRangeHeader", () => {
@@ -49,6 +49,54 @@ describe("parseRangeHeader", () => {
     assert.deepEqual(parseRangeHeader("bytes=0-10,20-30", SIZE), { kind: "full" }); // multi-range collapsed
     assert.deepEqual(parseRangeHeader("bytes=-", SIZE), { kind: "full" });
     assert.deepEqual(parseRangeHeader("bytes=500-100", SIZE), { kind: "full" }); // inverted
+  });
+});
+
+// ---- Pure helper: pendingFontFamilies (the font-load wait decision) ----
+// The render walk must run after webfonts are APPLIED, else text boxes measure the fallback face
+// (a systematic width delta wrongly attributed to the clone). This helper is the state-based (not
+// time-based) predicate the in-page poll ends on: it returns the DECLARED families not yet terminal.
+describe("pendingFontFamilies", () => {
+  const face = (family: string, status: string, weight = "400", style = "normal"): FontFaceStatus => ({ family, weight, style, status });
+
+  it("no faces declared → nothing pending", () => {
+    assert.deepEqual(pendingFontFamilies([]), []);
+  });
+
+  it("all faces loaded → nothing pending (walk may proceed)", () => {
+    assert.deepEqual(pendingFontFamilies([face("Avenir", "loaded"), face("Inter", "loaded")]), []);
+  });
+
+  it("an unloaded face makes its family pending", () => {
+    assert.deepEqual(pendingFontFamilies([face("Avenir", "unloaded")]), ["Avenir"]);
+  });
+
+  it("a loading face makes its family pending", () => {
+    assert.deepEqual(pendingFontFamilies([face("Avenir", "loading")]), ["Avenir"]);
+  });
+
+  it("errored faces are terminal — never reported pending (waiting longer is pointless)", () => {
+    assert.deepEqual(pendingFontFamilies([face("Avenir", "error")]), []);
+  });
+
+  it("a family with mixed weights is pending if ANY weight is not terminal", () => {
+    const faces = [face("Avenir", "loaded", "400"), face("Avenir", "loading", "700")];
+    assert.deepEqual(pendingFontFamilies(faces), ["Avenir"]);
+  });
+
+  it("a family whose faces are all terminal (loaded or errored) is not pending", () => {
+    const faces = [face("Avenir", "loaded", "400"), face("Avenir", "error", "700")];
+    assert.deepEqual(pendingFontFamilies(faces), []);
+  });
+
+  it("strips surrounding quotes from the reported family name and dedupes+sorts", () => {
+    const faces = [face('"Source Serif"', "unloaded"), face("Avenir", "loading"), face("Avenir", "unloaded")];
+    assert.deepEqual(pendingFontFamilies(faces), ["Avenir", "Source Serif"]);
+  });
+
+  it("only the unloaded families are returned when some are loaded", () => {
+    const faces = [face("Inter", "loaded"), face("Avenir", "unloaded"), face("JetBrains", "loaded")];
+    assert.deepEqual(pendingFontFamilies(faces), ["Avenir"]);
   });
 });
 

@@ -108,6 +108,9 @@ export async function validateRun(runDir: string, opts?: { harnessDir?: string; 
     try {
       const r = await renderApp({ url: server.url + "/", viewports, renderedDir });
       snapshots = r.snapshots; runtimeErrors = r.runtimeErrors; httpStatus = r.httpStatus; failedResources = r.failedResources;
+      // Non-fatal: webfonts that never loaded before the render walk (text was measured in a fallback
+      // face). Surfaced as a warning event, NOT a runtime error, so it never fails gate 0.
+      if (r.fontWarnings.length) log({ event: "font_wait_warning", families: r.fontWarnings });
       probeSnaps = await measureProbeWidths({ url: server.url + "/", widths: probeWidthsFor(viewports) });
       if (capture.interaction) {
         interactionGate = await driveInteractionGate({ url: server.url + "/", viewports, ir, interaction: capture.interaction });

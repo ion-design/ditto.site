@@ -260,7 +260,86 @@ export type RenderResult = {
   runtimeErrors: string[];
   httpStatus: number;
   failedResources: string[];
+  /** Non-fatal diagnostics: families the app declared via @font-face that never reached
+   *  `status:"loaded"` within the wait bound (their text was measured with a fallback face). */
+  fontWarnings: string[];
 };
+
+/** A single entry of `document.fonts` as reported in-page, reduced to the fields the
+ *  load decision needs. Serializable so the decision logic can be unit-tested outside a browser. */
+export type FontFaceStatus = { family: string; weight: string; style: string; status: string };
+
+/** Pure decision for the font-load wait: given the current `document.fonts` entries, return the
+ *  families that are DECLARED (an @font-face exists for them) but not yet `"loaded"`. A family is
+ *  considered pending while ANY of its faces is still `"unloaded"` or `"loading"`; a face that
+ *  `"error"`ed is treated as terminal (it will never load, so waiting longer is pointless — it is
+ *  not reported as pending). Empty return ⇒ every declared face has reached a terminal state and
+ *  the DOM may be measured. The check is state-based (not time-based), so the caller's poll is
+ *  deterministic: it ends the instant this returns empty, regardless of wall-clock timing. */
+export function pendingFontFamilies(faces: FontFaceStatus[]): string[] {
+  const pending = new Set<string>();
+  const terminalByFamily = new Map<string, boolean>();
+  for (const f of faces) {
+    const fam = f.family.replace(/^["']|["']$/g, "");
+    if (f.status === "loaded" || f.status === "error") {
+      if (!terminalByFamily.has(fam)) terminalByFamily.set(fam, true);
+    } else {
+      // "unloaded" | "loading" (or any non-terminal state) ⇒ this family is still pending.
+      pending.add(fam);
+      terminalByFamily.set(fam, false);
+    }
+  }
+  return [...pending].sort();
+}
+
+/** In-page: await `document.fonts.ready`, then poll (bounded) until every declared @font-face has
+ *  reached a terminal state (`loaded`/`error`). Returns the still-pending families when the bound
+ *  expired, or an empty array once all faces settled. Runs entirely inside the browser context so
+ *  it reads the live FontFaceSet. Bounded + state-based ⇒ deterministic (ends on state, never on a
+ *  fixed sleep). `capMs` is a hard ceiling so a hung/erroring font request can't stall the render. */
+async function awaitFontsLoaded(
+  page: import("playwright").Page,
+  opts?: { capMs?: number; pollMs?: number },
+): Promise<string[]> {
+  const capMs = opts?.capMs ?? 3000;
+  const pollMs = opts?.pollMs ?? 50;
+  try {
+    return await page.evaluate(
+      async ({ capMs, pollMs }) => {
+        const doc = document as Document;
+        const set = doc.fonts as unknown as { ready?: Promise<unknown>; forEach?: (cb: (f: FontFaceStatus) => void) => void } | undefined;
+        if (!set) return [];
+        const snapshot = (): { family: string; weight: string; style: string; status: string }[] => {
+          const out: { family: string; weight: string; style: string; status: string }[] = [];
+          set.forEach?.((f) => out.push({ family: f.family, weight: f.weight, style: f.style, status: f.status }));
+          return out;
+        };
+        const pending = (faces: { family: string; weight: string; style: string; status: string }[]): string[] => {
+          const p = new Set<string>();
+          for (const f of faces) {
+            const fam = f.family.replace(/^["']|["']$/g, "");
+            if (f.status !== "loaded" && f.status !== "error") p.add(fam);
+          }
+          return [...p].sort();
+        };
+        // First give the browser's own aggregate signal a chance (bounded — a hung request must not
+        // hold ready forever). Then poll the per-face states until all terminal or the cap expires.
+        await Promise.race([set.ready ?? Promise.resolve(), new Promise((r) => setTimeout(r, capMs))]);
+        const deadline = Date.now() + capMs;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const left = pending(snapshot());
+          if (left.length === 0) return [];
+          if (Date.now() >= deadline) return left;
+          await new Promise((r) => setTimeout(r, pollMs));
+        }
+      },
+      { capMs, pollMs },
+    ) as string[];
+  } catch {
+    return []; // a page without a FontFaceSet (or an evaluate fault) never blocks the walk
+  }
+}
 
 /** Navigate with `waitUntil:"load"` then wait for a bounded window of network quiet, so
  *  validation NEVER hard-fails on media that trickles requests. `waitUntil:"networkidle"`
@@ -335,6 +414,7 @@ export async function renderApp(opts: {
       const vh = viewportHeight(vw);
       const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: vw, height: vh }, deviceScaleFactor: 1 });
       const runtimeErrors: string[] = [];
+      const fontWarnings: string[] = [];
       const failedResources = new Set<string>();
       let httpStatus = 0;
       try {
@@ -345,7 +425,17 @@ export async function renderApp(opts: {
         page.on("requestfailed", (r) => failedResources.add(`failed ${r.url()}`));
         const resp = await gotoAndSettle(page, opts.url);
         if (resp) httpStatus = resp.status();
-        try { await page.evaluate(() => (document as Document).fonts?.ready); } catch { /* ignore */ }
+        // Webfonts must be APPLIED before the DOM walk and the screenshot: a rendered snapshot taken
+        // while the app's @font-face faces are still "unloaded" measures every text box in the
+        // fallback face (systematically narrower/wider glyphs → a bogus size delta attributed to the
+        // clone). Await document.fonts.ready AND poll (bounded, state-based) until every declared face
+        // is terminal, so this holds for both the walk below and the screenshot further down.
+        const pendingFonts = await awaitFontsLoaded(page);
+        if (pendingFonts.length) {
+          const msg = `font-wait: ${pendingFonts.length} @font-face families unloaded after wait bound at ${vw}px: ${pendingFonts.join(", ")}`;
+          fontWarnings.push(msg);
+          console.warn(`[render] ${msg}`);
+        }
         // Scroll to settle any lazy effects, then back to top.
         await page.evaluate(async () => {
           const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -389,18 +479,19 @@ export async function renderApp(opts: {
             await page.screenshot({ path: shotPath, fullPage: true, timeout: 90_000, animations: "disabled" });
           }
         } catch { /* ignore */ }
-        return { viewport: vw, snapshot, runtimeErrors, failedResources: [...failedResources], httpStatus };
+        return { viewport: vw, snapshot, runtimeErrors, fontWarnings, failedResources: [...failedResources], httpStatus };
       } finally {
         await ctx.close();
       }
     });
     const runtimeErrors = results.flatMap((r) => r.runtimeErrors);
+    const fontWarnings = results.flatMap((r) => r.fontWarnings);
     const failedResources = new Set(results.flatMap((r) => r.failedResources));
     for (const r of results) snapshots[r.viewport] = r.snapshot;
     const non200 = results.find((r) => r.httpStatus && r.httpStatus !== 200);
     const httpStatus = non200?.httpStatus ?? results.find((r) => r.httpStatus)?.httpStatus ?? 0;
     ensureDir(join(opts.renderedDir, "computed"));
-    return { snapshots, runtimeErrors, httpStatus, failedResources: [...failedResources] };
+    return { snapshots, runtimeErrors, httpStatus, failedResources: [...failedResources], fontWarnings };
   } finally {
     await browser.close();
   }
@@ -425,7 +516,9 @@ export async function measureProbeWidths(opts: { url: string; widths: number[] }
         const page = await ctx.newPage();
         await page.addInitScript(ESBUILD_SHIM);
         await gotoAndSettle(page, opts.url);
-        try { await page.evaluate(() => (document as Document).fonts?.ready); } catch { /* ignore */ }
+        // This probe walks the DOM and measures text boxes, so — exactly as renderApp does — webfonts
+        // must be applied first, else the probe reads fallback-font widths at the off-band widths.
+        await awaitFontsLoaded(page);
         await page.evaluate(() => {
           const win = window as unknown as { __dittoMotionStopped?: boolean; __dittoMotionStop?: () => void };
           try { win.__dittoMotionStopped = true; } catch { /* ignore */ }
