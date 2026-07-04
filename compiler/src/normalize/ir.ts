@@ -25,6 +25,9 @@ export type IRNode = {
   // element had no class.
   srcClass?: string;
   rawHTML?: string; // inline svg
+  // Computed paint of an inline <svg> root (fill/stroke/color), carried from capture. Lets codegen
+  // recover a paint that a raw `fill="none"` attribute hides but site CSS actually supplied.
+  svgPaint?: { fill: string; stroke: string; color: string };
   visibleByVp: Record<number, boolean>;
   bboxByVp: Record<number, BBox>;
   computedByVp: Record<number, StyleMap>;
@@ -456,6 +459,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       children: [],
     };
     if (raw.rawHTML) node.rawHTML = raw.rawHTML;
+    if (raw.svgPaint) node.svgPaint = raw.svgPaint;
     const srcClass = (raw.attrs?.class ?? "").trim();
     if (srcClass) node.srcClass = srcClass;
     if (Object.keys(sizingByVp).length) node.sizingByVp = sizingByVp;

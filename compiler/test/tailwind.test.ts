@@ -133,3 +133,21 @@ describe("declToUtil letter-spacing sub-0.1px preservation", () => {
     assert.equal(declToUtil("width", "204.9994px"), "w-[205px]");
   });
 });
+
+// text-wrap: modern heading line-balancing. `balance`/`pretty` rebalance where a title wraps;
+// without emitting them a two-line heading breaks differently in the clone. Tailwind v4 has the
+// named utilities text-balance / text-pretty / text-nowrap / text-wrap; anything else (e.g.
+// `stable`) falls through to the arbitrary property escape.
+describe("declToUtil text-wrap", () => {
+  it("maps balance and pretty to the named Tailwind v4 utilities", () => {
+    assert.equal(declToUtil("text-wrap", "balance"), "text-balance");
+    assert.equal(declToUtil("text-wrap", "pretty"), "text-pretty");
+  });
+  it("maps wrap and nowrap to their named utilities", () => {
+    assert.equal(declToUtil("text-wrap", "wrap"), "text-wrap");
+    assert.equal(declToUtil("text-wrap", "nowrap"), "text-nowrap");
+  });
+  it("falls back to the arbitrary property for an unmapped value", () => {
+    assert.equal(declToUtil("text-wrap", "stable"), "[text-wrap:stable]");
+  });
+});

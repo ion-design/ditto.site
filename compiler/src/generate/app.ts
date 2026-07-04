@@ -401,18 +401,34 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
     // surface verbatim in the markup and (post-extraction) as a bogus data field.
     const inner = svgInnerForNode(node, ctx);
     const svgAttrs = extractSvgAttrs(node.rawHTML);
-    let hasFillAttr = false;
+    let rawFill: string | undefined;
     for (const [k, v] of svgAttrs) {
-      if (k.toLowerCase() === "fill") hasFillAttr = true;
+      if (k.toLowerCase() === "fill") { rawFill = v; continue; } // the root fill is resolved below, not copied verbatim
       if (k === "class" || k === "style" || k === "data-cid-cap" || k.includes(":")) continue;
       const reactName = SVG_ATTR_RENAME[k] ?? k;
       const propKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(reactName) ? reactName : JSON.stringify(reactName);
       if (!props.some(([pk]) => pk === propKey)) props.push([propKey, JSON.stringify(v)]);
     }
-    // Raw SVG icons often rely on site CSS (`svg { fill: currentColor }` or a class) that is
-    // stripped during extraction. If the root didn't declare a fill, inherit the surrounding text
-    // color so monochrome wordmarks/icons don't fall back to the browser's black default.
-    if (!hasFillAttr && !props.some(([pk]) => pk === "fill")) props.push(["fill", JSON.stringify("currentColor")]);
+    // Reconcile the root fill against the captured COMPUTED paint. A raw `fill="none"` only looks
+    // unfilled: site CSS (`fill: currentColor` on the wordmark, an inherited color) may actually
+    // paint it, and that CSS is stripped during extraction. resolveSvgRootFill recovers the real
+    // paint — as currentColor when the computed fill tracks the element's color (emit that color
+    // too), else the literal value — and leaves a genuinely unfilled svg as fill="none". When the
+    // root declared no fill at all we fall back to currentColor so monochrome icons don't drop to
+    // the browser's black default.
+    if (!props.some(([pk]) => pk === "fill")) {
+      const resolved = resolveSvgRootFill(rawFill, node.svgPaint);
+      if (resolved.mode === "keep") {
+        if (rawFill !== undefined) props.push(["fill", JSON.stringify(rawFill)]);
+      } else if (resolved.mode === "emit") {
+        props.push(["fill", JSON.stringify(resolved.value!)]);
+        if (resolved.emitColor && !props.some(([pk]) => pk === "color")) {
+          props.push(["color", JSON.stringify(resolved.emitColor)]);
+        }
+      } else {
+        props.push(["fill", JSON.stringify("currentColor")]);
+      }
+    }
     props.push(["dangerouslySetInnerHTML", `{ __html: ${JSON.stringify(inner)} }`]);
   }
 
@@ -458,6 +474,50 @@ function extractSvgAttrs(outerHTML: string): Array<[string, string]> {
     out.push([name, val]);
   }
   return out;
+}
+
+/** A resolved paint value is "real" (paints something) when it is neither absent nor an explicit
+ * non-paint (`none`) nor fully transparent. `currentColor` counts as real (it paints the inherited
+ * color). Case/whitespace-insensitive. */
+export function isRealPaint(value: string | null | undefined): boolean {
+  const v = (value ?? "").trim().toLowerCase();
+  if (!v || v === "none" || v === "transparent") return false;
+  if (v === "rgba(0, 0, 0, 0)" || v === "rgba(0,0,0,0)") return false;
+  return true;
+}
+
+/**
+ * Decide what `fill` an inline <svg> ROOT should emit, reconciling the raw `fill` attribute against
+ * the svg's COMPUTED paint (captured from the live source). Pure and deterministic.
+ *
+ * - Raw `fill` present and itself a real paint → keep it (`keep`): the author meant that fill.
+ * - Raw `fill="none"` but the computed fill IS a real paint → the root only looked unfilled because
+ *   `fill="none"` is a presentation attribute the site's CSS overrode. Recover the real paint:
+ *   emit `currentColor` when the computed fill equals the computed `color` (a `fill: currentColor`
+ *   class — the common wordmark case; caller must also emit `color`), else the literal computed fill.
+ * - Raw `fill="none"` and computed fill also not a real paint → genuinely unfilled: keep `none`.
+ * - Raw `fill` absent → `fallback`: caller applies its existing currentColor default.
+ */
+export function resolveSvgRootFill(
+  rawFill: string | null | undefined,
+  computed?: { fill?: string; color?: string } | null,
+): { mode: "keep" | "fallback" | "emit"; value?: string; emitColor?: string } {
+  const raw = (rawFill ?? "").trim();
+  if (raw && raw.toLowerCase() !== "none") return { mode: "keep" };
+  if (raw.toLowerCase() === "none") {
+    const cf = computed?.fill;
+    if (isRealPaint(cf)) {
+      const color = (computed?.color ?? "").trim();
+      // fill:currentColor resolves to the element's color; recover it as currentColor so the clone
+      // tracks whatever color the surrounding CSS supplies, and signal the caller to emit that color.
+      if (color && cf!.trim().toLowerCase() === color.toLowerCase() && isRealPaint(color)) {
+        return { mode: "emit", value: "currentColor", emitColor: color };
+      }
+      return { mode: "emit", value: cf!.trim() };
+    }
+    return { mode: "keep" }; // genuinely unfilled — leave fill="none"
+  }
+  return { mode: "fallback" };
 }
 
 // SVG presentation attributes that React requires in camelCase (kebab in JSX is silently

@@ -55,6 +55,10 @@ export type RawNode = {
   // clone renders the browser's default gray, losing the authored placeholder color/type.
   placeholder?: RawStyle;
   rawHTML?: string; // set for inline <svg>
+  // Computed paint of an inline <svg> root (fill/stroke/color). A raw `fill="none"` attribute may
+  // still resolve to a real paint via site CSS (`fill: currentColor`); these resolved values let
+  // codegen recover a paint the extraction stripped. Set only for svg roots.
+  svgPaint?: { fill: string; stroke: string; color: string };
   children: RawChild[];
 };
 
@@ -138,6 +142,11 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     "letterSpacing", "wordSpacing", "textAlign", "textTransform",
     "textDecorationLine", "textDecorationColor", "textDecorationStyle",
     "whiteSpace", "wordBreak", "overflowWrap", "textOverflow", "textIndent",
+    // Modern line-wrapping: `text-wrap: balance/pretty` rebalances heading line breaks
+    // (getComputedStyle reports the shorthand — "balance"/"pretty"/"wrap"). Without it a
+    // balanced heading wraps differently in the clone (an even two-line title collapses
+    // to a lopsided break). Default "wrap" is elided downstream.
+    "textWrap",
     "textShadow", "fontVariantCaps", "fontFeatureSettings",
     // Line clamping (`display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:N`):
     // the mechanism that keeps cards equal height regardless of text length. Without it the engine
@@ -464,6 +473,14 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     // Inline SVG → raw markup, no recursion.
     if (tag === "svg") {
       node.rawHTML = el.outerHTML;
+      // Capture the svg root's COMPUTED paint (fill/stroke/color) separately from the general
+      // computed-prop list. A raw `fill="none"` presentation attribute paints nothing on its own; a
+      // wordmark/icon is visible on the source only because site CSS (a `fill: currentColor` class,
+      // an inherited `color`) overrides it. Extraction strips that CSS, so the raw attribute alone is
+      // misleading — codegen consults these resolved values to decide whether the root truly paints.
+      try {
+        node.svgPaint = { fill: cs.fill, stroke: cs.stroke, color: cs.color };
+      } catch { /* getComputedStyle already read above; guard against exotic UAs */ }
       return node;
     }
 

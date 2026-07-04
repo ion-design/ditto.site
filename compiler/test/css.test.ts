@@ -784,3 +784,39 @@ describe("generateCss breakpoint-gated marquee transform band suppression (Defec
     assert.ok(/matrix\(1, ?0, ?0, ?1, ?-40/.test(allRulesX(css, "n1")), `a non-animated per-band offset must be kept, got: ${allRulesX(css, "n1")}`);
   });
 });
+
+// text-wrap emission: a heading authored `text-wrap:balance` must survive to the clone, or the
+// title wraps differently. The initial `wrap` is elided (it's the default), so only authored
+// balance/pretty/nowrap ship.
+describe("generateCss text-wrap", () => {
+  it("emits an authored text-wrap:balance on a heading", () => {
+    const h1 = node("n1", "h1", computed({ textWrap: "balance" }));
+    const root = node("n0", "body", computed(), [h1]);
+    const css = generateCss(irWith(root), new Map());
+    assert.ok(/text-wrap:balance/.test(baseRule(css, "n1")), `text-wrap:balance emitted (got: ${baseRule(css, "n1")})`);
+  });
+
+  it("emits text-wrap:pretty", () => {
+    const p = node("n1", "p", computed({ textWrap: "pretty" }));
+    const root = node("n0", "body", computed(), [p]);
+    const css = generateCss(irWith(root), new Map());
+    assert.ok(/text-wrap:pretty/.test(baseRule(css, "n1")), `text-wrap:pretty emitted (got: ${baseRule(css, "n1")})`);
+  });
+
+  it("elides the default text-wrap:wrap (no noise)", () => {
+    const h1 = node("n1", "h1", computed({ textWrap: "wrap" }));
+    const root = node("n0", "body", computed(), [h1]);
+    const css = generateCss(irWith(root), new Map());
+    assert.ok(!/text-wrap/.test(baseRule(css, "n1")), `default text-wrap:wrap must not be emitted (got: ${baseRule(css, "n1")})`);
+  });
+
+  it("skips text-wrap on a child when it equals the parent (inherited)", () => {
+    // text-wrap is inherited: a child matching the parent's balance relies on inheritance.
+    const child = node("n2", "span", computed({ textWrap: "balance" }));
+    const h1 = node("n1", "h1", computed({ textWrap: "balance" }), [child]);
+    const root = node("n0", "body", computed(), [h1]);
+    const css = generateCss(irWith(root), new Map());
+    assert.ok(/text-wrap:balance/.test(baseRule(css, "n1")), "parent heading emits balance");
+    assert.ok(!/text-wrap/.test(baseRule(css, "n2")), `inherited child does not re-emit (got: ${baseRule(css, "n2")})`);
+  });
+});

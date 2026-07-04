@@ -74,7 +74,7 @@ function isViewportHeight(value: string, width: number): boolean {
 const INHERITED = new Set([
   "color", "fontFamily", "fontSize", "fontWeight", "fontStyle", "lineHeight",
   "letterSpacing", "wordSpacing", "textAlign", "textTransform", "whiteSpace",
-  "wordBreak", "overflowWrap", "textIndent", "fontVariantCaps", "fontFeatureSettings",
+  "wordBreak", "overflowWrap", "textWrap", "textIndent", "fontVariantCaps", "fontFeatureSettings",
   "listStyleType", "listStylePosition", "writingMode", "direction", "cursor",
   "textShadow", "visibility", "textDecorationColor", "webkitTextStroke",
   "webkitTextFillColor",
@@ -139,6 +139,8 @@ const GENERIC: Array<{ prop: string; def: string | string[] }> = [
   { prop: "textDecorationStyle", def: "solid" },
   { prop: "whiteSpace", def: "__never__" }, { prop: "wordBreak", def: "__never__" },
   { prop: "overflowWrap", def: "__never__" }, { prop: "textIndent", def: "__never__" },
+  // text-wrap: elide the initial `wrap`; emit `balance`/`pretty`/`nowrap`/`stable`.
+  { prop: "textWrap", def: "wrap" },
   { prop: "textShadow", def: "__never__" }, { prop: "fontVariantCaps", def: "__never__" },
   { prop: "fontFeatureSettings", def: "__never__" }, { prop: "listStyleType", def: "__never_list__" },
   { prop: "listStylePosition", def: "__never__" }, { prop: "writingMode", def: "__never__" },

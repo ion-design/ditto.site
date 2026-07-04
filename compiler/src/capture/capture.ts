@@ -182,6 +182,41 @@ export function looksLikeVideoFile(bytes: Buffer): boolean {
   return false;
 }
 
+/**
+ * A `<source>` candidate for the HTML media resource-selection algorithm. `media`/`type` are the
+ * raw attribute strings (null/undefined when absent, matching a missing attribute).
+ */
+export interface VideoSourceCandidate {
+  media?: string | null;
+  type?: string | null;
+}
+
+/**
+ * Pure re-implementation of the source-selection step of the HTML media resource-selection
+ * algorithm: return the index of the FIRST `<source>` (document order) that is eligible NOW, or -1
+ * when none is. A source is eligible when its `media` query matches (a missing/empty media matches
+ * unconditionally) AND the UA can play its `type` (a missing/empty type is not a disqualifier —
+ * `canPlayType` is only consulted when a type is present).
+ *
+ * The predicates are injected so this is testable in Node (the in-page caller passes the real
+ * `matchMedia`/`canPlayType`). Kept deterministic: no state, first-match wins in document order.
+ */
+export function selectVideoSourceIndex(
+  sources: VideoSourceCandidate[],
+  mediaMatches: (media: string) => boolean,
+  canPlay: (type: string) => boolean,
+): number {
+  for (let i = 0; i < sources.length; i++) {
+    const s = sources[i]!;
+    const media = (s.media ?? "").trim();
+    if (media && !mediaMatches(media)) continue;
+    const type = (s.type ?? "").trim();
+    if (type && !canPlay(type)) continue;
+    return i;
+  }
+  return -1;
+}
+
 async function autoScroll(page: import("playwright").Page, vpHeight: number): Promise<void> {
   // Scroll through the page to trigger lazy-loaded images/backgrounds, then return
   // to the top so document-coordinate bboxes are measured from a settled layout.
@@ -804,12 +839,57 @@ async function captureScreenshot(
  * diff that no CSS change can close. Seeking BOTH sides to frame 0 before EVERY viewport screenshot
  * removes it. `seeked` fires once the new frame is decoded; we still yield two rAFs so the compositor
  * has painted it before the screenshot reads pixels. Bounded so a stalled/unseekable video can't hang.
+ *
+ * FIRST it re-runs `<source media>` resource selection for THIS viewport. The capture pipeline loads
+ * the page once at the canonical width and reaches every other viewport by resizing — but the HTML
+ * media resource-selection algorithm evaluates `<source media>` only at load, so an aspect/orientation
+ * -gated hero video stays frozen on whatever variant matched at load width across all resized shots.
+ * The validator fresh-loads per viewport and correctly re-selects, so the two channels disagree on
+ * which variant is on screen (a large phantom diff on full-bleed portrait/landscape hero videos).
+ * Re-selecting here keeps the channels symmetric; it is a no-op on the fresh-loading validator side
+ * and — the common case — a no-op whenever the current selection is still the right one, so the fast
+ * path never touches `video.load()`.
  */
 export async function normalizeVideoTime(page: import("playwright").Page): Promise<void> {
   try {
     await page.evaluate(async () => {
       const vids = Array.from(document.querySelectorAll("video"));
       const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+      // Re-select the <source> the resource-selection algorithm would pick at the CURRENT viewport,
+      // mirroring selectVideoSourceIndex (Node-side, unit-tested): first source in document order
+      // whose media matches (missing media matches unconditionally) and whose type is playable
+      // (missing type is never disqualifying). Only reload when the winner differs from what is
+      // currently loaded — the fast path leaves untouched videos alone.
+      const reloadWaits: Promise<void>[] = [];
+      for (const v of vids) {
+        try {
+          const sources = Array.from(v.querySelectorAll("source"));
+          if (sources.length === 0) continue; // src attribute (no <source> children): nothing to re-select
+          let winner: HTMLSourceElement | null = null;
+          for (const s of sources) {
+            const media = (s.getAttribute("media") ?? "").trim();
+            if (media && !window.matchMedia(media).matches) continue;
+            const type = (s.getAttribute("type") ?? "").trim();
+            if (type && !v.canPlayType(type)) continue;
+            winner = s;
+            break;
+          }
+          if (!winner || !winner.src) continue;
+          // Compare resolved URLs; currentSrc is absolute, winner.src is already resolved.
+          if (v.currentSrc === winner.src) continue; // no change — fast path, do not reload
+          v.load();
+          reloadWaits.push(new Promise<void>((resolve) => {
+            let settled = false;
+            const done = () => { if (settled) return; settled = true; v.removeEventListener("loadeddata", done); resolve(); };
+            if (v.readyState >= 2 /* HAVE_CURRENT_DATA */) { done(); return; }
+            v.addEventListener("loadeddata", done, { once: true });
+            setTimeout(done, 4000); // bound: a stalled reload resolves anyway so the shot never hangs
+          }));
+        } catch { /* a malformed <source>/media query must not block the others */ }
+      }
+      if (reloadWaits.length) await Promise.all(reloadWaits);
+
       const waits: Promise<void>[] = [];
       for (const v of vids) {
         try { v.pause(); } catch { /* ignore */ }

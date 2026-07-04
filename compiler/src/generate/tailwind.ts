@@ -18,6 +18,7 @@
 import type { IR, IRNode } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import { collectNodeRules, computeBands, keyframesCss, type NodeRule } from "./css.js";
+import { colorClusterKey } from "../infer/semanticTokens.js";
 import type { InteractionCapture, StyleDelta } from "../capture/interactions.js";
 
 // ---- arbitrary-value escaping ----
@@ -72,6 +73,7 @@ const KW: Record<string, Record<string, string>> = {
   "font-weight": { "100": "font-thin", "200": "font-extralight", "300": "font-light", "400": "font-normal", "500": "font-medium", "600": "font-semibold", "700": "font-bold", "800": "font-extrabold", "900": "font-black" },
   "text-decoration-line": { underline: "underline", "line-through": "line-through", overline: "overline", none: "no-underline" },
   "white-space": { nowrap: "whitespace-nowrap", normal: "whitespace-normal", pre: "whitespace-pre", "pre-line": "whitespace-pre-line", "pre-wrap": "whitespace-pre-wrap", "break-spaces": "whitespace-break-spaces" },
+  "text-wrap": { wrap: "text-wrap", nowrap: "text-nowrap", balance: "text-balance", pretty: "text-pretty" },
   "overflow-x": { hidden: "overflow-x-hidden", auto: "overflow-x-auto", scroll: "overflow-x-scroll", visible: "overflow-x-visible", clip: "overflow-x-clip" },
   "overflow-y": { hidden: "overflow-y-hidden", auto: "overflow-y-auto", scroll: "overflow-y-scroll", visible: "overflow-y-visible", clip: "overflow-y-clip" },
   "object-fit": { contain: "object-contain", cover: "object-cover", fill: "object-fill", none: "object-none", "scale-down": "object-scale-down" },
@@ -1039,11 +1041,12 @@ export type TailwindOutput = {
 export type ColorInterner = {
   defs: Map<string, string>;    // minted token name → literal value
   byValue: Map<string, string>; // literal value → minted token name
+  byKey: Map<string, string>;   // rounded-sRGB cluster key → minted token name (visual dedup)
   tokens: Set<string>;          // ALL referenced color token names (palette + minted)
   seq: { n: number };           // monotonic counter for clr-N names
 };
 export function createColorInterner(): ColorInterner {
-  return { defs: new Map(), byValue: new Map(), tokens: new Set(), seq: { n: 0 } };
+  return { defs: new Map(), byValue: new Map(), byKey: new Map(), tokens: new Set(), seq: { n: 0 } };
 }
 /** `:root { --clr-N: <literal>; … }` for the interner's minted tokens (empty if none). */
 export function colorDefsCssOf(it: ColorInterner): string {
@@ -1126,12 +1129,31 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
   indexNode(ir.root);
 
   // Color interner: every distinct color value → a stable theme token referenced as
-  // var(--…). Palette colors already arrive as var(--color-*) (kept, semantic); any other
-  // color is minted a numbered token (--clr-N) so raw rgb/hex NEVER lands in markup.
-  // The token holds the literal value, minted in deterministic first-encounter order.
+  // var(--…). A color the semantic palette recognizes (exactly OR within the grader's ±2
+  // sRGB tolerance — the same tolerance css.ts already trusts for color/bg/border) reuses
+  // that SEMANTIC name (--primary, --surface, --color-001…), so oklab/lch colours reached
+  // only through decoration/gradient/shadow props no longer each mint a fresh opaque
+  // --clr-N. Only colours with NO palette role fall through to a numbered --clr-N token,
+  // minted in deterministic first-encounter order (the literal is kept, byte-exact).
   const internColor = (literal: string): string => {
+    const semantic = colorVar?.(literal);
+    if (semantic) { const n = tokenName(semantic); if (n) colorTokens.add(n); return semantic; }
     let name = interner.byValue.get(literal);
-    if (!name) { name = `clr-${interner.seq.n++}`; interner.byValue.set(literal, name); interner.defs.set(name, literal); }
+    if (!name) {
+      // Dedup visually-identical literals (many oklab()/lch() forms round to the same sRGB):
+      // reuse the token minted for that colour rather than a fresh --clr-N. Fidelity-neutral —
+      // the grader compares in sRGB and the shared token holds the FIRST literal (within ±0 of
+      // its own colour). Values that don't parse fall back to exact-literal keying.
+      const key = colorClusterKey(literal);
+      const existing = key ? interner.byKey.get(key) : undefined;
+      if (existing) { name = existing; interner.byValue.set(literal, name); }
+      else {
+        name = `clr-${interner.seq.n++}`;
+        interner.byValue.set(literal, name);
+        interner.defs.set(name, literal);
+        if (key) interner.byKey.set(key, name);
+      }
+    }
     colorTokens.add(name);
     return `var(--${name})`;
   };

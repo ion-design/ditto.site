@@ -317,3 +317,35 @@ describe("walker sizing probe: circular authored-height guard", () => {
     assert.equal(pct.sizing!.hAuto, false, "percentage fill is not content-sized");
   });
 });
+
+describe("walker text-wrap capture", () => {
+  let browser: Browser;
+  let page: Page;
+  before(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  });
+  after(async () => {
+    await browser.close();
+  });
+
+  const capture = async (html: string) => {
+    await page.setContent(html);
+    await page.evaluate("globalThis.__name = globalThis.__name || ((fn) => fn);");
+    return page.evaluate(collectPage);
+  };
+
+  it("captures text-wrap:balance on a heading (modern line-balancing)", async () => {
+    // Real case: a hero heading authored `text-wrap:balance` wraps its two lines evenly; without
+    // capturing the prop the clone wraps it lopsidedly.
+    const snap = await capture(`<h1 style="text-wrap:balance">BUILT RUGGED. WORN DAILY.</h1>`);
+    const h1 = findByTag(snap.root, "h1")!;
+    assert.equal(h1.computed.textWrap, "balance", "text-wrap:balance is captured");
+  });
+
+  it("captures text-wrap:pretty", async () => {
+    const snap = await capture(`<p style="text-wrap:pretty">Some flowing paragraph text here.</p>`);
+    const p = findByTag(snap.root, "p")!;
+    assert.equal(p.computed.textWrap, "pretty", "text-wrap:pretty is captured");
+  });
+});

@@ -100,6 +100,83 @@ function identName(name: string): string {
   return /^[A-Za-z_$]/.test(name) ? name : "S" + name;
 }
 
+// Generic structural words that carry no section identity — dropped from source-derived names.
+const GENERIC_NAME_WORDS = new Set([
+  "section", "sections", "wrapper", "container", "block", "blocks", "template", "templates",
+  "group", "inner", "outer", "content", "contents", "row", "col", "column", "grid", "layout",
+  "shopify", "js", "tvg", "elementor", "wp", "widget", "module", "region", "main", "page",
+  "component", "components", "el", "root", "body", "area", "box", "item", "items", "wrap",
+]);
+
+/** A trailing token looks like a build hash (mixed-case or long alnum entropy, e.g.
+ *  `JtTWTt`, `RbEALJ`, `x19f2a`, `dDMm2q`) rather than a real word — strip it. A token is
+ *  hashy when it is ≥4 chars and either mixes upper+lower case or is a long digit-bearing run. */
+function looksHashy(tok: string): boolean {
+  if (tok.length < 4) return false;
+  const hasUpper = /[A-Z]/.test(tok), hasLower = /[a-z]/.test(tok), hasDigit = /\d/.test(tok);
+  if (hasUpper && hasLower) return true;                 // camel/entropy hash: JtTWTt, dDMm2q
+  if (hasDigit && tok.length >= 6) return true;          // long id run: 19797275672650
+  if (!/[aeiou]/i.test(tok) && tok.length >= 5) return true; // vowelless run: bcdfgh
+  return false;
+}
+
+/** Turn a source id/class token stream into ≤3 semantic PascalCase words, or "" when the
+ *  evidence is all-generic or hashy. Strips CMS prefixes (shopify-section-…__), leading
+ *  numeric template ids, generic structural words, and trailing hash suffixes. Exported for
+ *  tests (the hashy-suffix stripping + generic-word filtering is the load-bearing part). */
+export function nameFromSourceToken(raw: string): string {
+  // Peel known CMS section-id prefixes, keeping the semantic slug after `__` / the hook name.
+  // Case is preserved through prefix-stripping + tokenizing so `looksHashy` can see the
+  // mixed-case entropy of build hashes (RbEALJ, JtTWTt) BEFORE we normalize to lowercase.
+  const s = raw.trim()
+    .replace(/^shopify-section-(?:template|sections)--\d+__/i, "")
+    .replace(/^shopify-(?:section|block)-/i, "")
+    .replace(/^(?:js|tvg|elementor|wp|et|elementor-element)[-_]/i, "");
+  const tokens = s.split(/[\s\-_]+/).filter(Boolean);
+  const kept: string[] = [];
+  for (const t of tokens) {
+    if (kept.length >= 3) break;
+    if (/^\d+$/.test(t)) continue;                  // pure numeric template ids
+    if (GENERIC_NAME_WORDS.has(t.toLowerCase())) continue; // structural noise
+    if (looksHashy(t)) continue;                    // trailing entropy suffix (mixed-case aware)
+    if (t.length < 2) continue;
+    const lc = t.toLowerCase();
+    kept.push(lc[0]!.toUpperCase() + lc.slice(1));
+  }
+  return kept.join("");
+}
+
+// A source `id` (or `data-section-type`) is a DELIBERATE, developer-authored block name only
+// when it carries a recognized CMS section prefix — Shopify's `shopify-section-…__split_callout`,
+// or a generic `section-…`/`…-section`. Arbitrary utility classes (`g_section_space`,
+// `duraldar-cta_section`) are styling noise, so we do NOT mine class names — a truncated heading
+// slug reads better than a made-up name. `js-*` behaviour hooks ARE intentional and allowed.
+const CMS_SECTION_ID = /shopify-section|^section[-_]|[-_]section(?:[-_]|$)|data-section/i;
+
+/** Best semantic name derivable from a section subtree's source *ids* + `js-*` hooks — the
+ *  only source signals reliable enough to beat a heading slug. Scans the root + shallow
+ *  descendants. Returns "" when no trustworthy semantic evidence exists. */
+function sourceNameForSection(sec: IRNode): string {
+  const candidates: string[] = [];
+  const collect = (n: IRNode, depth: number): void => {
+    const id = n.attrs.id;
+    if (id && CMS_SECTION_ID.test(id)) candidates.push(id);
+    const sectionType = n.attrs["data-section-type"] ?? n.attrs["data-section"];
+    if (sectionType) candidates.push(sectionType);
+    if (n.srcClass) {
+      // Only explicit `js-…` behaviour hooks — a deliberate semantic handle, not a utility class.
+      for (const cls of n.srcClass.split(/\s+/)) if (/^js[-_][a-z]/i.test(cls)) candidates.push(cls);
+    }
+    if (depth > 0) for (const c of elementChildren(n)) collect(c, depth - 1);
+  };
+  collect(sec, 2);
+  for (const c of candidates) {
+    const name = nameFromSourceToken(c);
+    if (name && name.length >= 3) return name;
+  }
+  return "";
+}
+
 function looksLikeNav(n: IRNode, cw: number): boolean {
   if (n.tag === "nav" || n.tag === "header") return true;
   if (subtreeHasTag(n, "nav")) return true;
@@ -279,8 +356,13 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     } else if (recipeName) {
       name = recipeName;
     } else {
+      // Prefer a clean semantic name from the source markup (Shopify/CMS section ids +
+      // `js-*` hooks, hash suffixes stripped) over a truncated heading slug — the source
+      // slug (`split_callout` → SplitCalloutSection) reads more like a hand-authored name.
+      const sourceName = sourceNameForSection(sec);
       const slug = slugWords(titleText(sec));
-      name = slug ? `${slug}Section`
+      name = sourceName ? `${sourceName}Section`
+        : slug ? `${slug}Section`
         : subtreeHasTag(sec, "form", 6) ? "ContactSection"
         : subtreeHasTag(sec, "video", 6) || subtreeHasTag(sec, "iframe", 6) ? "MediaSection"
         : `Section${i + 1}`;
