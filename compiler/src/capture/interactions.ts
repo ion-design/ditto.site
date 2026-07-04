@@ -24,6 +24,13 @@ const PSEUDO_PROPS = [
 
 export type StyleDelta = Record<string, string>;
 
+/** Changed-properties delta: every key in `b` whose value differs from `a`. Pure (unit-tested). */
+export function diffStyle(a: StyleDelta, b: StyleDelta): StyleDelta {
+  const d: StyleDelta = {};
+  for (const k of Object.keys(b)) if (a[k] !== b[k]) d[k] = b[k]!;
+  return d;
+}
+
 // Properties that distinguish a panel's shown/hidden state and a trigger's
 // active/inactive state. Captured per discrete state so the generated controller
 // can toggle between them faithfully (M2: tabs + accordion).
@@ -363,11 +370,42 @@ export async function captureInteractions(page: Page, opts?: { maxCandidates?: n
       return o;
     }, { capId, props: PSEUDO_PROPS as unknown as string[] });
 
-  const diff = (a: StyleDelta, b: StyleDelta): StyleDelta => {
-    const d: StyleDelta = {};
-    for (const k of Object.keys(b)) if (a[k] !== b[k]) d[k] = b[k]!;
-    return d;
+  const diff = diffStyle;
+
+  // Pseudo-state driver via CDP `CSS.forcePseudoState`. Pointer-based hovering (page.hover)
+  // moves the REAL cursor to the element's box centre, so the browser applies `:hover` to
+  // whatever sits under that point — on a page with a transparent full-viewport overlay (a
+  // fixed page-wrapper / scroll layer, common on modern builder stacks) the point lands on the
+  // overlay and the target never enters `:hover`, silently capturing ZERO authored hover states
+  // even though page.hover throws nothing. Forcing the pseudo-class on the node itself is
+  // geometry-independent (occlusion-immune), applies pure-CSS `:hover` rules directly, and — for
+  // `.card:hover .overlay` — also styles descendants of the forced node, so reveals still show.
+  // Resolves each cap → CDP nodeId; a live map is rebuilt per element (cheap) so it survives
+  // any DOM churn. Falls back to no forcing if a CDP session can't be opened (then hover/focus
+  // capture is simply empty rather than wrong).
+  const client = await page.context().newCDPSession(page).catch(() => null);
+  if (client) {
+    try { await client.send("DOM.enable"); await client.send("CSS.enable"); await client.send("DOM.getDocument", {}); }
+    catch { /* CDP unavailable — force() below no-ops */ }
+  }
+  const nodeIdFor = async (capId: string): Promise<number | null> => {
+    if (!client) return null;
+    let objectId: string | undefined;
+    try {
+      const ev = await client.send("Runtime.evaluate", { expression: `document.querySelector('[data-cid-cap="${capId}"]')` }) as { result?: { objectId?: string } };
+      objectId = ev.result?.objectId; if (!objectId) return null;
+      const r = await client.send("DOM.requestNode", { objectId }) as { nodeId?: number };
+      return r.nodeId ?? null;
+    } catch { return null; }
+    finally { if (objectId) await client.send("Runtime.releaseObject", { objectId }).catch(() => {}); }
   };
+  // Force (or clear, with []) a pseudo-class on a node. Deterministic and reversible.
+  const force = async (nodeId: number | null, classes: string[]): Promise<boolean> => {
+    if (!client || nodeId == null) return false;
+    try { await client.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: classes }); return true; }
+    catch { return false; }
+  };
+  const settlePseudo = () => page.waitForTimeout(180); // let a `:hover`/`:focus` transition land
 
   // Reveal-relevant props for descendants that appear on hover (overlay glow + CTA). Only
   // clean show/hide props — NOT transform/filter, whose mid-animation values bake a janky
@@ -413,21 +451,21 @@ export async function captureInteractions(page: Page, opts?: { maxCandidates?: n
   const hoverDesc: Record<string, Record<string, StyleDelta>> = {};
 
   for (const capId of candidates) {
-    const sel = `[data-cid-cap="${capId}"]`;
     const base = await read(capId);
     if (!base) continue;
+    const nodeId = await nodeIdFor(capId);
     const hiddenBase = await readHiddenDesc(capId); // hidden descendants → hover-reveal candidates
     const hiddenCaps = Object.keys(hiddenBase);
-    // :hover — settle before reading: framer-style hover is driven by JS (Framer Motion)
-    // with a short transition, so an immediate read catches the pre-transition frame and
-    // sees no delta (the nav-link hover was missed this way). Wait for the transition to land.
-    try {
-      await page.hover(sel, { timeout: 1200, force: true });
-      await page.waitForTimeout(180);
+    // :hover — force the pseudo-class on the node (geometry-independent; see `force` above),
+    // then settle before reading: an authored `:hover`/JS transition animates from the resting
+    // frame, so an immediate read catches the pre-transition value and sees no delta. Wait for it.
+    if (await force(nodeId, ["hover"])) {
+      await settlePseudo();
       const h = await read(capId);
       if (h) { const d = diff(base, h); if (Object.keys(d).length) hover[capId] = d; }
       // Descendant reveals (while still hovered): a hidden child shown on hover — the card's
-      // OWN style is unchanged, so this is the only signal (framer's "Read story" overlay).
+      // OWN style is unchanged, so this is the only signal (a "Read story" overlay). Forcing
+      // `:hover` on the card also matches `.card:hover .overlay` rules on its descendants.
       if (hiddenCaps.length) {
         await page.waitForTimeout(380); // let the reveal transition fully finish before reading
         const after = await readDescProps(hiddenCaps);
@@ -444,16 +482,17 @@ export async function captureInteractions(page: Page, opts?: { maxCandidates?: n
         }
         if (Object.keys(revealed).length) hoverDesc[capId] = revealed;
       }
-    } catch { /* not hoverable (covered/offscreen) — skip */ }
-    await page.mouse.move(1, 1).catch(() => {});
-    // :focus (only for focusable-ish; cheap to attempt, guarded)
-    try {
-      await page.focus(sel, { timeout: 800 });
+      await force(nodeId, []); // clear :hover before probing :focus
+    }
+    // :focus — force the pseudo-class the same way (also occlusion-independent).
+    if (await force(nodeId, ["focus"])) {
+      await settlePseudo();
       const f = await read(capId);
       if (f) { const d = diff(base, f); if (Object.keys(d).length) focus[capId] = d; }
-      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
-    } catch { /* not focusable — skip */ }
+      await force(nodeId, []); // restore the resting state
+    }
   }
+  await client?.detach().catch(() => {});
 
   log({ event: "interactions_hover_focus", candidates: candidates.length, hover: Object.keys(hover).length, focus: Object.keys(focus).length, hoverDesc: Object.keys(hoverDesc).length });
 

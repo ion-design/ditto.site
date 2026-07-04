@@ -18,6 +18,7 @@
 import type { IR, IRNode } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import { collectNodeRules, computeBands, keyframesCss, type NodeRule } from "./css.js";
+import { colorClusterKey } from "../infer/semanticTokens.js";
 import type { InteractionCapture, StyleDelta } from "../capture/interactions.js";
 
 // ---- arbitrary-value escaping ----
@@ -27,6 +28,25 @@ import type { InteractionCapture, StyleDelta } from "../capture/interactions.js"
  *  spaces → `_` (so `0px 4px rgba(0, 0, 0, .1)` → `0px_4px_rgba(0,_0,_0,_.1)`). */
 function arb(v: string): string {
   return v.replace(/"/g, "'").replace(/_/g, "\\_").replace(/ /g, "_");
+}
+
+/** Round a single simple `<number>px|rem` length, killing frozen sub-pixel noise: snap to an
+ *  integer when the value is within 0.1px of one (measurement/rounding jitter — `204.9994px` was
+ *  meant to be `205px`), otherwise keep at most 1 decimal (`204.797px` → `204.8px`, a genuine
+ *  fraction). `627px` is unchanged. Only touches a lone number+unit token: multi-token values,
+ *  calc()/clamp()/var(), percentages, and unitless numbers pass through untouched, so nothing that
+ *  needs exact sub-pixel precision (borders, transforms — handled on their own branches) is moved. */
+export function snapLen(value: string): string {
+  const m = /^(-?\d*\.?\d+)(px|rem)$/.exec(value.trim());
+  if (!m) return value;
+  const n = parseFloat(m[1]!);
+  const unit = m[2]!;
+  // rem thresholds scale by the 16px root so "within 0.1px" is unit-consistent.
+  const pxPerUnit = unit === "rem" ? 16 : 1;
+  const rounded = Math.abs(n - Math.round(n)) * pxPerUnit < 0.1
+    ? Math.round(n)
+    : Math.round(n * 10) / 10;
+  return `${rounded}${unit}`;
 }
 function arbList(v: string): string {
   return arb(v).replace(/,_/g, ",");
@@ -53,6 +73,7 @@ const KW: Record<string, Record<string, string>> = {
   "font-weight": { "100": "font-thin", "200": "font-extralight", "300": "font-light", "400": "font-normal", "500": "font-medium", "600": "font-semibold", "700": "font-bold", "800": "font-extrabold", "900": "font-black" },
   "text-decoration-line": { underline: "underline", "line-through": "line-through", overline: "overline", none: "no-underline" },
   "white-space": { nowrap: "whitespace-nowrap", normal: "whitespace-normal", pre: "whitespace-pre", "pre-line": "whitespace-pre-line", "pre-wrap": "whitespace-pre-wrap", "break-spaces": "whitespace-break-spaces" },
+  "text-wrap": { wrap: "text-wrap", nowrap: "text-nowrap", balance: "text-balance", pretty: "text-pretty" },
   "overflow-x": { hidden: "overflow-x-hidden", auto: "overflow-x-auto", scroll: "overflow-x-scroll", visible: "overflow-x-visible", clip: "overflow-x-clip" },
   "overflow-y": { hidden: "overflow-y-hidden", auto: "overflow-y-auto", scroll: "overflow-y-scroll", visible: "overflow-y-visible", clip: "overflow-y-clip" },
   "object-fit": { contain: "object-contain", cover: "object-cover", fill: "object-fill", none: "object-none", "scale-down": "object-scale-down" },
@@ -243,7 +264,14 @@ export function declToUtil(prop: string, value: string): string {
     if (value === "0" || value === "0px" || value === "0rem") {
       return ZERO_NAMED.has(prop) ? `${ARB[prop]}-0` : `${ARB[prop]}-[0px]`;
     }
-    return `${ARB[prop]}-[${arb(value)}]`;
+    // `snapLen`'s 0.1px integer snap is calibrated for BOX lengths (killing measurement jitter like
+    // `204.9994px`→`205px`). letter-spacing is authored at a far finer scale — a real `-0.08px`/
+    // `-0.0375px` tracking is WITHIN 0.1px of zero, so snapLen would collapse it to `0px`. Chromium
+    // then serializes computed `letter-spacing:0` as the keyword `normal`, which the style gate's
+    // numeric compare can't parse → a false exact-string mismatch. Skip the integer snap for tracking;
+    // `snapBase` rounds it to 2 decimals (`tracking-[-0.08px]`), the right precision for this axis.
+    if (prop === "letter-spacing") return `${ARB[prop]}-[${arb(value)}]`;
+    return `${ARB[prop]}-[${arb(snapLen(value))}]`;
   }
   if (/^border-(top|right|bottom|left)-width$/.test(prop)) {
     const side = prop.split("-")[1]![0]!; // t/r/b/l
@@ -353,7 +381,7 @@ function parseSide(b: string): SidePart | null {
   for (const h of COLLAPSE_HEADS) if (body.startsWith(h + "-")) return { neg, head: h, suf: body.slice(h.length + 1) };
   return null;
 }
-function collapseBases(bases: string[]): string[] {
+export function collapseBases(bases: string[]): string[] {
   const byHead = new Map<string, SidePart>(); // head → its parsed part (sides are unique within a group)
   for (const b of bases) { const p = parseSide(b); if (p) byHead.set(p.head, p); }
   const origOf = new Map<string, string>(); // head → original base string (to drop/replace by identity)
@@ -410,6 +438,18 @@ function collapseBases(bases: string[]): string[] {
   if (wv !== null) { const sfx = wv ? `-${wv}` : ""; replace.set(`border-t${sfx}`, `border${sfx}`); for (const s of ["r", "b", "l"]) drop.add(`border-${s}${sfx}`); }
   const cv = allEqSide(bcSuf);
   if (cv !== null) { replace.set(`border-t-${cv}`, `border-${cv}`); for (const s of ["r", "b", "l"]) drop.add(`border-${s}-${cv}`); }
+  // flex:1 1 0% → the idiomatic `flex-1` (Tailwind `flex-1` compiles to `flex: 1 1 0%`, EXACTLY these
+  // longhands). Fold when this band sets flex-grow:1 (`grow-[1]`) AND a zero flex-basis (`basis-[0%]`,
+  // or its already-shortened `basis-0` — reached from a band delta). flex-shrink is the CSS default 1
+  // (elided) unless an explicit `shrink-0` is present, which would break the equivalence — so require
+  // its absence. Emitting `flex-1` rather than `grow basis-[0%]` also sidesteps the `basis-[0%]`→`basis
+  // -0` prettify hazard (0% content-sizes against an indefinite main axis; 0px is a definite zero).
+  const hasGrow1 = bases.includes("grow-[1]");
+  const zeroBasis = bases.includes("basis-[0%]") ? "basis-[0%]" : bases.includes("basis-0") ? "basis-0" : null;
+  if (hasGrow1 && zeroBasis && !bases.includes("shrink-0")) {
+    replace.set("grow-[1]", "flex-1");
+    drop.add(zeroBasis);
+  }
   const out: string[] = [];
   for (const b of bases) { if (drop.has(b)) continue; out.push(replace.get(b) ?? b); }
   return out;
@@ -490,6 +530,14 @@ export function prettifyBase(base: string): string {
   const pm = /^(w|h|min-w|min-h|basis|inset|inset-x|inset-y|top|right|bottom|left)-\[(\d*\.?\d+)%\]$/.exec(base);
   if (pm) {
     const v = parseFloat(pm[2]!);
+    // A percentage on a MAIN-SIZE axis whose containing block may be indefinite is NOT equal to the
+    // same length in px. `flex-basis:0%` against an auto-sized (indefinite) flex container falls back
+    // to CONTENT sizing per the flexbox spec, whereas `flex-basis:0` (definite zero) gives a zero base
+    // size — collapsing a `flex:1 1 0%` item to 0 in an auto-height column. `height`/`min-height` in %
+    // resolve to `auto` when the containing block's height is indefinite, the same hazard. So never
+    // rewrite `[0%]` to the definite `-0` for these prefixes; keep the literal `basis-[0%]`/`h-[0%]`.
+    // (Width/inset percentages resolve against the always-definite containing-block WIDTH — safe.)
+    if (v === 0 && (pm[1] === "basis" || pm[1] === "h" || pm[1] === "min-h")) return base;
     const frac = FRACTIONS.find(([p]) => Math.abs(p - v) < 0.4);
     return frac ? `${pm[1]}-${frac[1]}` : base;
   }
@@ -544,7 +592,6 @@ function namedText(base: string): string | null {
 // nearest scale step / integer px when comfortably INSIDE that budget (ε well under the gate tol), so
 // the markup reads hand-authored. Bounded ε + the layout & perceptual gates backstop any accumulation;
 // values not near a step stay arbitrary because they are genuine one-offs.
-const SNAP_SPACE_PX = 1.0; // padding/margin/gap/inset/size → nearest 0.25rem scale step within this
 const SNAP_TYPE_PX = 0.6;  // font-size/line-height/radius → nearest integer px within this
 const NAMED_K_SORTED = [...NAMED_K].sort((a, b) => a - b);
 function nearestNamedK(k: number): number {
@@ -552,7 +599,7 @@ function nearestNamedK(k: number): number {
   for (const c of NAMED_K_SORTED) if (Math.abs(c - k) < Math.abs(best - k)) best = c;
   return best;
 }
-function snapBase(base: string): string {
+export function snapBase(base: string): string {
   const m = /^(-?)([a-z][a-z-]*)-\[(-?\d*\.?\d+)(px|rem)\]$/.exec(base);
   if (!m) return base;
   const neg = m[1]!, prefix = m[2]!, px = parseFloat(m[3]!) * (m[4] === "rem" ? 16 : 1);
@@ -568,10 +615,16 @@ function snapBase(base: string): string {
     if (Math.abs(r - px) <= SNAP_TYPE_PX && r in RADIUS_SUFFIX) return `${prefix}${RADIUS_SUFFIX[r]}`;
     return base;
   }
-  // spacing / size → nearest named scale step (0.25rem grid)
+  // spacing / size → nearest named scale step (0.25rem grid). Only snap a value that lands ESSENTIALLY
+  // ON a step (≤0.25px): the scale is 2px-granular (`p-0.5`=2px, `p-1.5`=6px), so a captured value ≥0.25px
+  // off the nearest step is a genuine sub-step measurement (3.5px is BETWEEN 2px and 4px — not on the
+  // scale). Snapping such a value up by +0.5px per side accumulates across the links of a fixed-width
+  // flex row until the items overflow and wrap to a second line; the exact `p-[3.5px]` cannot. The wider
+  // ±1px budget the gate tolerates in isolation is unsafe here because the error is systematic, not
+  // random. Values genuinely on a step (2px→`p-0.5`, 4px→`p-1`) still snap.
   if (SCALE_PREFIXES.has(prefix)) {
     const k = nearestNamedK(px / 4);
-    if (Math.abs(k * 4 - px) <= SNAP_SPACE_PX) return k === 0 ? `${neg}${prefix}-0` : `${neg}${prefix}-${k}`;
+    if (Math.abs(k * 4 - px) <= 0.25) return k === 0 ? `${neg}${prefix}-0` : `${neg}${prefix}-${k}`;
   }
   return base;
 }
@@ -694,6 +747,25 @@ function sourceVariantActive(variant: string, vp: number): boolean {
   return true;
 }
 
+// Tailwind cascade specificity of an ACTIVE variant at a viewport: the effective min-width its media
+// query opens at, so a more-specific (higher) breakpoint wins over a lower one. Tailwind emits its
+// utilities sorted by breakpoint (min-width ascending), NOT by class-attribute order, so when both
+// `md:` and `lg:` apply at 1280 the `lg:` rule wins regardless of which appears first in the class
+// string. `min-[Npx]:` embeds N; a bare min breakpoint uses its threshold; `max-*` variants are
+// upper-bounded windows that a plain min variant out-specifies, so they score below any min. The
+// unprefixed base scores 0. Only meaningful for variants already known active at `vp`.
+function sourceVariantSpecificity(variant: string, vp: number): number {
+  if (!variant) return 0;
+  let score = 0;
+  for (const part of variant.split(":").filter(Boolean)) {
+    const minArb = /^min-\[(\d+)px\]$/.exec(part);
+    if (minArb) { score = Math.max(score, +minArb[1]!); continue; }
+    if (part in SOURCE_BP) { score = Math.max(score, SOURCE_BP[part]!); continue; }
+    // max-* windows are less specific than any min breakpoint; leave score as-is (a min wins).
+  }
+  return score;
+}
+
 function sourceArbitraryInner(suffix: string): string | null {
   return suffix.startsWith("[") && suffix.endsWith("]") ? suffix.slice(1, -1) : null;
 }
@@ -707,6 +779,118 @@ function sourceFluidLengthSuffix(suffix: string): boolean {
   if (/^var\(/.test(inner)) return true;
   if (/^(calc|min|max|clamp|fit-content)\(/.test(inner)) return true;
   return /(%|vw|vh|svw|lvw|dvw|svh|lvh|dvh|fr|min-content|max-content|fit-content)/.test(inner);
+}
+
+// A FIXED, definite authored length suffix on a `w-`/`h-` utility: an arbitrary `[<px|rem|em|…>]`, the
+// `px` token (1px), or a numeric spacing-scale token (`24`, `2.5` → fixed rem). Unlike
+// sourceFluidLengthSuffix these do NOT re-derive from the container, so the source-intent pass must
+// re-emit them as the CAPTURED computed px (the clone's root font-size may differ from the source's, so
+// echoing `h-[4rem]` verbatim would mis-size), and only where geometry corroborates the resolved box.
+function sourceFixedLengthSuffix(suffix: string): boolean {
+  const inner = sourceArbitraryInner(suffix);
+  if (inner !== null) {
+    const v = inner.trim().toLowerCase();
+    if (/^var\(/.test(v)) return false;                                  // handled by the var-length path
+    if (/%|vw|vh|vmin|vmax|svw|lvw|dvw|svh|lvh|dvh|\bfr\b|min-content|max-content|fit-content/.test(v)) return false;
+    return /(?:^|[\s(*/+-])[\d.]+(?:px|rem|em|cm|mm|in|pt|pc|ex|ch|q)\b/.test(v);
+  }
+  if (suffix === "px") return true;
+  return /^\d+(?:\.\d+)?$/.test(suffix);
+}
+
+// A `w-`/`h-` utility carrying a fixed authored length (as recognised by sourceFixedLengthSuffix).
+function isFixedLengthUtil(util: string): boolean {
+  const m = /^([wh])-(.+)$/.exec(util);
+  return !!m && sourceFixedLengthSuffix(m[2]!);
+}
+
+// The captured computed px on this axis is definite and matches the measured bbox — i.e. the authored
+// fixed length resolved to the box the capture recorded. Geometry corroboration for a fixed w/h util.
+function fixedLengthResolvesToBox(node: IRNode, axis: "w" | "h", vp: number): boolean {
+  const cs = node.computedByVp[vp]; const b = node.bboxByVp[vp];
+  if (!cs || !b) return false;
+  const val = axis === "h" ? cs.height : cs.width;
+  const ext = axis === "h" ? b.height : b.width;
+  if (!val || val === "auto" || !/px$/.test(val)) return false;
+  if (!(ext > 0)) return false;
+  return Math.abs(pf(val) - ext) <= Math.max(1.5, 0.01 * ext);
+}
+
+// Rewrite a fixed-length `w-`/`h-` source utility to the node's CAPTURED computed px at a viewport,
+// preserving any variant prefix. `h-[4rem]` → `h-[60px]` (the source resolved 4rem against a 15px root;
+// the clone's root may differ, so bake the measured px). Returns the utility unchanged when it is not a
+// fixed-length util or the computed px is unavailable.
+function fixedLengthUtilAsPx(util: string, node: IRNode, vp: number): string {
+  const m = VARIANT_PREFIX.exec(util);
+  const prefix = m ? m[1]! : "";
+  const core = m ? m[2]! : util;
+  const sm = /^([wh])-(.+)$/.exec(core);
+  if (!sm || !sourceFixedLengthSuffix(sm[2]!)) return util;
+  const val = sm[1] === "h" ? node.computedByVp[vp]?.height : node.computedByVp[vp]?.width;
+  if (!val || !/px$/.test(val)) return util;
+  const px = Math.round(pf(val) * 100) / 100;
+  return `${prefix}${sm[1]}-[${px}px]`;
+}
+
+// Tailwind v4's `max-w-*` / `w-*` / `h-*` / `max-h-*` NAMED size scale (the `--container-*` theme
+// values), in px at a 16px root. A source built on an OLDER Tailwind authored these names against a
+// DIFFERENT scale (e.g. v0–v2 `max-w-md` = 640px vs v4's 448px), so re-emitting the name verbatim
+// silently re-sizes the box. The source-intent pass validates the modern px below and falls back to
+// the captured computed px when they disagree.
+const CONTAINER_NAMED_PX: Record<string, number> = {
+  "3xs": 256, "2xs": 288, xs: 320, sm: 384, md: 448, lg: 512, xl: 576,
+  "2xl": 672, "3xl": 768, "4xl": 896, "5xl": 1024, "6xl": 1152, "7xl": 1280,
+};
+
+// The px a `w-`/`h-`/`max-w-`/`max-h-` NAMED or numeric-scale suffix resolves to under THIS clone's
+// Tailwind v4 (16px root). Covers the `--container-*` names (`md`→448) and the numeric spacing scale
+// (`24`→96px, `2.5`→10px). Returns null for relative/keyword/arbitrary suffixes (`full`, `1/2`,
+// `screen`, `[…]`, `prose`) — those re-derive from context and are not px-fixed, so they need no
+// value validation and are re-emitted verbatim.
+function namedLengthPx(suffix: string): number | null {
+  if (suffix in CONTAINER_NAMED_PX) return CONTAINER_NAMED_PX[suffix]!;
+  if (suffix === "px") return 1;
+  if (/^\d+(?:\.\d+)?$/.test(suffix)) return parseFloat(suffix) * 4; // spacing scale: n × 0.25rem
+  return null;
+}
+
+// A source utility on a length axis whose suffix is a NAMED/numeric-scale token (px-fixed under
+// v4) rather than a relative/keyword/arbitrary one. Only these need modern-value validation; e.g.
+// `max-w-md`, `w-24`, `h-px` — but not `max-w-full`, `w-1/2`, `h-[4rem]`.
+function namedScaleCore(core: string): { axis: "w" | "h" | "max-w" | "max-h"; px: number } | null {
+  const m = /^(max-w|max-h|w|h)-(.+)$/.exec(core);
+  if (!m) return null;
+  const px = namedLengthPx(m[2]!);
+  return px === null ? null : { axis: m[1] as "w" | "h" | "max-w" | "max-h", px };
+}
+
+// Captured computed px on the axis at a viewport, when definite (`…px`, not `auto`/`none`). The
+// property a length axis constrains: `max-width` / `max-height` / `width` / `height`.
+function computedAxisPx(node: IRNode, axis: SourceAxis, vp: number): number | null {
+  const cs = node.computedByVp[vp];
+  if (!cs) return null;
+  const raw = axis === "max-w" ? cs.maxWidth : axis === "max-h" ? cs.maxHeight
+    : axis === "w" ? cs.width : axis === "h" ? cs.height : undefined;
+  if (!raw || raw === "auto" || raw === "none" || !/px$/.test(raw)) return null;
+  return pf(raw);
+}
+
+// Re-emit a source length utility for one viewport. When the suffix is a NAMED/numeric-scale token
+// (px-fixed under v4) and its modern px does NOT match the captured computed px (within tolerance),
+// the authored name meant a different length on the source's older Tailwind — emit the captured px
+// as an arbitrary value instead of the mis-resolving name. Fluid/keyword/fixed-arbitrary suffixes
+// (and the already-handled fixed w/h path) pass through unchanged.
+function namedLengthUtilChecked(util: string, node: IRNode, axis: SourceAxis, vp: number): string {
+  const m = VARIANT_PREFIX.exec(util);
+  const prefix = m ? m[1]! : "";
+  const core = m ? m[2]! : util;
+  const named = namedScaleCore(core);
+  if (!named) return util;
+  const computed = computedAxisPx(node, axis, vp);
+  if (computed === null) return util; // no definite computed px to check against — keep authored name
+  if (Math.abs(named.px - computed) <= Math.max(1.5, 0.02 * computed)) return util; // modern value agrees
+  const rem = pxToRem(computed);
+  return `${prefix}${named.axis}-[${rem ?? computed + "px"}]`;
 }
 
 function sourceAspectUtility(core: string): string | null {
@@ -740,7 +924,7 @@ function sourceAxisForCore(core0: string): { axis: SourceAxis; utility: string }
   const maxH = /^max-h-(.+)$/.exec(core);
   if (maxH && sourceFluidLengthSuffix(maxH[1]!)) return { axis: "max-h", utility: core };
   const size = /^([wh])-(.+)$/.exec(core);
-  if (size && sourceFluidLengthSuffix(size[2]!)) return { axis: size[1] as SourceAxis, utility: core };
+  if (size && (sourceFluidLengthSuffix(size[2]!) || sourceFixedLengthSuffix(size[2]!))) return { axis: size[1] as SourceAxis, utility: core };
   return null;
 }
 
@@ -904,6 +1088,12 @@ function sourceAxisCompatible(node: IRNode, parent: IRNode | undefined, axis: So
       if (axis === "h" && v === "h-full") return !!s?.hFill;
       if (axis === "h" && v === "h-auto") return !!s?.hAuto;
       if (axis === "h" && v && sourceVarName(v)) return /px$/.test(node.computedByVp[vp]?.height || "");
+      // A FIXED authored length (`h-[4rem]`, `w-24`, `h-px`) — the source-intent pass will re-emit it as
+      // the captured computed px. Compatible when that px is definite and equals the measured bbox extent
+      // at this viewport (the authored length actually resolved to the captured box). This recovers a
+      // banded authored fixed height/width the sizing probe dropped through the fill↔content cycle
+      // (h-full) or the content/fill drop (auto), without depending on the clone's root font-size.
+      if (v && isFixedLengthUtil(v)) return fixedLengthResolvesToBox(node, axis, vp);
       return false;
     });
   }
@@ -932,6 +1122,13 @@ function sourceIntentVarCss(node: IRNode, axis: SourceAxis, values: Map<number, 
 
 function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewports: number[], canonical: number): SourceIntent {
   const perAxis = new Map<SourceAxis, Map<number, string>>();
+  // Per (axis, vp): the cascade specificity of the currently-chosen active token, so a later token in
+  // the class string can only override an earlier one when it is at least as specific. Tailwind sorts
+  // its emitted rules by breakpoint (min-width), so when both `md:` and `lg:` apply at a wide viewport
+  // the `lg:` value wins — regardless of the class-attribute order. Picking the LAST active token
+  // instead (class-string order) silently takes `md:grid-cols-2` at 1280 for `lg:grid-cols-3
+  // md:grid-cols-2`, dropping the desktop column count.
+  const specAt = new Map<SourceAxis, Map<number, number>>();
   for (const tok of parseSourceClass(node.srcClass)) {
     const parsed = sourceAxisForCore(tok.core);
     if (!parsed) continue;
@@ -939,7 +1136,12 @@ function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewpor
       if (!sourceVariantActive(tok.variant, vp)) continue;
       let m = perAxis.get(parsed.axis);
       if (!m) { m = new Map<number, string>(); perAxis.set(parsed.axis, m); }
-      m.set(vp, parsed.utility);
+      let s = specAt.get(parsed.axis);
+      if (!s) { s = new Map<number, number>(); specAt.set(parsed.axis, s); }
+      const spec = sourceVariantSpecificity(tok.variant, vp);
+      // `>=` so a later token at EQUAL specificity still wins (matches source order for same-breakpoint
+      // duplicates), but a lower breakpoint can never displace a higher one already chosen.
+      if (!m.has(vp) || spec >= (s.get(vp) ?? -1)) { m.set(vp, parsed.utility); s.set(vp, spec); }
     }
   }
   const axes = new Set<SourceAxis>();
@@ -947,15 +1149,47 @@ function sourceIntentUtilities(node: IRNode, parent: IRNode | undefined, viewpor
   const css: string[] = [];
   const bands = computeBands(viewports, canonical);
   for (const [axis, byVp] of perAxis) {
-    if (!viewports.every((vp) => byVp.has(vp))) continue; // avoid partial custom-class inference for now
+    if (!viewports.every((vp) => byVp.has(vp))) {
+      // Partial-coverage escape hatch for SUBGRID. `grid-rows-subgrid`/`grid-cols-subgrid` is a
+      // structural keyword authored as a variant-only utility (`max-lg:grid-rows-subgrid`, with the
+      // axis resolving to explicit tracks at ≥lg), so the map covers only a subset of viewports and
+      // the full-coverage bail below would throw it away. Subgrid is safe to band partially: emit it
+      // exactly at the covered viewports as banded variants (and as the base only when canonical is
+      // covered). Adding the axis lets the redundant computed-derived subgrid bands drop in favour of
+      // this authored intent. Other partial axes still bail (partial fluid inference is unsafe).
+      const subgridOnly = (axis === "grid-rows" || axis === "grid-cols") &&
+        [...byVp.values()].every((u) => /-subgrid$/.test(u));
+      if (!subgridOnly) continue;
+      if (!sourceAxisCompatible(node, parent, axis, byVp, viewports)) continue;
+      axes.add(axis);
+      const canon = byVp.get(canonical);
+      if (canon) utilities.push(canon);
+      for (const b of bands) {
+        if (!b.media) continue;
+        const v = byVp.get(b.vp);
+        if (v && v !== canon) utilities.push(prefixFor(b.media) + v);
+      }
+      continue;
+    }
     if (!sourceAxisCompatible(node, parent, axis, byVp, viewports)) continue;
-    const base = byVp.get(canonical)!;
+    // A fixed-length w/h axis re-emits the CAPTURED computed px per band (root-font-size independent),
+    // not the source rem token. A NAMED/numeric-scale length token (`max-w-md`, `w-24`) is re-emitted
+    // only when its modern Tailwind-v4 px matches the captured computed px; otherwise the authored
+    // name meant a different length on the source's older Tailwind and the captured px is emitted as an
+    // arbitrary value. Every other axis keeps its authored utility verbatim.
+    const asEmit = (vp: number): string => {
+      const u = byVp.get(vp)!;
+      if ((axis === "w" || axis === "h") && isFixedLengthUtil(u)) return fixedLengthUtilAsPx(u, node, vp);
+      if (axis === "w" || axis === "h" || axis === "max-w" || axis === "max-h") return namedLengthUtilChecked(u, node, axis, vp);
+      return u;
+    };
+    const base = asEmit(canonical);
     axes.add(axis);
     if (axis === "aspect") axes.add("grid-rows");
     utilities.push(base);
     for (const b of bands) {
       if (!b.media) continue;
-      const v = byVp.get(b.vp)!;
+      const v = asEmit(b.vp);
       if (v !== base) utilities.push(prefixFor(b.media) + v);
     }
     css.push(...sourceIntentVarCss(node, axis, byVp, viewports, canonical));
@@ -988,11 +1222,12 @@ export type TailwindOutput = {
 export type ColorInterner = {
   defs: Map<string, string>;    // minted token name → literal value
   byValue: Map<string, string>; // literal value → minted token name
+  byKey: Map<string, string>;   // rounded-sRGB cluster key → minted token name (visual dedup)
   tokens: Set<string>;          // ALL referenced color token names (palette + minted)
   seq: { n: number };           // monotonic counter for clr-N names
 };
 export function createColorInterner(): ColorInterner {
-  return { defs: new Map(), byValue: new Map(), tokens: new Set(), seq: { n: 0 } };
+  return { defs: new Map(), byValue: new Map(), byKey: new Map(), tokens: new Set(), seq: { n: 0 } };
 }
 /** `:root { --clr-N: <literal>; … }` for the interner's minted tokens (empty if none). */
 export function colorDefsCssOf(it: ColorInterner): string {
@@ -1053,11 +1288,11 @@ function interactionUtilities(
   return { byCid, groups };
 }
 
-export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: (v: string) => string | null, opts?: { interner?: ColorInterner; includeNode?: (id: string) => boolean; interaction?: InteractionCapture; reflow?: boolean }): TailwindOutput {
+export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: (v: string) => string | null, opts?: { interner?: ColorInterner; includeNode?: (id: string) => boolean; interaction?: InteractionCapture; reflow?: boolean; lottieMounts?: ReadonlySet<string> }): TailwindOutput {
   // Colors tokenized (var(--…)); typography/geometry kept RAW (text-[16px] reads cleaner
   // than a token ref). The full tokenResolver is deliberately NOT passed — only colors are
   // tokenized below, so spacing/type stay as readable arbitrary values.
-  const rules = collectNodeRules(ir, assetMap, opts?.includeNode, colorVar, undefined, opts?.reflow);
+  const rules = collectNodeRules(ir, assetMap, opts?.includeNode, colorVar, undefined, opts?.reflow, opts?.lottieMounts);
   const classOf = new Map<string, string>();
   const styleOf = new Map<string, Map<string, string>>(); // cid → inline style (base-only gradients/url)
   const extraParts: string[] = []; // pseudo rules + url()-bearing decls, keyed by [data-cid]
@@ -1075,12 +1310,31 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
   indexNode(ir.root);
 
   // Color interner: every distinct color value → a stable theme token referenced as
-  // var(--…). Palette colors already arrive as var(--color-*) (kept, semantic); any other
-  // color is minted a numbered token (--clr-N) so raw rgb/hex NEVER lands in markup.
-  // The token holds the literal value, minted in deterministic first-encounter order.
+  // var(--…). A color the semantic palette recognizes (exactly OR within the grader's ±2
+  // sRGB tolerance — the same tolerance css.ts already trusts for color/bg/border) reuses
+  // that SEMANTIC name (--primary, --surface, --color-001…), so oklab/lch colours reached
+  // only through decoration/gradient/shadow props no longer each mint a fresh opaque
+  // --clr-N. Only colours with NO palette role fall through to a numbered --clr-N token,
+  // minted in deterministic first-encounter order (the literal is kept, byte-exact).
   const internColor = (literal: string): string => {
+    const semantic = colorVar?.(literal);
+    if (semantic) { const n = tokenName(semantic); if (n) colorTokens.add(n); return semantic; }
     let name = interner.byValue.get(literal);
-    if (!name) { name = `clr-${interner.seq.n++}`; interner.byValue.set(literal, name); interner.defs.set(name, literal); }
+    if (!name) {
+      // Dedup visually-identical literals (many oklab()/lch() forms round to the same sRGB):
+      // reuse the token minted for that colour rather than a fresh --clr-N. Fidelity-neutral —
+      // the grader compares in sRGB and the shared token holds the FIRST literal (within ±0 of
+      // its own colour). Values that don't parse fall back to exact-literal keying.
+      const key = colorClusterKey(literal);
+      const existing = key ? interner.byKey.get(key) : undefined;
+      if (existing) { name = existing; interner.byValue.set(literal, name); }
+      else {
+        name = `clr-${interner.seq.n++}`;
+        interner.byValue.set(literal, name);
+        interner.defs.set(name, literal);
+        if (key) interner.byKey.set(key, name);
+      }
+    }
     colorTokens.add(name);
     return `var(--${name})`;
   };
@@ -1131,7 +1385,11 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
     // one-off — emit it as an inline `style={{…}}` (exact, no Tailwind-escape mangling) so the node
     // needs no `[data-cid]` ditto.css rule and the shipped data-cid is stripped. If the prop IS
     // banded, it must stay in ditto.css: an inline style would out-specify the @media override.
-    const bandedRawProps = new Set<string>(bandRaws.flatMap((b) => [...b.raw.keys()]));
+    // Count EVERY band-touched prop (raw or not), not just the raw ones: a band that RESETS the prop
+    // to a non-raw value (e.g. `max-lg:bg-[none]` turning a gradient off on mobile) becomes a utility
+    // rather than a raw decl, so a raw-only set misses it — and inlining the base gradient then
+    // out-specifies the `@media` reset, painting the gradient where the source turned it off.
+    const bandedRawProps = new Set<string>(nr.bands.flatMap((b) => [...b.decls.keys()]));
     const inlineStyle = new Map<string, string>();
     for (const [p, v] of [...baseRaw]) {
       if (!bandedRawProps.has(p)) { inlineStyle.set(p, tokenizeColors(p, v)); baseRaw.delete(p); }
@@ -1222,7 +1480,7 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
  *  + breakpoint bindings, our token :root, and our reset/fonts/page-base inside @layer base
  *  so utilities override them. */
 export function tailwindGlobalsCss(opts: {
-  reset: string; fontCss: string; tokensCss: string; htmlBg: string; bodyFont: string;
+  reset: string; fontCss: string; tokensCss: string; htmlBg: string | null; bodyFont: string;
   clip: string; colorTokens: string[]; viewports: number[]; canonical: number;
 }): string {
   const screens = [
@@ -1250,8 +1508,7 @@ ${opts.tokensCss}
 ${opts.reset}
 /* fonts */
 ${opts.fontCss}
-html { background: ${opts.htmlBg}; }
-body { font-family: ${opts.bodyFont}; }${opts.clip}
+${opts.htmlBg !== null ? `html { background: ${opts.htmlBg}; }\n` : ""}body { font-family: ${opts.bodyFont}; }${opts.clip}
 }
 `;
 }

@@ -14,6 +14,7 @@ import {
 import { discoverBreakpoints } from "./breakpoints.js";
 import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.js";
 import { sha1_12, round } from "../util/canonical.js";
+import { isZipArchive, extractDotLottieJson } from "./dotlottie.js";
 
 export const REQUIRED_VIEWPORTS = [375, 768, 1280, 1920] as const;
 // The dense width set captured for SIZE INFERENCE: a node sampled at 9 widths reveals its sizing
@@ -115,13 +116,19 @@ export function isRetryableAssetFailure(type: string, status: number | null): bo
   return status >= 500 || status === 429;
 }
 
-function extFromUrl(url: string): string {
+// Bound on a preserved file extension. Real extensions are short, but a hard 5-char cap
+// silently truncates legitimate ones (`.lottie` → `.lotti`, `.webmanifest` → `.webma`),
+// which then mis-materializes the asset. Keep the guard generous enough for the longest
+// real extensions and reject anything absurdly long (a dotted path segment, not an ext).
+const MAX_EXT_LEN = 12;
+
+export function extFromUrl(url: string): string {
   try {
     const p = new URL(url).pathname;
     const dot = p.lastIndexOf(".");
     if (dot >= 0 && dot > p.lastIndexOf("/")) {
-      const ext = p.slice(dot + 1).toLowerCase().slice(0, 5);
-      if (/^[a-z0-9]+$/.test(ext)) return ext;
+      const ext = p.slice(dot + 1).toLowerCase();
+      if (ext.length <= MAX_EXT_LEN && /^[a-z0-9]+$/.test(ext)) return ext;
     }
   } catch { /* ignore */ }
   return "";
@@ -175,6 +182,83 @@ export function looksLikeVideoFile(bytes: Buffer): boolean {
   return false;
 }
 
+/** Container-magic check for accepted font bytes, mirroring `looksLikeVideoFile`. A router that
+ *  answers 200+HTML for an unknown `/media/*` path (common on SPA hosts) otherwise gets stored as
+ *  a `.woff2`; the browser rejects it as a font and the whole page falls through to a system
+ *  fallback. Accept only the real font-container signatures — woff2 (`wOF2`), woff (`wOFF`),
+ *  OpenType/CFF (`OTTO`), TrueType (`\x00\x01\x00\x00` or `true`/`ttcf`), and EOT (the version
+ *  header at bytes 8..11 is `\x01\x00\x01\x00`/`\x02\x00\x01\x00`, so key EOT off its unique
+ *  0x504C signature at offset 34) — and explicitly reject an HTML/text body. */
+export function looksLikeFontFile(bytes: Buffer): boolean {
+  if (bytes.length < 4) return false;
+  const b0 = bytes[0]!, b1 = bytes[1]!, b2 = bytes[2]!, b3 = bytes[3]!;
+  // A leading `<` (`<!DOCTYPE`, `<html`, `<?xml`, `<svg`) is never a binary font container.
+  if (b0 === 0x3c) return false;
+  const tag = bytes.subarray(0, 4).toString("latin1");
+  if (tag === "wOF2" || tag === "wOFF") return true; // woff2 / woff
+  if (tag === "OTTO" || tag === "true" || tag === "ttcf") return true; // CFF OpenType / TrueType / TrueType collection
+  if (b0 === 0x00 && b1 === 0x01 && b2 === 0x00 && b3 === 0x00) return true; // TrueType sfnt (\x00\x01\x00\x00)
+  // EOT: a little-endian byte count precedes a version/flags header; its stable marker is the
+  // 0x504C ("LP") magic at byte offset 34.
+  if (bytes.length >= 36 && bytes[34] === 0x4c && bytes[35] === 0x50) return true;
+  return false;
+}
+
+/**
+ * A `<source>` candidate for the HTML media resource-selection algorithm. `media`/`type` are the
+ * raw attribute strings (null/undefined when absent, matching a missing attribute).
+ */
+export interface VideoSourceCandidate {
+  media?: string | null;
+  type?: string | null;
+}
+
+/**
+ * Pure re-implementation of the source-selection step of the HTML media resource-selection
+ * algorithm: return the index of the FIRST `<source>` (document order) that is eligible NOW, or -1
+ * when none is. A source is eligible when its `media` query matches (a missing/empty media matches
+ * unconditionally) AND the UA can play its `type` (a missing/empty type is not a disqualifier —
+ * `canPlayType` is only consulted when a type is present).
+ *
+ * The predicates are injected so this is testable in Node (the in-page caller passes the real
+ * `matchMedia`/`canPlayType`). Kept deterministic: no state, first-match wins in document order.
+ */
+export function selectVideoSourceIndex(
+  sources: VideoSourceCandidate[],
+  mediaMatches: (media: string) => boolean,
+  canPlay: (type: string) => boolean,
+): number {
+  for (let i = 0; i < sources.length; i++) {
+    const s = sources[i]!;
+    const media = (s.media ?? "").trim();
+    if (media && !mediaMatches(media)) continue;
+    const type = (s.type ?? "").trim();
+    if (type && !canPlay(type)) continue;
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * Pure decision for the per-video seek in normalizeVideoTime, extracted so the reloaded-set /
+ * seek-target branch is unit-testable in Node (the in-page loop applies the same rule to real
+ * elements). Returns the seek to perform after the re-selection reload pass, or null to fast-skip.
+ *
+ * - A `reloaded` video sits at t=0 with the HTML element's show-poster flag freshly set. Seeking to
+ *   0 would be a no-op that fires no `seeked` and leaves the poster showing, so force a genuine seek
+ *   to a tiny epsilon to clear the flag and paint the new source's frame 0.
+ * - A non-reloaded video already at t≈0 needs nothing (skip). Otherwise seek it back to 0.
+ */
+export function planVideoSeek(
+  reloaded: boolean,
+  currentTime: number,
+): { target: number } | null {
+  const EPSILON = 1e-4;
+  if (reloaded) return { target: EPSILON };
+  if (Math.abs(currentTime) < 1e-3) return null;
+  return { target: 0 };
+}
+
 async function autoScroll(page: import("playwright").Page, vpHeight: number): Promise<void> {
   // Scroll through the page to trigger lazy-loaded images/backgrounds, then return
   // to the top so document-coordinate bboxes are measured from a settled layout.
@@ -209,6 +293,41 @@ async function settle(page: import("playwright").Page, maxMs = 2500): Promise<vo
   await page.waitForTimeout(250);
 }
 
+/**
+ * Stage 2 — scroll-state reset immediately before a per-viewport snapshot. The motion /
+ * dwell-scroll / carousel / element-screenshot passes above all leave the page scrolled or
+ * mid-transition; scroll-linked styles (Webflow scroll-state transforms, position:sticky
+ * offsets) then get baked into the captured computed styles for THAT viewport only, so a
+ * scroll-driven translateY leaks into one band and cascades. Reset window + inner scrollers
+ * to the top, wait for scroll-linked effects to settle across a few rAF ticks plus a short
+ * quiescence window, THEN let the caller snapshot. Bounded and deterministic.
+ */
+async function settleScrollTopBeforeSnapshot(page: import("playwright").Page): Promise<void> {
+  try {
+    await Promise.race([
+      page.evaluate(async () => {
+        const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+        const resetAll = () => {
+          window.scrollTo(0, 0);
+          for (const el of Array.from(document.querySelectorAll("*"))) {
+            if (el.scrollLeft) el.scrollLeft = 0;
+            if (el.scrollTop) el.scrollTop = 0;
+          }
+        };
+        resetAll();
+        // Let scroll-linked effects (scroll-state classes, sticky offsets, JS scroll handlers)
+        // recompute at scroll 0 over several frames, re-asserting the top position each tick in
+        // case a handler nudged it, then hold briefly for quiescence.
+        for (let i = 0; i < 6; i++) { await raf(); resetAll(); }
+        await new Promise<void>((r) => setTimeout(r, 120));
+        resetAll();
+        await raf();
+      }),
+      new Promise<void>((r) => setTimeout(r, 4000)),
+    ]);
+  } catch { /* ignore — a best-effort reset never blocks the snapshot */ }
+}
+
 export type DismissResult = { dismissed: string[]; overlaysRemaining: number; removed: number; blocking: boolean };
 
 /**
@@ -219,64 +338,102 @@ export type DismissResult = { dismissed: string[]; overlaysRemaining: number; re
  * Removal of a stuck overlay happens later (finalizeOverlays) AFTER a settle, so a
  * just-clicked dialog has time to close and unlock scrolling before we judge it.
  */
+/**
+ * In-page dismissal click pass (exported for fixture tests). Runs in ONE document — the main
+ * page OR a cross-origin frame (Attentive/Recart/Klaviyo creatives host their Decline/× inside
+ * an iframe, so the caller runs this in every `page.frames()`). Traverses open shadow roots
+ * (Recart mounts its popup in a shadow tree) when scanning both containers and buttons.
+ */
+export function clickDismissInPage(): string[] {
+  const dismissed: string[] = [];
+  // Deep collector across open shadow roots.
+  const deepEls = (root: ParentNode, sel: string): Element[] => {
+    const out: Element[] = [];
+    const walk = (r: ParentNode): void => {
+      let hits: Element[] = [];
+      try { hits = Array.from(r.querySelectorAll(sel)); } catch { /* invalid selector */ }
+      out.push(...hits);
+      for (const el of Array.from(r.querySelectorAll("*"))) {
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) walk(sr);
+      }
+    };
+    walk(root);
+    return out;
+  };
+  const vis = (el: Element): boolean => {
+    const cs = getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
+    const r = (el as HTMLElement).getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const click = (el: Element): void => { try { (el as HTMLElement).click(); } catch { /* ignore */ } };
+
+  // 1) Known consent-framework / generic close affordances, in priority order.
+  const KNOWN = [
+    "#onetrust-accept-btn-handler", "#accept-recommended-btn-handler", ".onetrust-close-btn-handler",
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
+    "#truste-consent-button", ".osano-cm-accept-all", ".osano-cm-dialog__close",
+    "[data-testid='uc-accept-all-button']", "[data-testid='uc-deny-all-button']",
+    "#didomi-notice-agree-button", ".didomi-continue-without-agreeing",
+    ".qc-cmp2-summary-buttons button[mode='primary']", "button[aria-label='Consent']",
+    ".cc-allow", ".cookie-consent-accept", "#hs-eu-confirmation-button", "#gdpr-consent-tool-wrapper button",
+  ];
+  for (const sel of KNOWN) {
+    for (const el of deepEls(document, sel)) {
+      if (vis(el)) { click(el); dismissed.push(sel); break; }
+    }
+  }
+
+  // 2) Scoped text-button pass: only inside overlay-ish containers (dialogs, or id/class naming
+  //    cookie/consent/modal/popup/newsletter/overlay/ccpa/privacy) so we never click an ordinary
+  //    page button. ACCEPT now also covers email-capture DECLINE affordances ("decline",
+  //    "no thanks", "not now", …) — a popup's own opt-out is the surest deterministic close.
+  const ACCEPT = new Set([
+    "accept", "accept all", "accept all cookies", "accept cookies", "accept & close",
+    "i accept", "i agree", "agree", "agree and continue", "allow all", "allow cookies",
+    "allow all cookies", "got it", "ok", "okay", "continue", "no thanks", "no, thanks",
+    "dismiss", "close", "got it!", "understood", "yes, i agree",
+    "decline", "no, thank you", "not now", "maybe later", "no thank you", "skip", "reject all",
+  ]);
+  const containerSel =
+    "[role='dialog'],[aria-modal='true'],[id*='cookie' i],[class*='cookie' i],[id*='consent' i]," +
+    "[class*='consent' i],[class*='gdpr' i],[id*='gdpr' i],[class*='modal' i],[class*='popup' i]," +
+    "[class*='newsletter' i],[class*='interstitial' i],[class*='overlay' i],[id*='overlay' i]," +
+    "[class*='ccpa' i],[id*='ccpa' i],[class*='privacy' i],[id*='pop' i]";
+  const containers = deepEls(document, containerSel);
+  for (const c of containers) {
+    if (!vis(c)) continue;
+    // Text/value-matched accept/decline buttons.
+    const btns = deepEls(c, "button,[role='button'],a,input[type='button'],input[type='submit']");
+    let clicked = false;
+    for (const b of btns) {
+      const t = (b.textContent || (b as HTMLInputElement).value || "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (t && ACCEPT.has(t) && vis(b)) { click(b); dismissed.push("text:" + t); clicked = true; break; }
+    }
+    if (clicked) continue;
+    // aria-label / title close affordance (icon-only ×, no text content to match).
+    const closers = deepEls(c, "[aria-label*='close' i],[aria-label*='dismiss' i],[title*='close' i],button.close,.close-button,[class*='close' i][role='button']");
+    for (const x of closers) {
+      if (vis(x)) { click(x); dismissed.push("close:" + ((x.getAttribute("aria-label") || x.getAttribute("title") || "x")).slice(0, 24)); break; }
+    }
+  }
+  return dismissed;
+}
+
 async function clickDismiss(page: import("playwright").Page): Promise<string[]> {
-  try {
-    return await Promise.race([
-      page.evaluate(() => {
-        const dismissed: string[] = [];
-        const vis = (el: Element): boolean => {
-          const cs = getComputedStyle(el);
-          if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
-          const r = (el as HTMLElement).getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        };
-        const click = (el: Element): void => { try { (el as HTMLElement).click(); } catch { /* ignore */ } };
-
-        // 1) Known consent-framework / generic close affordances, in priority order.
-        const KNOWN = [
-          "#onetrust-accept-btn-handler", "#accept-recommended-btn-handler", ".onetrust-close-btn-handler",
-          "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
-          "#truste-consent-button", ".osano-cm-accept-all", ".osano-cm-dialog__close",
-          "[data-testid='uc-accept-all-button']", "[data-testid='uc-deny-all-button']",
-          "#didomi-notice-agree-button", ".didomi-continue-without-agreeing",
-          ".qc-cmp2-summary-buttons button[mode='primary']", "button[aria-label='Consent']",
-          ".cc-allow", ".cookie-consent-accept", "#hs-eu-confirmation-button", "#gdpr-consent-tool-wrapper button",
-        ];
-        for (const sel of KNOWN) {
-          try {
-            for (const el of Array.from(document.querySelectorAll(sel))) {
-              if (vis(el)) { click(el); dismissed.push(sel); break; }
-            }
-          } catch { /* invalid selector in this browser */ }
-        }
-
-        // 2) Scoped text-button pass: only inside overlay-ish containers (dialogs,
-        //    or id/class naming cookie/consent/modal/popup/newsletter) so we never
-        //    click an ordinary page button.
-        const ACCEPT = new Set([
-          "accept", "accept all", "accept all cookies", "accept cookies", "accept & close",
-          "i accept", "i agree", "agree", "agree and continue", "allow all", "allow cookies",
-          "allow all cookies", "got it", "ok", "okay", "continue", "no thanks", "no, thanks",
-          "dismiss", "close", "got it!", "understood", "yes, i agree",
-        ]);
-        const containerSel =
-          "[role='dialog'],[aria-modal='true'],[id*='cookie' i],[class*='cookie' i],[id*='consent' i]," +
-          "[class*='consent' i],[class*='gdpr' i],[id*='gdpr' i],[class*='modal' i],[class*='popup' i]," +
-          "[class*='newsletter' i],[class*='interstitial' i]";
-        let containers: Element[] = [];
-        try { containers = Array.from(document.querySelectorAll(containerSel)); } catch { /* ignore */ }
-        for (const c of containers) {
-          if (!vis(c)) continue;
-          const btns = Array.from(c.querySelectorAll("button,[role='button'],a,input[type='button'],input[type='submit']"));
-          for (const b of btns) {
-            const t = (b.textContent || (b as HTMLInputElement).value || "").replace(/\s+/g, " ").trim().toLowerCase();
-            if (t && ACCEPT.has(t) && vis(b)) { click(b); dismissed.push("text:" + t); break; }
-          }
-        }
-        return dismissed;
-      }),
+  // Run the click pass in the main document AND every frame — cross-origin popup creatives
+  // (Attentive/Recart/…) host their Decline/close controls inside an iframe that the top
+  // document cannot reach, but Playwright can evaluate inside each frame from Node.
+  const runOne = (frame: import("playwright").Frame): Promise<string[]> =>
+    Promise.race([
+      frame.evaluate(clickDismissInPage).catch(() => [] as string[]),
       new Promise<string[]>((res) => setTimeout(() => res([]), 6000)),
     ]);
+  try {
+    const frames = page.frames();
+    const results = await Promise.all(frames.map((f) => runOne(f).catch(() => [] as string[])));
+    return results.flat();
   } catch {
     return [];
   }
@@ -292,57 +449,168 @@ async function clickDismiss(page: import("playwright").Page): Promise<string[]> 
  * sticky chrome is never stripped. Reports `blocking` = a scroll-locking overlay we
  * could not clear (the pollution gate keys off this, not mere overlay presence).
  */
-async function finalizeOverlays(page: import("playwright").Page): Promise<{ overlaysRemaining: number; removed: number; blocking: boolean; removedLabels: string[] }> {
+export type FinalizeOverlaysResult = { overlaysRemaining: number; removed: number; blocking: boolean; removedLabels: string[] };
+
+/**
+ * In-page overlay finalizer (exported so fixture tests can page.evaluate it directly).
+ * Detects any full-viewport, fixed/sticky BLOCKING layer still present and — when the page
+ * is scroll-locked (a state legit pages never enter) — removes it. Key robustness rules:
+ *
+ *  (a) EFFECTIVE z-index: an element with `z-index:auto` inherits its stacking position from
+ *      the nearest positioned/opacity/transform ancestor that establishes a stacking context.
+ *      A vendor popup iframe is z:auto but sits inside a z=INT_MAX wrapper, so per-element
+ *      `parseInt("auto")` under-reads it — resolve z through the ancestor chain instead.
+ *  (b) LOCK relaxes the z gate: on a scroll-locked page, ANY fixed/sticky full-viewport layer
+ *      is blocking regardless of z (catches a z:auto creative and a z=50 CCPA dialog). Off a
+ *      locked page we keep the z>=100 floor to avoid stripping legit fixed content.
+ *  (c) OVERLAY UNIT: a 0-size (height:0) max-z wrapper whose descendant is a full-viewport
+ *      fixed iframe is ONE overlay — the wrapper carries the z, the iframe carries the pixels.
+ *      Detecting either means removing BOTH (climb from a removable iframe to its high-z
+ *      wrapper ancestor; and treat a max-z 0-size wrapper as an overlay via its full-viewport
+ *      descendant). Neither alone passes the area+z gate, so they must be grouped.
+ *  (d) LOUD FAILURE: if the lock persists after removal (or was locked with nothing detected),
+ *      report blocking=true so the pollution gate fails rather than shipping a polluted capture.
+ */
+export function finalizeOverlaysInPage(): FinalizeOverlaysResult {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  // Deep element walk that descends into OPEN shadow roots. A shadow host reports 0 light-DOM
+  // children, so a popup mounted inside a shadow tree (Recart's `#recart-popup-root`) is invisible
+  // to a plain `querySelectorAll("*")` — its full-viewport fixed layer would never be detected and
+  // would paint into every screenshot. Traverse `element.shadowRoot` (open only; closed roots are
+  // unreachable — the host itself is still caught by the geometry gate below and removed whole).
+  const deepEls = (root: ParentNode): Element[] => {
+    const out: Element[] = [];
+    const push = (r: ParentNode): void => {
+      for (const el of Array.from(r.querySelectorAll("*"))) {
+        out.push(el);
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) push(sr);
+      }
+    };
+    push(root);
+    return out;
+  };
+  const isLocked = (): boolean => {
+    const b = document.body, h = document.documentElement;
+    const bs = getComputedStyle(b), hs = getComputedStyle(h);
+    return bs.overflow === "hidden" || hs.overflow === "hidden" ||
+      bs.overflowY === "hidden" || hs.overflowY === "hidden" ||
+      bs.position === "fixed" || bs.position === "absolute";
+  };
+  // Effective z-index: climb to the nearest ancestor that both is positioned/creates a stacking
+  // context AND reports a numeric z-index. `z-index:auto` on a positioned child paints in its
+  // parent stacking context, so the parent's z is the layer's true stacking rank.
+  const effectiveZ = (el: Element): number => {
+    let cur: Element | null = el;
+    let hops = 0;
+    while (cur && hops < 20) {
+      const cs = getComputedStyle(cur);
+      const zi = parseInt(cs.zIndex || "", 10);
+      const positioned = cs.position !== "static";
+      if (Number.isFinite(zi) && positioned) return zi;
+      cur = cur.parentElement;
+      hops++;
+    }
+    return 0;
+  };
+  const rectOf = (el: Element) => (el as HTMLElement).getBoundingClientRect();
+  const fullViewport = (r: DOMRect): boolean => r.width >= vw * 0.7 && r.height >= vh * 0.5 && (r.width * r.height) / (vw * vh) >= 0.5;
+  const painting = (cs: CSSStyleDeclaration): boolean =>
+    cs.display !== "none" && cs.visibility !== "hidden" && parseFloat(cs.opacity || "1") !== 0;
+
+  const locked = isLocked();
+
+  // Candidate blocking layers. A layer qualifies when it is fixed/sticky, painting, and either
+  // (1) itself full-viewport, or (2) a 0-size/high-z wrapper whose descendant is full-viewport
+  // (the overlay-unit case — the wrapper holds the z, an inner iframe holds the pixels).
+  // Full-viewport descendant test that pierces shadow roots (Recart mounts the covering layer
+  // inside the host's shadow tree, so a light-DOM `querySelectorAll` would find nothing).
+  const hasFullDescendant = (el: Element): boolean => {
+    const scope: ParentNode = (el as HTMLElement).shadowRoot ?? el;
+    return deepEls(scope).some((d) => { const dcs = getComputedStyle(d); return painting(dcs) && (dcs.position === "fixed" || dcs.position === "sticky" || dcs.position === "absolute") && fullViewport(rectOf(d)); });
+  };
+  const bigOverlays = (): HTMLElement[] => {
+    const out: HTMLElement[] = [];
+    for (const el of deepEls(document.body)) {
+      const cs = getComputedStyle(el);
+      const isShadowHost = !!(el as HTMLElement).shadowRoot;
+      // A shadow host is usually position:static with a fixed layer INSIDE its root; still test it
+      // (via its shadow descendants) so the whole host can be removed as one overlay unit.
+      if (cs.position !== "fixed" && cs.position !== "sticky" && !isShadowHost) continue;
+      if (!painting(cs)) continue;
+      const r = rectOf(el);
+      const z = effectiveZ(el);
+      // Off a locked page keep the z>=100 floor; on a locked page any full-viewport fixed
+      // layer is blocking (rule b). A max-z wrapper is a blocking layer even at 0 size when it
+      // wraps a full-viewport descendant (rule c) — legit chrome never reaches the INT_MAX band.
+      const positioned = cs.position === "fixed" || cs.position === "sticky";
+      const selfFull = positioned && fullViewport(r);
+      const wrapsFull = (isShadowHost || r.width < 4 || r.height < 4) && (isShadowHost || z >= 100) && hasFullDescendant(el);
+      if (!selfFull && !wrapsFull) continue;
+      const zPass = locked || z >= 100 || (wrapsFull && isShadowHost);
+      if (zPass) out.push(el as HTMLElement);
+    }
+    // Keep outermost only (a wrapper subsumes its inner full-viewport iframe — the overlay unit).
+    // `Node.contains` does NOT cross shadow boundaries, so also treat a candidate that lives inside
+    // another candidate's shadow tree as contained — otherwise a shadow host AND its inner layer
+    // both survive and we double-remove (or leave the inner layer behind).
+    const shadowContains = (host: Element, node: Element): boolean => {
+      let cur: Node | null = node;
+      while (cur) {
+        const rootNode = cur.getRootNode();
+        if (rootNode instanceof ShadowRoot) {
+          if (rootNode.host === host || host.contains(rootNode.host)) return true;
+          cur = rootNode.host;
+        } else break;
+      }
+      return false;
+    };
+    return out.filter((el) => !out.some((o) => o !== el && (o.contains(el) || shadowContains(o, el))));
+  };
+
+  // A scroll-locked page behind a full-viewport overlay IS a blocking modal by definition
+  // (legit pages don't scroll-lock). Remove ANY such overlay that isn't page chrome — many
+  // modals/drawers carry no consent/modal keyword and an icon-only close, so a keyword/aria
+  // allowlist misses them. PROTECTED guards real chrome (header/nav/footer) only.
+  const PROTECTED = /header|navbar|nav-|site-nav|topbar|masthead|footer/i;
+  const sig = (el: HTMLElement): string => `${el.id} ${el.className}`.toString();
+
+  const removedLabels: string[] = [];
+  let removed = 0;
+  let remaining = bigOverlays();
+  if (remaining.length && locked) {
+    for (const el of remaining) {
+      const s = sig(el);
+      const z = effectiveZ(el);
+      // Scroll-locked + full-viewport ⇒ blocking modal; remove unless it's page chrome. Always
+      // remove iframes (cross-origin close, unclickable), max-z wrappers, and the overlay unit:
+      // when the layer IS or CONTAINS a full-viewport fixed iframe, remove the whole subtree
+      // (rule c — the 0-size wrapper + its iframe come out together as one node).
+      const isShadowHost = !!(el as HTMLElement).shadowRoot;
+      const containsIframe = el.tagName === "IFRAME" || !!el.querySelector("iframe") ||
+        (isShadowHost && !!(el as HTMLElement).shadowRoot!.querySelector("iframe"));
+      const removable = !PROTECTED.test(s) || el.getAttribute("aria-modal") === "true" ||
+        containsIframe || isShadowHost || z >= 100;
+      if (removable) { el.remove(); removed++; removedLabels.push((el.id || el.className || el.tagName).toString().slice(0, 40)); }
+    }
+    if (removed) {
+      document.body.style.overflow = "visible"; document.documentElement.style.overflow = "visible";
+      document.body.style.overflowY = "visible"; document.documentElement.style.overflowY = "visible";
+      document.body.style.position = "static";
+    }
+    remaining = bigOverlays();
+  }
+  // Loud failure (rule d): a persisting lock is blocking whether or not a specific overlay was
+  // still detectable — a scroll-locked capture is polluted, so surface it to the pollution gate.
+  const stillLocked = isLocked();
+  return { overlaysRemaining: remaining.length, removed, blocking: stillLocked && (remaining.length > 0 || locked), removedLabels };
+}
+
+async function finalizeOverlays(page: import("playwright").Page): Promise<FinalizeOverlaysResult> {
   try {
     return await Promise.race([
-      page.evaluate(() => {
-        const vw = window.innerWidth, vh = window.innerHeight;
-        const bigOverlays = (): HTMLElement[] => {
-          const out: HTMLElement[] = [];
-          for (const el of Array.from(document.body.querySelectorAll("*"))) {
-            const cs = getComputedStyle(el);
-            if (cs.position !== "fixed" && cs.position !== "sticky") continue;
-            if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) continue;
-            const r = (el as HTMLElement).getBoundingClientRect();
-            const z = parseInt(cs.zIndex || "0", 10) || 0;
-            const area = (r.width * r.height) / (vw * vh);
-            if (area >= 0.5 && z >= 100 && r.width >= vw * 0.7 && r.height >= vh * 0.5) out.push(el as HTMLElement);
-          }
-          return out.filter((el) => !out.some((o) => o !== el && o.contains(el)));
-        };
-        const isLocked = (): boolean => {
-          const b = document.body, h = document.documentElement;
-          return getComputedStyle(b).overflow === "hidden" || getComputedStyle(h).overflow === "hidden" ||
-            getComputedStyle(b).position === "fixed";
-        };
-        // A scroll-locked page behind a full-viewport overlay IS a blocking modal by
-        // definition (legit pages don't scroll-lock). So remove ANY such overlay that
-        // isn't page chrome — many modals/drawers carry no consent/modal keyword and
-        // an icon-only close, so a keyword/aria allowlist misses them (ruggable's
-        // z-[1001] drawer). PROTECTED guards real chrome (header/nav/footer) only.
-        const PROTECTED = /header|navbar|nav-|site-nav|topbar|masthead|footer/i;
-        const sig = (el: HTMLElement): string => `${el.id} ${el.className}`.toString();
-
-        const removedLabels: string[] = [];
-        let removed = 0;
-        let remaining = bigOverlays();
-        if (remaining.length && isLocked()) {
-          for (const el of remaining) {
-            const s = sig(el);
-            const z = parseInt(getComputedStyle(el).zIndex || "0", 10) || 0;
-            // Scroll-locked + full-viewport ⇒ blocking modal; remove unless it's page
-            // chrome. Always remove iframes (cross-origin close, unclickable) and the
-            // max-z-index popup trick.
-            const removable = !PROTECTED.test(s) || el.getAttribute("aria-modal") === "true" ||
-              el.tagName === "IFRAME" || z >= 2_000_000_000;
-            if (removable) { el.remove(); removed++; removedLabels.push((el.id || el.className || el.tagName).toString().slice(0, 40)); }
-          }
-          if (removed) { document.body.style.overflow = "visible"; document.documentElement.style.overflow = "visible"; document.body.style.position = "static"; }
-          remaining = bigOverlays();
-        }
-        return { overlaysRemaining: remaining.length, removed, blocking: remaining.length > 0 && isLocked(), removedLabels };
-      }),
-      new Promise<{ overlaysRemaining: number; removed: number; blocking: boolean; removedLabels: string[] }>((res) => setTimeout(() => res({ overlaysRemaining: 0, removed: 0, blocking: false, removedLabels: [] }), 6000)),
+      page.evaluate(finalizeOverlaysInPage),
+      new Promise<FinalizeOverlaysResult>((res) => setTimeout(() => res({ overlaysRemaining: 0, removed: 0, blocking: false, removedLabels: [] }), 6000)),
     ]);
   } catch {
     return { overlaysRemaining: 0, removed: 0, blocking: false, removedLabels: [] };
@@ -475,10 +743,102 @@ async function captureVideoStills(page: import("playwright").Page): Promise<Vide
 }
 
 /**
- * Full-page screenshot with robustness for heavy/animated pages. The default 30s
- * timeout is exceeded by tall SaaS pages (Playwright also waits for web fonts);
- * use a long timeout, freeze animations (also improves determinism), and retry.
- * As a last resort take a viewport-only shot so the file exists (the capture gate
+ * Stage 2 — canvas raster fallback. A visible <canvas> (animated background, chart,
+ * WebGL scene) is a runtime-drawn surface the clone cannot reproduce as DOM, so it
+ * would render as an empty box. Rasterize each meaningful canvas to a PNG still under
+ * a synthetic URL (the normal asset pipeline rewrites it to a local file); the node is
+ * then marked with a `src` attr so generation emits the still as an <img> filling the
+ * canvas's box. `toDataURL` is exact but THROWS for tainted canvases and for WebGL
+ * contexts without preserveDrawingBuffer — those return a shot plan for the node-side
+ * element-screenshot fallback (composited pixels, works regardless). A WebGL canvas may
+ * also toDataURL to a blank image when the drawing buffer was already presented; that
+ * blank is accepted as-is (detecting blankness would be heuristic, not deterministic).
+ * The in-page part is exported for the fixture tests (page.evaluate'd directly).
+ */
+export type CanvasStillPlan = { stills: Array<{ url: string; dataUrl: string; sel: string }>; shots: Array<{ url: string; sel: string }> };
+export function captureCanvasStillsInPage(): CanvasStillPlan {
+  const stills: CanvasStillPlan["stills"] = [];
+  const shots: CanvasStillPlan["shots"] = [];
+  const hash = (s: string): string => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); };
+  const canvases = Array.from(document.querySelectorAll("canvas"));
+  let i = 0;
+  for (const c of canvases) {
+    const r = c.getBoundingClientRect();
+    if (r.width < 48 || r.height < 48) continue; // not a meaningful painted surface
+    const cs = getComputedStyle(c);
+    if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") < 0.05) continue;
+    const idx = i++;
+    c.setAttribute("data-clone-canvas", String(idx));
+    const sel = `canvas[data-clone-canvas="${idx}"]`;
+    const url = `https://clone-canvas.local/${idx}-${hash(c.id + "|" + c.width + "|" + c.height + "|" + idx)}.png`;
+    let ok = false;
+    try {
+      const dataUrl = c.toDataURL("image/png"); // throws if tainted / WebGL buffer unreadable
+      if (dataUrl.startsWith("data:image/png")) { stills.push({ url, dataUrl, sel }); ok = true; }
+    } catch { /* fall through to the element-screenshot plan */ }
+    if (!ok) shots.push({ url, sel });
+  }
+  return { stills, shots };
+}
+
+async function captureCanvasStills(page: import("playwright").Page): Promise<CanvasStillPlan> {
+  try {
+    return await Promise.race([
+      page.evaluate(captureCanvasStillsInPage),
+      new Promise<CanvasStillPlan>((res) => setTimeout(() => res({ stills: [], shots: [] }), 12_000)),
+    ]);
+  } catch {
+    return { stills: [], shots: [] };
+  }
+}
+
+// Chromium refuses/truncates screenshots past a texture-size cap; keep clip dimensions
+// under a conservative bound so captureFullPageViaCDP fails cleanly (→ Playwright fallback)
+// instead of returning a truncated image on pathologically tall pages.
+const CDP_MAX_SHOT_DIMENSION = 16_384;
+
+/**
+ * Full-page screenshot via CDP `Page.captureScreenshot` with `captureBeyondViewport:true`.
+ * Unlike Playwright's `fullPage:true` (which scroll-stitches — scrolling the page to render
+ * each band, FIRING scroll events that drive scroll-linked animations, e.g. IX2 grow-on-scroll
+ * or WAAPI scroll-timelines), CDP renders the whole page in ONE shot WITHOUT scrolling and
+ * never fires scroll events. So the resulting still is the genuine at-rest (unscrolled) page,
+ * matching the DOM snapshot the walk grades. Writes a PNG to `path`. Throws on any failure so
+ * the caller can fall back to the Playwright path.
+ */
+export async function captureFullPageViaCDP(page: import("playwright").Page, path: string): Promise<void> {
+  const client = await page.context().newCDPSession(page);
+  try {
+    const metrics = await client.send("Page.getLayoutMetrics") as {
+      cssContentSize?: { width: number; height: number };
+      contentSize?: { width: number; height: number };
+    };
+    const size = metrics.cssContentSize ?? metrics.contentSize;
+    if (!size || !(size.width > 0) || !(size.height > 0)) throw new Error("cdp: empty content size");
+    const width = Math.ceil(size.width);
+    const height = Math.ceil(size.height);
+    if (width > CDP_MAX_SHOT_DIMENSION || height > CDP_MAX_SHOT_DIMENSION) {
+      throw new Error(`cdp: content ${width}x${height} exceeds max shot dimension`);
+    }
+    const shot = await client.send("Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width, height, scale: 1 },
+    }) as { data: string };
+    if (!shot?.data) throw new Error("cdp: no screenshot data");
+    writeBytes(path, Buffer.from(shot.data, "base64"));
+  } finally {
+    await client.detach().catch(() => { /* ignore */ });
+  }
+}
+
+/**
+ * Full-page screenshot with robustness for heavy/animated pages. Prefers CDP capture
+ * (captureFullPageViaCDP — no scroll-stitch, so scroll-linked animations aren't scrubbed
+ * and the still is the true at-rest page). On ANY CDP failure, falls back to Playwright's
+ * `fullPage:true` (which scroll-stitches but freezes animations); the default 30s timeout
+ * is exceeded by tall pages (Playwright also waits for web fonts), so use a long timeout and
+ * retry. As a last resort take a viewport-only shot so the file exists (the capture gate
  * checks presence; a partial image still beats none).
  */
 async function captureScreenshot(
@@ -487,6 +847,13 @@ async function captureScreenshot(
   vw: number,
   log: (e: Record<string, unknown>) => void,
 ): Promise<void> {
+  try {
+    await captureFullPageViaCDP(page, path);
+    log({ event: "screenshot_cdp", viewport: vw });
+    return;
+  } catch (eCdp) {
+    log({ event: "screenshot_cdp_fallback", viewport: vw, error: String(eCdp).slice(0, 200) });
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await page.screenshot({ path, fullPage: true, timeout: 90_000, animations: "disabled" });
@@ -503,6 +870,131 @@ async function captureScreenshot(
       }
     }
   }
+}
+
+/**
+ * Pause every <video> and seek it to time 0, then wait for that seek to actually PAINT, so a
+ * screenshot taken right after is deterministic. A video's playback time is runtime state: a one-shot
+ * animation ends on its last frame, an autoplaying loop sits at an arbitrary offset, and the time a
+ * given viewport's shot happens to catch is nondeterministic. Without normalization the SOURCE and the
+ * (frame-0, non-playing) CLONE can show different frames of the same element — a phantom perceptual
+ * diff that no CSS change can close. Seeking BOTH sides to frame 0 before EVERY viewport screenshot
+ * removes it. `seeked` fires once the new frame is decoded; we still yield two rAFs so the compositor
+ * has painted it before the screenshot reads pixels. Bounded so a stalled/unseekable video can't hang.
+ *
+ * FIRST it re-runs `<source media>` resource selection for THIS viewport. The capture pipeline loads
+ * the page once at the canonical width and reaches every other viewport by resizing — but the HTML
+ * media resource-selection algorithm evaluates `<source media>` only at load, so an aspect/orientation
+ * -gated hero video stays frozen on whatever variant matched at load width across all resized shots.
+ * The validator fresh-loads per viewport and correctly re-selects, so the two channels disagree on
+ * which variant is on screen (a large phantom diff on full-bleed portrait/landscape hero videos).
+ * Re-selecting here keeps the channels symmetric; it is a no-op on the fresh-loading validator side
+ * and — the common case — a no-op whenever the current selection is still the right one, so the fast
+ * path never touches `video.load()`.
+ */
+export async function normalizeVideoTime(
+  page: import("playwright").Page,
+  log?: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  try {
+    const reselections = await page.evaluate(async () => {
+      const vids = Array.from(document.querySelectorAll("video"));
+      const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+      // Re-select the <source> the resource-selection algorithm would pick at the CURRENT viewport,
+      // mirroring selectVideoSourceIndex (Node-side, unit-tested): first source in document order
+      // whose media matches (missing media matches unconditionally) and whose type is playable
+      // (missing type is never disqualifying). Only reload when the winner differs from what is
+      // currently loaded — the fast path leaves untouched videos alone.
+      //
+      // Track which videos we reloaded. A reload resets the element's *show-poster flag* to true and
+      // sets currentTime to 0; the follow-up pause() cancels the pending autoplay, so the one thing
+      // that would have cleared that flag (playback beginning) never happens. Left uncleared, the
+      // element renders its `poster` image — which for an aspect-gated hero is a frame of the WRONG
+      // variant — instead of the freshly-selected source's frame 0. A real seek is the other
+      // flag-clearing path, but the fast-skip below bails at t=0. So force a genuine seek (to a tiny
+      // epsilon, not to the already-current 0) on exactly the reloaded videos to clear the flag and
+      // present the new source's decoded frame. Non-reloaded videos keep the existing fast skip.
+      const reloaded = new WeakSet<HTMLVideoElement>();
+      const reselections: { from: string; to: string; readyState: number }[] = [];
+      const reloadWaits: Promise<void>[] = [];
+      for (const v of vids) {
+        try {
+          const sources = Array.from(v.querySelectorAll("source"));
+          if (sources.length === 0) continue; // src attribute (no <source> children): nothing to re-select
+          let winner: HTMLSourceElement | null = null;
+          for (const s of sources) {
+            const media = (s.getAttribute("media") ?? "").trim();
+            if (media && !window.matchMedia(media).matches) continue;
+            const type = (s.getAttribute("type") ?? "").trim();
+            if (type && !v.canPlayType(type)) continue;
+            winner = s;
+            break;
+          }
+          if (!winner || !winner.src) continue;
+          // Compare resolved URLs; currentSrc is absolute, winner.src is already resolved.
+          if (v.currentSrc === winner.src) continue; // no change — fast path, do not reload
+          const from = v.currentSrc;
+          const to = winner.src;
+          v.load();
+          reloaded.add(v);
+          reloadWaits.push(new Promise<void>((resolve) => {
+            let settled = false;
+            const done = () => {
+              if (settled) return;
+              settled = true;
+              v.removeEventListener("loadeddata", done);
+              v.removeEventListener("seeked", done);
+              reselections.push({ from, to, readyState: v.readyState });
+              resolve();
+            };
+            if (v.readyState >= 2 /* HAVE_CURRENT_DATA */) { done(); return; }
+            // A post-reload `seeked` implies a decoded frame is ready too, so treat it as an
+            // additional readiness signal: on slow CDNs the epsilon seek (below) can land its
+            // `seeked` before `loadeddata`, which unblocks the FIRST viewport instead of waiting
+            // out the 4s bound and shooting the poster.
+            v.addEventListener("loadeddata", done, { once: true });
+            v.addEventListener("seeked", done, { once: true });
+            setTimeout(done, 4000); // bound: a stalled reload resolves anyway so the shot never hangs
+          }));
+        } catch { /* a malformed <source>/media query must not block the others */ }
+      }
+
+      const waits: Promise<void>[] = [];
+      const seekTo = (v: HTMLVideoElement, t: number) =>
+        new Promise<void>((resolve) => {
+          let settled = false;
+          const done = () => { if (settled) return; settled = true; v.removeEventListener("seeked", done); resolve(); };
+          v.addEventListener("seeked", done, { once: true });
+          try { v.currentTime = t; } catch { done(); }
+          setTimeout(done, 400); // bound: a stalled/unseekable video resolves anyway
+        });
+      for (const v of vids) {
+        try { v.pause(); } catch { /* ignore */ }
+        if (reloaded.has(v)) {
+          // A just-reloaded video sits at t=0 with the show-poster flag set. Seek to a tiny epsilon
+          // (not 0, which is already the current time and would fire no `seeked`) to force a genuine
+          // seek: it clears the flag and paints the new source's frame 0. Start it eagerly so its
+          // `seeked` can also satisfy the reload wait above on slow networks.
+          waits.push(seekTo(v, 1e-4));
+          continue;
+        }
+        // Seek to 0 only when not already there (a fresh seek to the current time may not fire `seeked`).
+        if (Math.abs(v.currentTime) < 1e-3) continue;
+        waits.push(seekTo(v, 0));
+      }
+      // Await the reload settles and the seeks together; the reload wait can be released by an
+      // epsilon seek's `seeked`, so both sets must be in flight before we block on either.
+      await Promise.all([...reloadWaits, ...waits]);
+      await raf(); await raf(); // let the decoded frame composite before the screenshot reads pixels
+      return reselections;
+    });
+    if (log && reselections && reselections.length) {
+      for (const r of reselections) {
+        log({ event: "video_source_reselected", from: r.from, to: r.to, readyState: r.readyState });
+      }
+    }
+  } catch { /* a page with no videos / an eval hiccup must never block the screenshot */ }
 }
 
 export async function captureSite(opts: {
@@ -577,9 +1069,24 @@ export async function captureSite(opts: {
     // page stored under first-stored-wins ships a corrupt file). Left unstored, the
     // asset surfaces in visual_assets_missing instead.
     if (type === "video" && !looksLikeVideoFile(bytes)) return;
+    // Same guard for fonts: a 200+HTML body (SPA router answering an unknown /media/* path) must not
+    // be stored as a .woff2. Left unstored, the face surfaces as failed, so the font graph can fall
+    // back to a correctly-resolved duplicate url instead of shipping an impostor the browser rejects.
+    if (type === "font" && !looksLikeFontFile(bytes)) return;
     const a = assetMap.get(url) ?? recordAsset(url, type, null, null, "network");
     if (a.storedAs) return;
-    const ext = extFromUrl(url) || extFromContentType(a.contentType) ||
+    // A `.lottie` (dotLottie) asset is a ZIP archive, not bare lottie-web JSON. lottie-web's
+    // `path:` loader does a JSON.parse and throws on the ZIP bytes, blanking the container. So
+    // unwrap it here: extract the default animation JSON and store THAT, materializing every
+    // lottie source as plain JSON regardless of the container it arrived in.
+    let extOverride: string | null = null;
+    if (type === "lottie" && isZipArchive(bytes)) {
+      const json = extractDotLottieJson(bytes);
+      if (!json) return; // unreadable dotLottie — leave unstored rather than ship a broken ZIP
+      bytes = json;
+      extOverride = "json";
+    }
+    const ext = extOverride || extFromUrl(url) || extFromContentType(a.contentType) ||
       (type === "css" ? "css" : type === "font" ? "woff2" : type === "svg" ? "svg" :
        type === "video" ? "mp4" : type === "lottie" ? "json" : "png");
     const name = `${sha1_12(url)}.${ext}`;
@@ -870,6 +1377,47 @@ export async function captureSite(opts: {
           await page.evaluate(() => window.scrollTo(0, 0));
           await page.waitForTimeout(80);
         }
+
+        // Stage 2: canvas raster fallback — same synthetic-URL mechanism as the video
+        // stills above (captureCanvasStills). Bytes ride the normal asset pipeline; the
+        // canvas node gets a `src` attr (whitelisted → survives the IR) that generation
+        // reads to emit the still as an <img> carrying the canvas's cid/box. The attr is
+        // stamped only AFTER bytes are stored, so a failed capture leaves the canvas
+        // rendering as an empty box, same as before.
+        const cplan = await captureCanvasStills(page);
+        const stampCanvasSrc = (sel: string, u: string): Promise<void> =>
+          page.evaluate(({ s, u: uu }) => { document.querySelector(s)?.setAttribute("src", uu); }, { s: sel, u }).catch(() => { /* ignore */ });
+        for (const s of cplan.stills) {
+          const comma = s.dataUrl.indexOf(",");
+          if (comma < 0) continue;
+          try {
+            const buf = Buffer.from(s.dataUrl.slice(comma + 1), "base64");
+            recordAsset(s.url, "image", "image/png", 200, "canvas-still");
+            storeBytes(s.url, "image", buf);
+            await stampCanvasSrc(s.sel, s.url);
+            log({ event: "canvas_still", viewport: vw, sel: s.sel });
+          } catch { /* ignore */ }
+        }
+        for (const s of cplan.shots) {
+          // Same reveal discipline as the video shots: a hidden canvas (entrance
+          // animation not yet fired) would time out locator.screenshot's visibility wait.
+          try {
+            await page.evaluate(forceRevealForShot, s.sel);
+            const buf = await page.locator(s.sel).first().screenshot({ type: "png", timeout: 5000, animations: "disabled" });
+            recordAsset(s.url, "image", "image/png", 200, "canvas-still");
+            storeBytes(s.url, "image", buf);
+            await stampCanvasSrc(s.sel, s.url);
+            log({ event: "canvas_still", viewport: vw, sel: s.sel });
+          } catch (e) {
+            log({ event: "canvas_still_error", viewport: vw, sel: s.sel, error: String(e).slice(0, 200) });
+          } finally {
+            await page.evaluate(restoreRevealForShot).catch(() => { /* ignore */ });
+          }
+        }
+        if (cplan.shots.length) {
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await page.waitForTimeout(80);
+        }
       }
 
       // Stage 4/5: stamp capture-ids before the canonical snapshot so the IR carries
@@ -973,6 +1521,21 @@ export async function captureSite(opts: {
       const scrollAnimsCanceled = await neutralizeScrollTimelineAnimations(page);
       if (scrollAnimsCanceled) log({ event: "scroll_timeline_anims_canceled", viewport: vw, count: scrollAnimsCanceled });
 
+      // Final scroll-state reset immediately before the walk: every preceding pass (dwell
+      // scroll, carousel settle, element screenshots) can leave the page scrolled, which bakes
+      // scroll-linked transforms/offsets into this viewport's computed styles. Scroll to top and
+      // let scroll-linked effects settle so the snapshot records the genuine at-rest values.
+      await settleScrollTopBeforeSnapshot(page);
+
+      // Late-mounting dialogs (a CCPA opt-out that opens between the canonical and last
+      // viewport; a Recart/Attentive promo that fires on a timer) mount AFTER the load /
+      // post-scroll passes and would otherwise pollute this viewport's DOM snapshot. Re-run
+      // the dismissal pass immediately before the walk. Cheap when nothing matches — the
+      // settle only runs when a control was actually clicked or an overlay removed.
+      await applyDismiss("pre-snapshot");
+      dismissUnion.overlaysRemaining = Math.max(dismissUnion.overlaysRemaining, overlaysRemaining);
+      dismissUnion.blocking = dismissUnion.blocking || blocking;
+
       // Bound the in-page DOM walk: page.evaluate has no default timeout, so a
       // pathologically large/animated DOM (e.g. asana.com) could hang forever.
       const snapshot: PageSnapshot = await Promise.race([
@@ -1020,7 +1583,20 @@ export async function captureSite(opts: {
 
       // Persist DOM snapshot, and (unless skipped for a production clone) the full-page screenshot.
       writeJSONCompact(join(captureDir, `dom-${vw}.json`), snapshot);
-      if (opts.screenshots !== false) await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
+      if (opts.screenshots !== false) {
+        // A promo popup can mount in the window between the DOM walk and the screenshot (Recart
+        // fires into a shadow root on a short timer). The screenshot is the ground-truth channel
+        // the perceptual gate compares against, so re-run dismissal right before it — otherwise a
+        // late popup paints over every shot even though the DOM snapshot came out clean. Cheap
+        // when nothing matches.
+        await applyDismiss("pre-screenshot");
+        dismissUnion.blocking = dismissUnion.blocking || blocking;
+        // Normalize every video to frame 0 (paused) at THIS viewport before the shot — the clone is
+        // always at frame 0, so pinning the source there too makes the two channels comparable
+        // regardless of the playback time the viewport happened to catch.
+        await normalizeVideoTime(page, log);
+        await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
+      }
 
       // Stage 4: drive recognized affordances at the canonical viewport (opt-in).
       if (opts.interactions && vw === canonical) {

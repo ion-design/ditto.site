@@ -6,7 +6,10 @@ import type { InteractionCapture } from "../capture/interactions.js";
 /**
  * Normalized Render IR. Merges the per-viewport capture snapshots into a single
  * tree whose structure comes from the canonical (1280) capture; each node carries
- * per-viewport computed styles, bounding boxes, and visibility. This is the single
+ * per-viewport computed styles, bounding boxes, and visibility. Children that exist
+ * ONLY at non-canonical viewports are grafted in as siblings (visible only in their
+ * source bands); a container whose children are a wholly different set at some width
+ * is recorded as content drift instead (see childDriftVps). This is the single
  * source of truth for section/token inference, generation, and validation.
  */
 
@@ -25,6 +28,9 @@ export type IRNode = {
   // element had no class.
   srcClass?: string;
   rawHTML?: string; // inline svg
+  // Computed paint of an inline <svg> root (fill/stroke/color), carried from capture. Lets codegen
+  // recover a paint that a raw `fill="none"` attribute hides but site CSS actually supplied.
+  svgPaint?: { fill: string; stroke: string; color: string };
   visibleByVp: Record<number, boolean>;
   bboxByVp: Record<number, BBox>;
   computedByVp: Record<number, StyleMap>;
@@ -37,6 +43,14 @@ export type IRNode = {
   // ::placeholder computed style (input/textarea with placeholder text) — emitted as a
   // `::placeholder` rule so form controls keep their authored placeholder color.
   placeholderByVp?: Record<number, StyleMap>;
+  // Band viewports where this container's element children were a DIFFERENT SET than the
+  // canonical capture's (mutual whole-set mismatch — the source deterministically served
+  // different content at that width, e.g. a rotator picking other items per breakpoint).
+  // Policy: FAITHFUL-AT-CANONICAL — emission shows the canonical children there (it skips
+  // the display:none band it would otherwise emit for a child with no counterpart) instead
+  // of rendering an empty shell; the other set is NOT grafted (no duplication). Surfaced in
+  // the manifest via doc.contentDrift.
+  childDriftVps?: number[];
   children: IRChild[];
 };
 
@@ -72,6 +86,11 @@ export type IRDoc = {
   // re-emit the keyframes that the per-node `animation-name` declarations reference —
   // without these the animation properties are inert (the half-plumbed pre-Stage-5 gap).
   keyframes: string[];
+  // Containers whose children diverged as a WHOLE SET at some band viewport(s) (see
+  // IRNode.childDriftVps). Recorded post-renumber so ids are final; carried into the
+  // generated manifest as a fidelity note ("the source served different content there").
+  // Omitted when no drift was detected.
+  contentDrift?: Array<{ id: string; tag: string; viewports: number[] }>;
 };
 
 export type IR = {
@@ -81,6 +100,33 @@ export type IR = {
 
 export function isTextChild(c: IRChild): c is IRTextNode {
   return (c as IRTextNode).text !== undefined;
+}
+
+/**
+ * In-flow content extent at a viewport: the largest border-box bottom (`bbox.y + bbox.height`)
+ * over every VISIBLE, IN-FLOW descendant. This is the true height the real page laid out to,
+ * independent of a scroll-lock that clips the root to one viewport (a popup vendor that sets
+ * `body{overflow:hidden;height:100vh}` collapses `document.scrollHeight` to the viewport, but
+ * the in-flow sections still carry their real coordinates). Out-of-flow (absolute/fixed) and
+ * floated boxes are excluded — a fixed overlay/footer badge or a floated aside is not part of
+ * the document flow that determines page height. Pure + deterministic (reads only the IR).
+ */
+export function irContentExtent(root: IRNode, vp: number): number {
+  let maxBottom = 0;
+  const visit = (n: IRNode): void => {
+    for (const c of n.children) {
+      if (isTextChild(c)) continue;
+      const cs = c.computedByVp[vp];
+      const bb = c.bboxByVp[vp];
+      if (!cs || !bb || !c.visibleByVp[vp]) { visit(c); continue; }
+      const pos = cs.position || "static";
+      const inFlow = pos !== "absolute" && pos !== "fixed" && (cs.float || "none") === "none";
+      if (inFlow) maxBottom = Math.max(maxBottom, bb.y + bb.height);
+      visit(c);
+    }
+  };
+  visit(root);
+  return maxBottom;
 }
 
 /**
@@ -175,9 +221,24 @@ const NOISE_TAGS = new Set(["next-route-announcer"]);
 // width where capture happened to read it open → an empty 400×700 white rectangle at 2xl). Drop
 // the whole subtree so it never reaches generation.
 const THIRD_PARTY_OVERLAY = /(?:^|[\s_-])(?:intercom|drift-|hubspot-messages|zendesk|zd-|onetrust|ot-sdk-|usercentrics|grecaptcha|crisp-client|tawk-|livechat|helpscout|beacon-container|cookiebot|cky-)/;
+
+/**
+ * Email-capture / promo POPUP overlay containers (Attentive, Wunderkind/Bounce Exchange,
+ * Justuno, Privy, Omnisend, Sailthru, Wisepops, etc.). These vendors inject a full-viewport
+ * fixed overlay + backdrop that scroll-locks the page — third-party chrome, not site content.
+ *
+ * CAUTION: these vendors ALSO ship inline, embedded signup forms that ARE real page content
+ * and are deliberately grafted (see iframeGraft tests). So this matches ONLY the OVERLAY
+ * CONTAINER markers each vendor uses for its popup (`attentive_overlay`, `bx-wrapper` /
+ * `wk-`, `justuno`-`container`, `privy-`popup, …) — never a bare vendor name that an inline
+ * form embed would also carry. Overlay-container tokens only.
+ */
+export const POPUP_OVERLAY_CONTAINER =
+  /(?:^|[\s_-])(?:attentive_overlay|attentive_creative|attn-|bx-wrapper|bx-window|bounce-?exchange|wknd-|wunderkind|justuno_container|jw-overlay|privy-popup|privy-container|klaviyo-form-.*overlay|sailthru-overlay|wisepops-root|recart-popup|recart-modal)/;
 function isThirdPartyOverlay(raw: RawNode): boolean {
   const idClass = `${raw.attrs?.id ?? ""} ${raw.attrs?.class ?? ""}`.toLowerCase();
   if (THIRD_PARTY_OVERLAY.test(idClass)) return true;
+  if (POPUP_OVERLAY_CONTAINER.test(idClass)) return true;
   // INT_MAX band: overlay libraries stack above everything. Real content should not reach here,
   // so this cannot swallow site chrome under normal captures.
   const zi = parseInt(raw.computed?.zIndex ?? "", 10);
@@ -186,6 +247,121 @@ function isThirdPartyOverlay(raw: RawNode): boolean {
 
 function elementChildren(n: RawNode): RawNode[] {
   return n.children.filter((c) => (c as { text?: string }).text === undefined) as RawNode[];
+}
+
+/** True for a transform value that is visually the identity (no offset/rotation/scale):
+ *  the `none` keyword or an identity matrix/matrix3d the browser reports as noise. */
+export function isIdentityTransform(value: string | undefined): boolean {
+  if (!value || value === "none") return true;
+  const m = /^matrix\(([^)]*)\)$/.exec(value.trim());
+  if (m) {
+    const n = m[1]!.split(",").map((s) => parseFloat(s.trim()));
+    return n.length === 6 && n[0] === 1 && n[1] === 0 && n[2] === 0 && n[3] === 1 && n[4] === 0 && n[5] === 0;
+  }
+  const m3 = /^matrix3d\(([^)]*)\)$/.exec(value.trim());
+  if (m3) {
+    const n = m3[1]!.split(",").map((s) => parseFloat(s.trim()));
+    const id = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    return n.length === 16 && n.every((v, i) => v === id[i]);
+  }
+  return false;
+}
+
+/** Parse a CSS length to px (number), 0 for `auto`/empty/non-px. */
+function pfLen(v: string | undefined): number {
+  if (!v) return 0;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** The horizontal translate (matrix `e`) of a computed transform, or null if the transform is not a
+ *  pure-2D matrix/matrix3d with a definite tx (rotation/scale/skew or 3D perspective → null: we only
+ *  re-anchor plain horizontal track offsets). `matrix(a,b,c,d,e,f)` → e; `matrix3d(...)` → m41. */
+function translateXOf(value: string | undefined): number | null {
+  if (!value || value === "none") return null;
+  const m = /^matrix\(([^)]*)\)$/.exec(value.trim());
+  if (m) {
+    const n = m[1]!.split(",").map((s) => parseFloat(s.trim()));
+    if (n.length !== 6 || n.some((x) => !Number.isFinite(x))) return null;
+    if (n[1] !== 0 || n[2] !== 0) return null;               // has rotation/skew → not a plain slide
+    return n[4]!;
+  }
+  const m3 = /^matrix3d\(([^)]*)\)$/.exec(value.trim());
+  if (m3) {
+    const n = m3[1]!.split(",").map((s) => parseFloat(s.trim()));
+    if (n.length !== 16 || n.some((x) => !Number.isFinite(x))) return null;
+    // Require an otherwise-identity 3D matrix apart from the translate column (indices 12/13/14).
+    const idExceptTranslate = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, /*12*/ 0, /*13*/ 0, /*14*/ 0, 1];
+    for (let i = 0; i < 16; i++) { if (i === 12 || i === 13 || i === 14) continue; if (n[i] !== idExceptTranslate[i]) return null; }
+    return n[12]!;
+  }
+  return null;
+}
+
+/** Return `value` with its horizontal translate replaced by `tx` (keeps the rest of the matrix). */
+function setTranslateX(value: string, tx: number): string {
+  const m = /^matrix\(([^)]*)\)$/.exec(value.trim());
+  if (m) {
+    const n = m[1]!.split(",").map((s) => s.trim());
+    n[4] = String(tx);
+    return `matrix(${n.join(", ")})`;
+  }
+  const m3 = /^matrix3d\(([^)]*)\)$/.exec(value.trim());
+  if (m3) {
+    const n = m3[1]!.split(",").map((s) => s.trim());
+    n[12] = String(tx);
+    return `matrix3d(${n.join(", ")})`;
+  }
+  return value;
+}
+
+/**
+ * Normalize per-viewport transform values so identity is represented uniformly as the literal
+ * `none`. Two problems this closes, both in the per-viewport delta emission downstream:
+ *   1. The browser reports "no transform" inconsistently — `none` at some widths, an identity
+ *      `matrix(1,0,0,1,0,0)` at others (composited-layer noise). The generator's default-skip
+ *      only recognizes `none`, so an identity matrix at the base viewport is emitted as a real
+ *      transform and then cascades across bands.
+ *   2. When ANY viewport carries a genuine (non-identity) transform, the identity value at the
+ *      other viewports must stay observable — canonicalizing it to `none` (not dropping it) lets
+ *      the generator emit the explicit reset so the non-identity transform can't leak into a band
+ *      where the source had none.
+ * Deterministic, in place; only touches the `transform` slot.
+ */
+export function canonicalizeTransforms(computedByVp: Record<number, StyleMap>): void {
+  for (const k of Object.keys(computedByVp)) {
+    const cs = computedByVp[Number(k)];
+    if (cs && isIdentityTransform(cs.transform)) cs.transform = "none";
+  }
+}
+
+/** True when an INFINITE CSS animation is active at this viewport. Such an animation perpetually
+ *  drives its animated properties (opacity/transform), so the captured value is a frozen phase of
+ *  the loop, not authored design. */
+function hasInfiniteAnimation(cs: StyleMap | undefined): boolean {
+  if (!cs || (cs.animationName || "none") === "none") return false;
+  return /infinite/.test(cs.animationIterationCount || "1");
+}
+
+/**
+ * Neutralize the transform of a node that carries an INFINITE animation at ANY captured viewport.
+ * The capture shutter froze the marquee/spinner mid-loop, and — critically — a CSS animation gated
+ * to a breakpoint (Webflow's `max-lg` logo/big-text tracks) reads `animation:none` at the widths
+ * where it does NOT run, yet the browser still reports the last frozen `translateX` there. Banding
+ * those frozen values bakes a mid-scroll offset that shifts content offscreen-left AT REST (rows
+ * starting mid-glyph). The runtime `@keyframes` owns the transform and starts at translateX(0), so
+ * the faithful at-rest value is `none` at every width; generation's `animOwnedProps` then keeps the
+ * base holding while the animation drives it live. Only fires when a genuine infinite animation is
+ * present at some viewport — a statically-offset design element (no animation) is untouched.
+ * Deterministic, in place; only touches the `transform` slot.
+ */
+export function neutralizeAnimatedTransforms(computedByVp: Record<number, StyleMap>): void {
+  const vps = Object.keys(computedByVp).map(Number);
+  if (!vps.some((vp) => hasInfiniteAnimation(computedByVp[vp]))) return;
+  for (const vp of vps) {
+    const cs = computedByVp[vp];
+    if (cs && cs.transform && cs.transform !== "none") cs.transform = "none";
+  }
 }
 
 /** Full identity signature (tag + id + class). */
@@ -259,6 +435,39 @@ function alignChildren(canon: RawNode[], other: RawNode[]): (RawNode | undefined
   return out;
 }
 
+/** True when this raw node or any element descendant painted at its capture viewport. */
+function rawSubtreeVisible(n: RawNode): boolean {
+  if (n.visible) return true;
+  for (const c of elementChildren(n)) if (rawSubtreeVisible(c)) return true;
+  return false;
+}
+
+/** Most frequent tag in a sibling group (ties broken alphabetically — deterministic). */
+function dominantTag(nodes: RawNode[]): string {
+  const counts = new Map<string, number>();
+  for (const n of nodes) counts.set(n.tag, (counts.get(n.tag) ?? 0) + 1);
+  let best = "", bestC = -1;
+  for (const [t, c] of [...counts.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (c > bestC) { best = t; bestC = c; }
+  }
+  return best;
+}
+
+// A sibling appearing ONLY at non-canonical viewport(s) is grafted into the IR (visible only in
+// its source band(s)). Cap per parent per viewport so a pathological capture (a virtualized list
+// re-keying hundreds of rows) can't balloon the tree; the whole-set drift path below covers the
+// legitimate large-mismatch case.
+const GRAFT_MAX_PER_VP = 24;
+// Whole-set content-identity drift: at least this many children UNMATCHED on BOTH sides before a
+// container is treated as "the source served different content at this width" (vs a couple of
+// responsive-only extras, which are grafted instead).
+const DRIFT_MIN_UNMATCHED = 3;
+
+/** A per-parent graft group: one non-canonical-only child, matched across the non-canonical
+ *  viewports it appears at. `rep` is the raw node from the LOWEST viewport (structural identity
+ *  for aligning later viewports into the group). */
+type GraftGroup = { rep: RawNode; rawByVp: Record<number, RawNode> };
+
 /** Capture-ids of recognized-pattern panels/regions to force-keep through pruning
  *  (they are display:none in the inactive/collapsed base state). Empty when no
  *  interactions were captured, so non-interactive runs prune exactly as before. */
@@ -289,6 +498,9 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
   }
   const canonical = viewports.includes(1280) ? 1280 : viewports[Math.floor(viewports.length / 2)]!;
   const canonSnap = snapshots[canonical]!;
+  // Deterministic iteration order for the cross-viewport graft grouping below.
+  const vpsAsc = [...viewports].sort((a, b) => a - b);
+  const bandVpSet = new Set(bandVps);
 
   // Stage 4: recognized interactive panels (tabs/accordion) are often display:none
   // at base (the inactive/collapsed state). Their subtrees must survive pruning so
@@ -304,6 +516,10 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
   const convert = (raw: RawNode, matched: Record<number, RawNode | undefined>): IRNode | null => {
     if (NOISE_TAGS.has(raw.tag)) return null;
     if (isThirdPartyOverlay(raw)) return null;
+    // Font-metric / measurement scratch nodes the source's own JS injects (tagged by the walker):
+    // absolutely positioned, parked far off-screen, non-painting. Never user-visible — drop so they
+    // don't ship as page markup (e.g. the `<div … -top-[6249rem] invisible>Mgy</div>` probe).
+    if (raw.probe) return null;
 
     const visibleByVp: Record<number, boolean> = {};
     const bboxByVp: Record<number, BBox> = {};
@@ -324,6 +540,14 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       if (match.after) afterByVp[vw] = match.after;
       if (match.placeholder) placeholderByVp[vw] = match.placeholder;
     }
+    // Canonicalize identity transforms (none / identity matrix) to `none` at every viewport so
+    // the generator's per-band delta treats them uniformly and a scroll/composite-noise transform
+    // at one width can't leak across bands.
+    canonicalizeTransforms(computedByVp);
+    // Drop transforms frozen mid-loop by an infinite animation (marquees/spinners) at every viewport —
+    // including the breakpoints where the animation is gated off but the browser still reports the last
+    // frozen offset. Prevents a baked mid-scroll translateX from clipping content offscreen at rest.
+    neutralizeAnimatedTransforms(computedByVp);
 
     const node: IRNode = {
       id: nextId(),
@@ -335,6 +559,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       children: [],
     };
     if (raw.rawHTML) node.rawHTML = raw.rawHTML;
+    if (raw.svgPaint) node.svgPaint = raw.svgPaint;
     const srcClass = (raw.attrs?.class ?? "").trim();
     if (srcClass) node.srcClass = srcClass;
     if (Object.keys(sizingByVp).length) node.sizingByVp = sizingByVp;
@@ -346,25 +571,131 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       const canonKids = elementChildren(raw);
       // Align this node's canonical element children to each viewport's children.
       const aligned: Record<number, (RawNode | undefined)[]> = {};
+      const kidsByVp: Record<number, RawNode[]> = {};
       for (const vw of viewports) {
         if (vw === canonical) continue;
         const m = matched[vw];
         const vwKids = m && m.tag === raw.tag ? elementChildren(m) : [];
+        kidsByVp[vw] = vwKids;
         aligned[vw] = alignChildren(canonKids, vwKids);
       }
+
+      // ---- Per-viewport DOM divergence (canonical-rooted subtrees only) ----
+      // Two inverse gaps closed here:
+      //  • GRAFT: a child that exists ONLY at non-canonical viewport(s) (destroyed/never built at
+      //    the canonical width) would otherwise never enter the IR — the clone then misses it at
+      //    the widths where the source shows it (e.g. mobile-only carousel pagination bullets).
+      //    Graft it as a sibling at its source position, carrying per-viewport data ONLY for the
+      //    viewports it appeared at; emission hides it at base and reveals it in its band(s).
+      //  • DRIFT: when a container's children at some viewport are a DIFFERENT SET on BOTH sides
+      //    (mutual whole-set mismatch — the source deterministically served other content there),
+      //    grafting would duplicate the component. Prefer faithful-at-canonical: record the drift
+      //    so emission shows the canonical children there instead of banding them all display:none
+      //    (an empty shell). Recorded in childDriftVps → doc.contentDrift → the manifest.
+      const driftVps = new Set<number>();
+      const graftsByAnchor = new Map<number, GraftGroup[]>();
+      if (matched[canonical]) {
+        for (const vw of vpsAsc) {
+          if (vw === canonical) continue;
+          const vwKids = kidsByVp[vw]!;
+          if (vwKids.length === 0) continue;
+          const matchedOther = new Set<RawNode>();
+          for (const mo of aligned[vw]!) if (mo) matchedOther.add(mo);
+          const unmatchedCanon = canonKids.filter((_, i) => !aligned[vw]![i]);
+          const unmatchedOther = vwKids.filter((k) => !matchedOther.has(k));
+          // Whole-set identity drift: many unmatched on BOTH sides, few matched, and both leftover
+          // groups are the same kind of element (same dominant tag — one component family serving
+          // different items, not a structurally different widget swapped in at this width).
+          if (
+            unmatchedCanon.length >= DRIFT_MIN_UNMATCHED &&
+            unmatchedOther.length >= DRIFT_MIN_UNMATCHED &&
+            matchedOther.size * 2 < Math.min(canonKids.length, vwKids.length) &&
+            dominantTag(unmatchedCanon) === dominantTag(unmatchedOther)
+          ) {
+            driftVps.add(vw);
+            continue; // faithful-at-canonical: do NOT graft the other set (no duplication)
+          }
+          if (unmatchedOther.length === 0 || unmatchedOther.length > GRAFT_MAX_PER_VP) continue;
+          // Graft position: each unmatched child anchors AFTER the last canonical child matched
+          // before it in this viewport's sibling order (-1 = before every canonical child).
+          const canonIdxOf = new Map<RawNode, number>();
+          aligned[vw]!.forEach((mo, i) => { if (mo) canonIdxOf.set(mo, i); });
+          let lastCanonIdx = -1;
+          const newByAnchor = new Map<number, RawNode[]>();
+          for (const k of vwKids) {
+            const ci = canonIdxOf.get(k);
+            if (ci !== undefined) { lastCanonIdx = ci; continue; }
+            let list = newByAnchor.get(lastCanonIdx);
+            if (!list) newByAnchor.set(lastCanonIdx, (list = []));
+            list.push(k);
+          }
+          // Merge this viewport's unmatched children into the anchor's existing graft groups by
+          // structural signature (the same node present at several widths becomes ONE graft with
+          // per-viewport data), preserving sibling order; leftovers open new groups in order.
+          for (const [anchor, newcomers] of [...newByAnchor.entries()].sort((a, b) => a[0] - b[0])) {
+            const groups = graftsByAnchor.get(anchor) ?? [];
+            const al = alignChildren(groups.map((g) => g.rep), newcomers);
+            const groupOfNew = new Map<RawNode, number>();
+            al.forEach((r, idx) => { if (r) groupOfNew.set(r, idx); });
+            const merged: GraftGroup[] = [];
+            let gi = 0;
+            for (const k of newcomers) {
+              const gIdx = groupOfNew.get(k);
+              if (gIdx !== undefined) {
+                while (gi <= gIdx) merged.push(groups[gi++]!);
+                groups[gIdx]!.rawByVp[vw] = k;
+              } else {
+                merged.push({ rep: k, rawByVp: { [vw]: k } });
+              }
+            }
+            while (gi < groups.length) merged.push(groups[gi++]!);
+            graftsByAnchor.set(anchor, merged);
+          }
+        }
+      }
+      // Materialize graft groups → IR nodes. Keep only groups that actually PAINT at a band
+      // viewport (a graft visible solely at a dense sample width could never be shown — bands are
+      // emitted only at the standard breakpoints — so it would be dead markup).
+      const graftedByAnchor = new Map<number, IRNode[]>();
+      for (const [anchor, groups] of [...graftsByAnchor.entries()].sort((a, b) => a[0] - b[0])) {
+        const out: IRNode[] = [];
+        for (const g of groups) {
+          const graftVps = Object.keys(g.rawByVp).map(Number).sort((a, b) => a - b);
+          if (!graftVps.some((vw) => bandVpSet.has(vw) && rawSubtreeVisible(g.rawByVp[vw]!))) continue;
+          const gm: Record<number, RawNode | undefined> = {};
+          for (const vw of viewports) gm[vw] = g.rawByVp[vw];
+          const gn = convert(g.rawByVp[graftVps[0]!]!, gm);
+          if (gn) out.push(gn);
+        }
+        if (out.length) graftedByAnchor.set(anchor, out);
+      }
+      if (driftVps.size) {
+        const bandDrift = [...driftVps].filter((v) => bandVpSet.has(v)).sort((a, b) => a - b);
+        if (bandDrift.length) node.childDriftVps = bandDrift;
+      }
+
       let ei = 0;
+      let pushedLeading = false;
+      const pushGrafts = (anchor: number): void => {
+        for (const gn of graftedByAnchor.get(anchor) ?? []) node.children.push(gn);
+      };
       for (const c of raw.children) {
         if ((c as IRTextNode).text !== undefined) {
           node.children.push({ text: (c as IRTextNode).text });
           continue;
         }
+        if (!pushedLeading) { pushGrafts(-1); pushedLeading = true; }
         const child = c as RawNode;
         const childMatched: Record<number, RawNode | undefined> = {};
-        for (const vw of viewports) childMatched[vw] = vw === canonical ? child : aligned[vw]![ei];
-        ei++;
+        // A grafted subtree has no canonical counterpart: its own children must not be treated as
+        // canonical-matched either (they carry data only at the graft's source viewports).
+        for (const vw of viewports) childMatched[vw] = vw === canonical ? (matched[canonical] ? child : undefined) : aligned[vw]![ei];
         const converted = convert(child, childMatched);
         if (converted) node.children.push(converted);
+        pushGrafts(ei);
+        ei++;
       }
+      if (!pushedLeading) pushGrafts(-1);
     }
     return node;
   };
@@ -381,6 +712,8 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     // interactive panel so its whole (possibly display:none) subtree is retained.
     const keepAll = forced || preserveCaps.has(node.attrs["data-cid-cap"] ?? "");
     const keptChildren: IRChild[] = [];
+    // Per element child, in original order: was it kept? (for track-transform re-anchoring below.)
+    const elemKept: Array<{ child: IRNode; kept: boolean }> = [];
     let hasVisibleDescendant = false;
     let hasText = false;
     for (const c of node.children) {
@@ -397,16 +730,81 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       if (keepAll) {
         prune(c, true);
         keptChildren.push(c);
+        elemKept.push({ child: c, kept: true });
         if (Object.values(c.visibleByVp).some(Boolean) || childHasVisible(c)) hasVisibleDescendant = true;
       } else if (prune(c, false) || keepSource) {
         keptChildren.push(c);
+        elemKept.push({ child: c, kept: true });
         if (Object.values(c.visibleByVp).some(Boolean) || childHasVisible(c)) hasVisibleDescendant = true;
+      } else {
+        elemKept.push({ child: c, kept: false });
       }
     }
     node.children = keptChildren;
+    reanchorTrackTransform(node, elemKept);
     if (keepAll) return true;
     const selfVisible = Object.values(node.visibleByVp).some(Boolean);
-    return selfVisible || hasVisibleDescendant || hasText || !!node.rawHTML;
+    return selfVisible || hasVisibleDescendant || hasText || !!node.rawHTML || isSizedInvisibleSpacer(node);
+  };
+  // An in-flow `visibility:hidden` box with a nonzero border box is LOAD-BEARING geometry: it is
+  // invisible (so `visibleByVp` is false and the visibility prune would drop it), but it still takes
+  // up its captured width/height in normal flow — a spacer/ghost column that reserves the row height
+  // its absolutely-positioned siblings paint into. Dropping it collapses the column and shifts
+  // everything below it up. Keep it as an empty sized placeholder (generation emits its w/h with
+  // `visibility:hidden` and no content). `display:none`-everywhere nodes (never in flow, zero box)
+  // and out-of-flow probes stay pruned; font-metric probes are already dropped before pruning.
+  const isSizedInvisibleSpacer = (node: IRNode): boolean => {
+    for (const vp of Object.keys(node.computedByVp).map(Number)) {
+      const cs = node.computedByVp[vp]; const bb = node.bboxByVp[vp];
+      if (!cs || !bb) continue;
+      if ((cs.display || "") === "none") continue;                    // not in flow here
+      const vis = cs.visibility || "visible";
+      if (vis !== "hidden" && vis !== "collapse") continue;           // only invisible-but-laid-out boxes
+      const pos = cs.position || "static";
+      if (pos !== "static" && pos !== "relative") continue;           // in-flow geometry only (not absolute/fixed)
+      if (bb.width > 0 && bb.height > 0) return true;                 // reserves real space
+    }
+    return false;
+  };
+  // Re-anchor a horizontally-translated TRACK container after pruning removed leading in-flow
+  // children. A settled loop carousel (Splide/Swiper/Slick) parks its track with a baked
+  // `translateX(-N)` and prepends invisible clone slides that occupy exactly [-N, 0]; the first REAL
+  // slide then paints at x=0. The visibility prune drops the off-screen clones but the baked
+  // translateX survives verbatim, so every kept slide sits N px offscreen-left (an empty band). When
+  // emission drops the leading in-flow children of such a translated track, subtract their aggregate
+  // outer width from the baked translateX per viewport so the first KEPT child lands where it was
+  // captured. NON-animated baked offsets only — animation-owned transforms are already neutralized to
+  // `none` upstream (neutralizeAnimatedTransforms), so a still-present translate here is a static bake.
+  const reanchorTrackTransform = (node: IRNode, elemKept: Array<{ child: IRNode; kept: boolean }>): void => {
+    if (elemKept.length === 0) return;
+    // Only act when a leading RUN of element children was dropped (the clone slides precede the reals).
+    const firstKeptIdx = elemKept.findIndex((e) => e.kept);
+    if (firstKeptIdx <= 0) return; // nothing dropped ahead of the first kept child (or nothing kept)
+    for (const vp of Object.keys(node.computedByVp).map(Number)) {
+      const cs = node.computedByVp[vp];
+      if (!cs || !cs.transform) continue;
+      const tx = translateXOf(cs.transform);
+      if (tx === null || tx === 0) continue; // no baked horizontal offset to re-anchor at this vp
+      // Aggregate the outer (margin-box) width of the dropped leading in-flow siblings at this vp.
+      let droppedW = 0;
+      for (let i = 0; i < firstKeptIdx; i++) {
+        const { child } = elemKept[i]!;
+        const ccs = child.computedByVp[vp]; const cb = child.bboxByVp[vp];
+        if (!ccs || !cb) continue;
+        if ((ccs.display || "") === "none") continue;
+        const cpos = ccs.position || "static";
+        if (cpos !== "static" && cpos !== "relative") continue; // out-of-flow slides don't advance the track
+        droppedW += cb.width + pfLen(ccs.marginLeft) + pfLen(ccs.marginRight);
+      }
+      if (droppedW === 0) continue;
+      // translateX is negative (track pulled left); dropping the leading clones that filled [tx, 0]
+      // means the reals shift right by droppedW → add it back. Re-anchor toward 0.
+      const next = tx + droppedW;
+      // Only re-anchor when it moves the track TOWARD the origin and doesn't overshoot past it — a
+      // guard so a partial mismatch can't push content the wrong way. Round to match capture precision.
+      if (Math.abs(next) >= Math.abs(tx)) continue;
+      cs.transform = setTranslateX(cs.transform, Math.round(next * 100) / 100);
+    }
   };
   const childHasVisible = (n: IRNode): boolean => {
     for (const c of n.children) {
@@ -426,6 +824,16 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     for (const c of node.children) if (!isTextChild(c)) renumber(c);
   };
   renumber(root);
+
+  // Content-identity drift notes (containers whose children were a different set at some band
+  // viewport — see childDriftVps). Collected AFTER renumbering so the recorded ids are final;
+  // deterministic (pre-order walk of the pruned tree).
+  const contentDrift: NonNullable<IRDoc["contentDrift"]> = [];
+  const collectDrift = (n: IRNode): void => {
+    if (n.childDriftVps?.length) contentDrift.push({ id: n.id, tag: n.tag, viewports: [...n.childDriftVps] });
+    for (const c of n.children) if (!isTextChild(c)) collectDrift(c);
+  };
+  collectDrift(root);
 
   const perViewport: IRDoc["perViewport"] = {};
   for (const vw of viewports) {
@@ -456,6 +864,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
     // benchmark + all multi-page, which don't capture motion) ⇒ none emitted, so the
     // clone stays byte-identical to the pre-Stage-5 frozen output.
     keyframes: opts?.motion ? [...new Set(canonSnap.keyframes ?? [])].sort() : [],
+    ...(contentDrift.length ? { contentDrift } : {}),
   };
 
   // Repair transient root scroll-locks. A site that locks scrolling during an intro

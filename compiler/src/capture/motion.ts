@@ -60,6 +60,83 @@ export type MarqueeSpec = {
   periodPx: number; // distance per seamless loop (one duplicated copy ≈ scrollWidth/2)
 };
 
+// ---- Pure marquee discriminators (extracted so the in-browser sampling logic is unit
+// testable). These are duplicated verbatim inside `detectMarquees`' page.evaluate body —
+// module-scope functions do NOT cross the serialization boundary — so any change here must
+// be mirrored there (and vice versa). They are deterministic: no randomness, no clock reads.
+
+/**
+ * Median signed velocity (px/s) from a series of per-sample translateX deltas taken at a
+ * fixed cadence. Median (not mean) ignores the single per-loop wrap-reset outlier, which
+ * is a large jump opposite the travel direction when the track seamlessly restarts.
+ */
+export function medianVelocityPxPerSec(deltas: number[], sampleMs: number): number {
+  if (!deltas.length || sampleMs <= 0) return 0;
+  const med = [...deltas].sort((a, b) => a - b)[Math.floor(deltas.length / 2)]!;
+  return Math.round((med / sampleMs) * 1000);
+}
+
+/**
+ * Discriminator 2 — sustained-constant-velocity test. A real marquee holds a steady
+ * velocity across time; a scroll-settle lerp (still easing toward its scroll-target after
+ * `scrollIntoView`) decays, so its velocity in a later observation window is a small
+ * fraction of the earlier one. Two windows of per-sample deltas separated by ≥1.5s; pass
+ * only if the later window's speed is BOTH non-trivial AND close to the earlier window's
+ * (within a relative tolerance) — i.e. it did not decay and did not reverse.
+ *
+ * @param window1Deltas per-sample translateX deltas from the first observation window
+ * @param window2Deltas per-sample translateX deltas from the second (later) window
+ * @param sampleMs cadence between samples within a window
+ * @param minPxPerSec minimum sustained |velocity| to be considered moving at all
+ * @param relTol fractional tolerance: |v2| must be ≥ (1-relTol)·|v1| and same sign
+ */
+export function classifyVelocitySamples(
+  window1Deltas: number[],
+  window2Deltas: number[],
+  sampleMs: number,
+  minPxPerSec = 4,
+  relTol = 0.5,
+): { isMarquee: boolean; pxPerSec: number; v1: number; v2: number } {
+  const v1 = medianVelocityPxPerSec(window1Deltas, sampleMs);
+  const v2 = medianVelocityPxPerSec(window2Deltas, sampleMs);
+  // The reported velocity is the first window's (measured closest to a clean, post-settle
+  // marquee; also what the old code reported), kept for output determinism vs. the old path.
+  const pxPerSec = v1;
+  if (Math.abs(v1) < minPxPerSec || Math.abs(v2) < minPxPerSec) return { isMarquee: false, pxPerSec, v1, v2 };
+  if (Math.sign(v1) !== Math.sign(v2)) return { isMarquee: false, pxPerSec, v1, v2 }; // reversed → not a steady ticker
+  // v2 must NOT have decayed relative to v1 (a lerp settling toward target loses speed).
+  const sustained = Math.abs(v2) >= Math.abs(v1) * (1 - relTol);
+  return { isMarquee: sustained, pxPerSec, v1, v2 };
+}
+
+/**
+ * Discriminator 4 — genuine duplicated content. A marquee duplicates its content ≥2×
+ * (that is how a seamless loop works); "≥2 children" alone is far too weak (any flex row
+ * of distinct logos passes). Require actual repetition: ≥2 CONSECUTIVE children whose
+ * shape repeats — equal outerHTML hash (exact duplicate) or, as a looser structural
+ * fallback, an equal consecutive width sequence (some marquees clone then tweak attributes
+ * so hashes differ but the geometry repeats).
+ *
+ * @param hashes per-child outerHTML hash (cheap 32-bit), index-aligned with `widths`
+ * @param widths per-child rounded offsetWidth
+ */
+export function hasRepeatedChildren(hashes: number[], widths: number[]): boolean {
+  const n = Math.min(hashes.length, widths.length);
+  if (n < 2) return false;
+  // (a) two consecutive children with an identical hash — a literal cloned copy.
+  for (let i = 1; i < n; i++) if (hashes[i] === hashes[i - 1] && hashes[i] !== 0) return true;
+  // (b) structural fallback: the first half's width sequence repeats in the second half
+  // (content duplicated as a block, e.g. [A B C A B C]). Require an even count and a real
+  // width so a row of zero-width nodes can't spuriously "repeat".
+  if (n >= 4 && n % 2 === 0) {
+    const half = n / 2;
+    let repeats = true;
+    for (let i = 0; i < half; i++) { if (widths[i] === 0 || widths[i] !== widths[i + half]) { repeats = false; break; } }
+    if (repeats) return true;
+  }
+  return false;
+}
+
 export type MotionCapture = {
   waapi: WaapiAnim[];
   rotators: RotatorSpec[];
@@ -132,6 +209,25 @@ export async function probeReveals(page: Page): Promise<void> {
  * and record its signed velocity + seamless-loop period (one duplicated copy ≈ half the
  * scroll width) so the clone can replay the loop. Read-only beyond scrolling (restores
  * scroll to top); does not touch the captured snapshot/IR.
+ *
+ * Discriminators (ALL must pass — a candidate is only classified as a marquee if every one
+ * holds), added to defeat scroll-LINKED easing false positives (a static logo row on a
+ * scroll-eased page is still lerping toward its scroll-target right after `scrollIntoView`,
+ * which reads as a constant velocity over a single short window):
+ *   1. Content overflow — scrollWidth > 1.35·clientWidth (a marquee has content to scroll;
+ *      a static row that fits its box, scrollWidth ≈ clientWidth, cannot be a marquee).
+ *   2. Sustained constant velocity — two observation windows separated by ≥1.5s; a settle
+ *      lerp decays (v2 ≪ v1), a real marquee holds v2 ≈ v1 (see classifyVelocitySamples).
+ *   3. Scroll independence (jiggle) — nudge scroll by ±50px and re-sample; if the velocity
+ *      responds to the nudge the motion is scroll-linked, not a self-driven ticker.
+ *   4. Genuine duplication — ≥2 consecutive children repeat (equal outerHTML hash or an
+ *      equal consecutive width sequence), the shape real marquees use for a seamless loop.
+ *
+ * Added latency is bounded: the expensive per-candidate windows/jiggle run ONLY for the
+ * few candidates that already pass the cheap synchronous gates (overflow + translated +
+ * clip + duplication), and the candidate list is capped at 8. Per surviving candidate the
+ * async cost is ≈ 300ms settle + 2×~600ms windows + ~1.4s inter-window gap + 2×~250ms
+ * jiggle ≈ 3.4s; with the cap the whole pass is bounded regardless of page size.
  */
 async function detectMarquees(page: Page): Promise<MarqueeSpec[]> {
   try {
@@ -143,32 +239,113 @@ async function detectMarquees(page: Page): Promise<MarqueeSpec[]> {
         while (p && depth < 6) { const ox = getComputedStyle(p).overflowX; if (ox === "hidden" || ox === "clip") return true; p = p.parentElement; depth++; }
         return false;
       };
+      // cheap 32-bit string hash (djb2-ish) — deterministic, for the duplication test.
+      const hashStr = (s: string): number => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return h; };
+
+      // ---- Pure discriminators (mirror of the exported module-scope functions; kept inline
+      // because module scope does not cross the page.evaluate serialization boundary). ----
+      const medianVelocityPxPerSec = (deltas: number[], sampleMs: number): number => {
+        if (!deltas.length || sampleMs <= 0) return 0;
+        const med = [...deltas].sort((a, b) => a - b)[Math.floor(deltas.length / 2)]!;
+        return Math.round((med / sampleMs) * 1000);
+      };
+      const classifyVelocitySamples = (w1: number[], w2: number[], sampleMs: number, minPxPerSec = 4, relTol = 0.5) => {
+        const v1 = medianVelocityPxPerSec(w1, sampleMs);
+        const v2 = medianVelocityPxPerSec(w2, sampleMs);
+        const pxPerSec = v1;
+        if (Math.abs(v1) < minPxPerSec || Math.abs(v2) < minPxPerSec) return { isMarquee: false, pxPerSec, v1, v2 };
+        if (Math.sign(v1) !== Math.sign(v2)) return { isMarquee: false, pxPerSec, v1, v2 };
+        const sustained = Math.abs(v2) >= Math.abs(v1) * (1 - relTol);
+        return { isMarquee: sustained, pxPerSec, v1, v2 };
+      };
+      const hasRepeatedChildren = (hashes: number[], widths: number[]): boolean => {
+        const n = Math.min(hashes.length, widths.length);
+        if (n < 2) return false;
+        for (let i = 1; i < n; i++) if (hashes[i] === hashes[i - 1] && hashes[i] !== 0) return true;
+        if (n >= 4 && n % 2 === 0) {
+          const half = n / 2;
+          let repeats = true;
+          for (let i = 0; i < half; i++) { if (widths[i] === 0 || widths[i] !== widths[i + half]) { repeats = false; break; } }
+          if (repeats) return true;
+        }
+        return false;
+      };
+      // sample per-child outerHTML hash + width for the duplication test.
+      const childSignature = (el: Element): { hashes: number[]; widths: number[] } => {
+        const hashes: number[] = [], widths: number[] = [];
+        const kids = Array.from(el.children).slice(0, 24) as HTMLElement[];
+        for (const k of kids) { hashes.push(hashStr(k.outerHTML)); widths.push(Math.round(k.getBoundingClientRect().width)); }
+        return { hashes, widths };
+      };
+      // one observation window: `count` deltas at `sampleMs` cadence.
+      const sampleWindow = async (el: Element, count: number, sampleMs: number): Promise<number[]> => {
+        const xs: number[] = [txOf(el)];
+        for (let i = 0; i < count; i++) { await sleep(sampleMs); xs.push(txOf(el)); }
+        const dxs: number[] = []; for (let i = 1; i < xs.length; i++) dxs.push(xs[i]! - xs[i - 1]!);
+        return dxs;
+      };
+
+      const SAMPLE_MS = 120;
+      const WINDOW_SAMPLES = 5;            // 5 deltas ≈ 600ms per window
+      const INTER_WINDOW_MS = 1500;        // ≥1.5s between windows (discriminator 2)
+      const JIGGLE_PX = 50;                // scroll nudge for the independence test (discriminator 3)
+
       // Candidates: tagged, already translated (paused tickers keep their offset), with
-      // duplicated content (≥2 children) inside an overflow-clip viewport — the marquee shape.
+      // GENUINE duplicated content inside an overflow-clip viewport, AND real content
+      // overflow (scrollWidth > 1.35·clientWidth) — the marquee shape. All cheap/synchronous
+      // so the expensive async windows only run for the few survivors.
       const cand: Element[] = [];
       for (const el of Array.from(document.querySelectorAll("[data-cid-cap]"))) {
         if (Math.abs(txOf(el)) <= 0.5) continue;
         if (el.children.length < 2) continue;
         if (!inClip(el)) continue;
+        // Discriminator 1: content overflow. scrollWidth must meaningfully exceed clientWidth;
+        // a static row that fits (scrollWidth ≈ clientWidth) has nothing to scroll.
+        if (el.scrollWidth <= el.clientWidth * 1.35) continue;
+        // Discriminator 4: genuine repetition, not merely ≥2 distinct children.
+        const sig = childSignature(el);
+        if (!hasRepeatedChildren(sig.hashes, sig.widths)) continue;
         cand.push(el);
-        if (cand.length >= 16) break;
+        if (cand.length >= 8) break;
       }
       const out: Array<{ cap: string; axis: "x"; pxPerSec: number; periodPx: number }> = [];
       const seen = new Set<string>();
       for (const el of cand) {
         const cap = el.getAttribute("data-cid-cap"); if (!cap || seen.has(cap)) continue;
         try { el.scrollIntoView({ block: "center" }); } catch { /* ignore */ }
-        await sleep(450); // wake the off-screen-paused ticker + let the scroll settle
-        const xs: number[] = [];
-        for (let i = 0; i < 6; i++) { xs.push(txOf(el)); await sleep(120); }
-        const dxs: number[] = []; for (let i = 1; i < xs.length; i++) dxs.push(xs[i]! - xs[i - 1]!);
-        if (dxs.length < 3) continue;
-        // velocity = median per-120ms delta (median ignores the single wrap-reset outlier).
-        const med = [...dxs].sort((a, b) => a - b)[Math.floor(dxs.length / 2)]!;
-        const pxPerSec = Math.round((med / 120) * 1000);
-        if (Math.abs(pxPerSec) < 4) continue; // not actually moving (e.g. a frozen scroll-scrub offset)
-        // direction must be consistent in all but (at most) the one wrap step.
-        if (dxs.filter((d) => Math.sign(d) === Math.sign(med)).length < dxs.length - 1) continue;
+        await sleep(300); // wake the off-screen-paused ticker + let the scroll settle
+
+        // Discriminator 2: two velocity windows ≥1.5s apart. A scroll-settle lerp decays;
+        // a real marquee holds constant velocity.
+        const w1 = await sampleWindow(el, WINDOW_SAMPLES, SAMPLE_MS);
+        await sleep(INTER_WINDOW_MS);
+        const w2 = await sampleWindow(el, WINDOW_SAMPLES, SAMPLE_MS);
+        if (w1.length < 3 || w2.length < 3) continue;
+        // direction must be consistent within window 1, but for (at most) the one wrap step.
+        const med1 = [...w1].sort((a, b) => a - b)[Math.floor(w1.length / 2)]!;
+        if (w1.filter((d) => Math.sign(d) === Math.sign(med1)).length < w1.length - 1) continue;
+        const cls = classifyVelocitySamples(w1, w2, SAMPLE_MS);
+        if (!cls.isMarquee) continue;
+        const pxPerSec = cls.pxPerSec;
+
+        // Discriminator 3: scroll independence (jiggle). Nudge the scroll ±50px and re-sample
+        // velocity; a self-driven ticker is unaffected, a scroll-linked animation changes.
+        const baseY = window.scrollY;
+        const jiggle = async (dy: number): Promise<number> => {
+          try { window.scrollTo(0, Math.max(0, baseY + dy)); } catch { /* ignore */ }
+          await sleep(250); // let any scroll-linked easing react and settle at the new offset
+          const dxs = await sampleWindow(el, WINDOW_SAMPLES, SAMPLE_MS);
+          return medianVelocityPxPerSec(dxs, SAMPLE_MS);
+        };
+        const vDown = await jiggle(JIGGLE_PX);
+        const vUp = await jiggle(-JIGGLE_PX);
+        try { window.scrollTo(0, baseY); } catch { /* ignore */ }
+        // Scroll-linked motion responds to the nudge (velocity reverses, dies, or spikes as
+        // it re-lerps to the new target). A real marquee holds ~pxPerSec through both nudges.
+        const stableUnderJiggle = (v: number): boolean =>
+          Math.sign(v) === Math.sign(pxPerSec) && Math.abs(v) >= Math.abs(pxPerSec) * 0.5 && Math.abs(v) <= Math.abs(pxPerSec) * 2;
+        if (!stableUnderJiggle(vDown) || !stableUnderJiggle(vUp)) continue;
+
         const periodPx = Math.round(el.scrollWidth / 2);
         if (periodPx < 40) continue;
         seen.add(cap);
@@ -305,8 +482,11 @@ export async function captureMotion(page: Page, opts?: { observeMs?: number; log
             const cap = el && (el as Element).getAttribute?.("data-cid-cap");
             if (!cap) continue;
             const elem = el as Element;
-            // only track small text-bearing elements (a rotating word/phrase, not a big block)
-            if (elem.querySelector("[data-cid-cap]")) continue; // has element children → not a leaf word
+            // only track small text-bearing elements (a rotating word/phrase, not a big block).
+            // Reject ANY element child, capped or not: rows injected at runtime (after cid-cap
+            // tagging, so uncapped) would otherwise defeat a capped-only check and let a
+            // multi-element panel pass as a "leaf word".
+            if (elem.firstElementChild) continue; // has element children → not a leaf word
             const txt = norm(elem.textContent || "");
             if (!txt || txt.length > 80) continue;
             const e = changes.get(cap) ?? { texts: [], times: [] };

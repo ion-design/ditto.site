@@ -289,8 +289,15 @@ function metadataObject(report: SeoInventory): Record<string, unknown> {
   if (keywords) metadata.keywords = keywords;
   if (report.robots) metadata.robots = report.robots;
   if (report.referrer) metadata.referrer = report.referrer;
+  const sourceOrigin = originOf(report.sourceUrl);
   const alternates: Record<string, unknown> = {};
-  if (report.canonicalUrl) alternates.canonical = report.canonicalUrl;
+  // Canonical is relativized to the source origin path so metadataBase (the clone's own
+  // origin) resolves it — never hard-coding the source domain. Off-origin canonicals are rare;
+  // keep them verbatim.
+  if (report.canonicalUrl) {
+    const c = relativizeToSource(report.canonicalUrl, sourceOrigin);
+    alternates.canonical = c.path;
+  }
   if (report.alternates.length) {
     const languages: Record<string, string> = {};
     for (const alt of report.alternates) languages[alt.hrefLang] = alt.href;
@@ -314,7 +321,7 @@ function metadataObject(report: SeoInventory): Record<string, unknown> {
     else other["og:type"] = ogType;
   }
   if (ogSiteName) og.siteName = ogSiteName;
-  if (ogUrl) og.url = ogUrl;
+  if (ogUrl) og.url = relativizeToSource(ogUrl, sourceOrigin).path;
   if (ogImages.length) og.images = ogImages;
   if (Object.keys(og).length) metadata.openGraph = og;
 
@@ -352,8 +359,23 @@ function metadataObject(report: SeoInventory): Record<string, unknown> {
   return metadata;
 }
 
+// A sentinel object value that metadataExport rewrites into the runtime `metadataBase`
+// expression (JSON can't hold `new URL(...)`). Chosen so it never collides with real content.
+const METADATA_BASE_SENTINEL = "__DITTO_METADATA_BASE__";
+
+// The metadata/JSON-LD layout module references SITE_ORIGIN — callers must hoist this import.
+export const SITE_ORIGIN_LAYOUT_IMPORT = siteOriginImportLine(1);
+
 export function metadataExport(report: SeoInventory): string {
-  return `export const metadata = ${JSON.stringify(metadataObject(report), null, 2)};\n`;
+  const obj = metadataObject(report);
+  // metadataBase lets Next resolve the (now relative) canonical/openGraph URLs against the
+  // clone's OWN origin — SITE_ORIGIN when set, localhost in dev. Placed first for readability.
+  const withBase = { metadataBase: METADATA_BASE_SENTINEL, ...obj };
+  const body = JSON.stringify(withBase, null, 2).replace(
+    JSON.stringify(METADATA_BASE_SENTINEL),
+    `new URL(SITE_ORIGIN || "http://localhost:3000")`,
+  );
+  return `export const metadata = ${body};\n`;
 }
 
 export function viewportExport(report: SeoInventory): string {
@@ -367,13 +389,31 @@ function safeJsonLd(text: string): string {
   return text.replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
 }
 
+/** Rewrite a JSON-LD block's on-origin @id/url/contentUrl/target values off the SOURCE domain.
+ *  The frozen JSON escapes slashes (`https:\/\/host\/…`), so we split on both the escaped and
+ *  plain origin forms and rejoin with SITE_ORIGIN at RUNTIME — the source domain never appears
+ *  in output, and setting NEXT_PUBLIC_SITE_ORIGIN re-hosts the ids under the clone's own origin.
+ *  Returns a JS expression string. Off-origin links (genuinely external) are left untouched. */
+function jsonLdHtmlExpr(text: string, sourceOrigin: string): string {
+  const safe = safeJsonLd(text);
+  if (!sourceOrigin) return JSON.stringify(safe);
+  const escaped = sourceOrigin.replace(/\//g, "\\/");
+  // Split on whichever origin form appears; only one form is present in a given block.
+  const forms = safe.includes(escaped) ? escaped : (safe.includes(sourceOrigin) ? sourceOrigin : null);
+  if (!forms) return JSON.stringify(safe);
+  const segments = safe.split(forms);
+  if (segments.length === 1) return JSON.stringify(safe);
+  return `[${segments.map((s) => JSON.stringify(s)).join(", ")}].join(SITE_ORIGIN)`;
+}
+
 export function jsonLdHeadMarkup(report: SeoInventory, indent = 8): string {
   if (!report.jsonLd.length) return "";
   const pad = " ".repeat(indent);
+  const sourceOrigin = originOf(report.sourceUrl);
   return report.jsonLd.map((entry, index) => `${pad}<script
 ${pad}  key="ditto-json-ld-${index}"
 ${pad}  type="application/ld+json"
-${pad}  dangerouslySetInnerHTML={{ __html: ${JSON.stringify(safeJsonLd(entry.text))} }}
+${pad}  dangerouslySetInnerHTML={{ __html: ${jsonLdHtmlExpr(entry.text, sourceOrigin)} }}
 ${pad}/>`).join("\n");
 }
 
@@ -395,6 +435,27 @@ export function GET() {
 
 function originOf(url: string): string {
   try { return new URL(url).origin; } catch { return "https://example.com"; }
+}
+
+/** The single origin constant every generated SEO/metadata route resolves against. Empty by
+ *  default so canonical/sitemap/JSON-LD URLs render RELATIVE to wherever the clone is served
+ *  (never the source domain); set NEXT_PUBLIC_SITE_ORIGIN to make them absolute to the clone's
+ *  own origin. Emitted once as src/lib/site.ts. */
+export const SITE_ORIGIN_MODULE = `export const SITE_ORIGIN = (process.env.NEXT_PUBLIC_SITE_ORIGIN ?? "").replace(/\\/$/, "");\n`;
+
+/** The `import { SITE_ORIGIN } from "…/lib/site"` line; `depth` mirrors cnImportLine. */
+export function siteOriginImportLine(depth: number): string {
+  return `import { SITE_ORIGIN } from "${"../".repeat(Math.max(1, depth))}lib/site";`;
+}
+
+/** Path portion of a URL that sits on the source origin (so it can be re-hosted under
+ *  SITE_ORIGIN); returns the input unchanged for off-origin (genuinely external) URLs. */
+function relativizeToSource(url: string, sourceOrigin: string): { onOrigin: boolean; path: string } {
+  if (sourceOrigin && url.startsWith(sourceOrigin)) {
+    const path = url.slice(sourceOrigin.length) || "/";
+    return { onOrigin: true, path: path.startsWith("/") ? path : "/" + path };
+  }
+  return { onOrigin: false, path: url };
 }
 
 function generatedLlms(report: SeoInventory, routes: SeoRouteSummary[]): string {
@@ -422,15 +483,17 @@ function generatedLlms(report: SeoInventory, routes: SeoRouteSummary[]): string 
 
 export function seoRouteFiles(report: SeoInventory, routes: SeoRouteSummary[]): Array<[string, string]> {
   const origin = originOf(report.sourceUrl);
-  const sitemapUrl = origin + "/sitemap.xml";
+  // robots.ts / sitemap.ts live at src/app → depth 1 below src.
+  const siteImport = siteOriginImportLine(1);
   const robots = `import type { MetadataRoute } from "next";
+${siteImport}
 
 export const dynamic = "force-static";
 
 export default function robots(): MetadataRoute.Robots {
   return {
     rules: { userAgent: "*", allow: "/" },
-    sitemap: ${JSON.stringify(sitemapUrl)},
+    sitemap: SITE_ORIGIN + "/sitemap.xml",
   };
 }
 `;
@@ -441,13 +504,21 @@ export default function robots(): MetadataRoute.Robots {
     title: report.title || "Home",
     description: report.description,
     excerpt: "",
-  }]).map((route, index) => ({ url: route.url, changeFrequency: "weekly", priority: index === 0 ? 1 : 0.7 }));
+  }]).map((route, index) => ({ path: relativizeToSource(route.url, origin).path, changeFrequency: "weekly", priority: index === 0 ? 1 : 0.7 }));
+  // Emit `url: SITE_ORIGIN + "<path>"` so URLs resolve to the clone's own origin (relative by
+  // default), never the source domain.
+  const entryLines = sitemapEntries.map((e) =>
+    `  {\n    url: SITE_ORIGIN + ${JSON.stringify(e.path)},\n    changeFrequency: ${JSON.stringify(e.changeFrequency)},\n    priority: ${e.priority},\n  }`
+  ).join(",\n");
   const sitemap = `import type { MetadataRoute } from "next";
+${siteImport}
 
 export const dynamic = "force-static";
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  return ${JSON.stringify(sitemapEntries, null, 2)};
+  return [
+${entryLines},
+  ];
 }
 `;
   const sourceLlms = resourceText(report, "llms");
@@ -472,11 +543,12 @@ function xmlEscape(value: string): string {
 
 export function seoStaticFiles(report: SeoInventory, routes: SeoRouteSummary[]): Array<[string, string]> {
   const origin = originOf(report.sourceUrl);
-  const sitemapUrl = origin + "/sitemap.xml";
+  // Static output (Vite) has no runtime env: emit the clone's own paths RELATIVE to the source
+  // origin so the source domain is never baked in (the requirement's relative default).
   const robots = [
     "User-agent: *",
     "Allow: /",
-    `Sitemap: ${sitemapUrl}`,
+    "Sitemap: /sitemap.xml",
     "",
   ].join("\n");
   const sitemapRoutes = routes.length ? routes : [{
@@ -492,7 +564,7 @@ export function seoStaticFiles(report: SeoInventory, routes: SeoRouteSummary[]):
     '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ...sitemapRoutes.map((route, index) => [
       "  <url>",
-      `    <loc>${xmlEscape(route.url)}</loc>`,
+      `    <loc>${xmlEscape(relativizeToSource(route.url, origin).path)}</loc>`,
       "    <changefreq>weekly</changefreq>",
       `    <priority>${index === 0 ? "1.0" : "0.7"}</priority>`,
       "  </url>",

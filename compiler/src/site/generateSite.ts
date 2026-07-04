@@ -15,7 +15,7 @@ import { generateCss, RESET_CSS } from "../generate/css.js";
 import { generateInteractionCss } from "../generate/interactionCss.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, interactionRejectedSet } from "../generate/interactive.js";
 import { buildLottieSpec, lottieHasContent, lottieWireJsx, dittoLottieImportPath, DITTO_LOTTIE_TSX } from "../generate/lottie.js";
-import { renderChildrenJsx, renderAttrs, buildComponentRegistry, componentPreamble, componentFiles, componentImports, componentDataDecls, summarizeComponents, fileBase, generateViteConfig, generateViteIndexHtml, viteGlobalsCss, PACKAGE_JSON, PACKAGE_JSON_TW, PACKAGE_JSON_VITE, PACKAGE_JSON_VITE_TW, TSCONFIG_JSON, TSCONFIG_JSON_VITE, NEXT_CONFIG, injectLottieDep, type AppFramework, type LinkRewrite, type ExtractedComponent, type RenderCtx } from "../generate/app.js";
+import { renderChildrenJsx, renderAttrs, buildComponentRegistry, componentPreamble, componentFiles, componentImports, componentDataDecls, summarizeComponents, fileBase, generateViteConfig, generateViteIndexHtml, viteGlobalsCss, cnImportLine, resolveHtmlBg, htmlBgRule, CN_UTILS_MODULE, PACKAGE_JSON, PACKAGE_JSON_TW, PACKAGE_JSON_VITE, PACKAGE_JSON_VITE_TW, TSCONFIG_JSON, TSCONFIG_JSON_VITE, NEXT_CONFIG, injectLottieDep, type AppFramework, type LinkRewrite, type ExtractedComponent, type RenderCtx } from "../generate/app.js";
 import { buildTailwind, tailwindGlobalsCss, createColorInterner, colorDefsCssOf, type TailwindOutput } from "../generate/tailwind.js";
 import type { InteractionCapture } from "../capture/interactions.js";
 import type { IRChild } from "../normalize/ir.js";
@@ -29,7 +29,7 @@ import type { CaptureResult } from "../capture/capture.js";
 import { backfillLazyBackgrounds } from "../normalize/ir.js";
 import { toRoutePath, segmentsOf } from "../crawl/url.js";
 import { buildCanonicalChrome, chromeCssIr, middleChildren, middleIncludeFilter, CHROME_PREFIX, type ChromePlan } from "./sharedLayout.js";
-import { buildSeoInventory, emitSeoAssetFiles, emitSeoRoutes, jsonLdHeadMarkup, metadataExport, routeSummaryFromIr, seoStaticFiles, viewportExport, type SeoInventory, type SeoRouteSummary } from "../generate/seo.js";
+import { buildSeoInventory, emitSeoAssetFiles, emitSeoRoutes, jsonLdHeadMarkup, metadataExport, routeSummaryFromIr, seoStaticFiles, SITE_ORIGIN_LAYOUT_IMPORT, SITE_ORIGIN_MODULE, viewportExport, type SeoInventory, type SeoRouteSummary } from "../generate/seo.js";
 import { emitGeneratedDocs } from "../generate/docs.js";
 
 export type RouteArtifact = {
@@ -91,10 +91,10 @@ function unionFontCss(routes: RouteArtifact[]): string {
 
 /** Shared page-base bits (entry html background + overflow-x clip) — same rationale as
  *  single-page generation; used by both the plain-CSS and Tailwind globals. */
-function pageBaseOf(entry: RouteArtifact): { htmlBg: string; clip: string } {
+function pageBaseOf(entry: RouteArtifact): { htmlBg: string | null; clip: string } {
   const cw = entry.ir.doc.canonicalViewport;
   const pv = entry.ir.doc.perViewport[cw];
-  const htmlBg = pv?.htmlBg && pv.htmlBg !== "rgba(0, 0, 0, 0)" ? pv.htmlBg : (pv?.bodyBg ?? "#ffffff");
+  const htmlBg = resolveHtmlBg(pv);
   const noHScroll = Object.entries(entry.ir.doc.perViewport).every(([vp, d]) => d.scrollWidth <= Number(vp) * 1.03);
   return { htmlBg, clip: noHScroll ? "\nhtml, body { overflow-x: clip; }" : "" };
 }
@@ -112,8 +112,7 @@ ${paletteCss}
 ${tokensToCss(entry.tokens, true)}
 
 /* page base */
-html { background: ${htmlBg}; }
-body { font-family: ${SYSTEM_FALLBACK}; }${clip}
+${htmlBgRule(htmlBg)}body { font-family: ${SYSTEM_FALLBACK}; }${clip}
 `;
 }
 
@@ -132,9 +131,10 @@ function layoutTsx(entry: RouteArtifact, bodyClass: string | undefined, chrome?:
   const viewport = seo ? viewportExport(seo) : `export const viewport = { width: "device-width", initialScale: 1 };\n`;
   const jsonLd = seo ? jsonLdHeadMarkup(seo, 8) : "";
   const head = jsonLd ? `      <head>\n${jsonLd}\n      </head>\n` : "";
+  const siteImport = seo ? SITE_ORIGIN_LAYOUT_IMPORT + "\n" : "";
   return `import "./globals.css";
 ${chromeImport}import type { ReactNode } from "react";
-
+${siteImport}
 ${metadata}${viewport}
 
 ${pre}export default function RootLayout({ children }: { children: ReactNode }) {
@@ -271,6 +271,9 @@ export function generateSiteApp(opts: {
   // package.json is written after the route loop (below) so the lottie-web dependency can be
   // added when any route actually replays a Lottie animation.
   writeText(join(appDir, "tsconfig.json"), isVite ? TSCONFIG_JSON_VITE : TSCONFIG_JSON);
+  writeText(join(appDir, "src", "lib", "utils.ts"), CN_UTILS_MODULE);
+  // SITE_ORIGIN constant for SEO/metadata routes (Next only — Vite ships static SEO files).
+  if (!isVite) writeText(join(appDir, "src", "lib", "site.ts"), SITE_ORIGIN_MODULE);
   writeText(join(appDir, ".gitignore"), "node_modules\n.next\nout\ndist\n");
   if (isVite) {
     rmSync(join(appDir, "next.config.mjs"), { force: true });
@@ -384,11 +387,17 @@ export function generateSiteApp(opts: {
     // Stage 6: split each route component into its own route-local `components/Name.tsx`
     // (page imports them); per-route data stays inline. Route-local dirs keep names from
     // colliding across routes, which each name their components independently.
-    for (const { name, module } of componentFiles(routeReg)) writeText(join(routeDir, "components", fileBase(name) + ".tsx"), module);
+    // Depth of a route-local `components/Name.tsx` below `src`: src/app/<dir>/components
+    // (Next) or src/routes/<key>/components (Vite). +1 for the components dir itself.
+    const compDepth = (isVite ? 2 : (dir ? dir.split("/").length + 1 : 1)) + 1;
+    for (const { name, module } of componentFiles(routeReg, undefined, compDepth)) writeText(join(routeDir, "components", fileBase(name) + ".tsx"), module);
     const compImport = componentImports(routeReg, 0); // route-local → ./components/Name
     const dataDecls = componentDataDecls(routeReg);
     const preBlock = dataDecls ? dataDecls + "\n\n" : "";
-    const importLines = [wireImport.trimEnd(), lottieImport.trimEnd(), compImport].filter(Boolean).join("\n");
+    // page.tsx sits at routeDir (src/app/<dir> or src/routes/<key>); depth below src.
+    const pageDepth = isVite ? 2 : (dir ? dir.split("/").length + 1 : 1);
+    const cnImport = /\bcn\(/.test(bodyJsx) ? cnImportLine(pageDepth) + "\n" : "";
+    const importLines = [wireImport.trimEnd(), lottieImport.trimEnd(), cnImport.trimEnd(), compImport].filter(Boolean).join("\n");
     const pageTsx = `${isVite ? "" : 'import "./ditto.css";\n'}${importLines ? importLines + "\n" : ""}// Generated by clone-site. Do not edit by hand.\n${preBlock}export default function Page() {\n  return (\n    <>\n${bodyJsx}${wireBody}${lottieBody}
     </>
   );

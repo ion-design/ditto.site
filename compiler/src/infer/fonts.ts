@@ -61,19 +61,14 @@ export function buildFontGraph(fontFaces: FontFace[], assetGraph: AssetGraph, so
     }
   }
 
-  const entries: FontEntry[] = [];
-  const cssBlocks: string[] = [];
-  const seen = new Set<string>();
-
-  for (const ff of fontFaces) {
-    const weight = (ff.weight || "400").trim();
-    const style = (ff.style || "normal").trim();
-    const display = (ff.display || "swap").trim();
-    const key = `${ff.family}|${weight}|${style}|${ff.unicodeRange ?? ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const srcs = parseSrcUrls(ff.src, sourceUrl);
+  // Resolve one face's src descriptor against the downloaded-asset graph. A face harvested from
+  // CSSOM carries the url of its owning sheet in `baseHref`; its relative src url()s must resolve
+  // against THAT, not the document, or `../media/x` clamps to the wrong path (commonly the SPA
+  // router's HTML shell). Faces parsed out-of-band already have absolute srcs baked in, so
+  // `baseHref` is absent and the document url is a harmless fallback.
+  const order = ["woff2", "woff", "truetype", "opentype", "embedded-opentype"];
+  const resolveFace = (ff: FontFace): { resolved: Array<{ localPath: string; format: string }>; dataUris: string[] } => {
+    const srcs = parseSrcUrls(ff.src, ff.baseHref || sourceUrl);
     const resolved: Array<{ localPath: string; format: string }> = [];
     const dataUris: string[] = [];
     for (const s of srcs) {
@@ -84,10 +79,47 @@ export function buildFontGraph(fontFaces: FontFace[], assetGraph: AssetGraph, so
         resolved.push({ localPath: entry.localPath, format: s.format || FORMAT_BY_EXT[ext] || "woff2" });
       }
     }
-
     // Prefer woff2 > woff > others for ordering.
-    const order = ["woff2", "woff", "truetype", "opentype", "embedded-opentype"];
     resolved.sort((a, b) => order.indexOf(a.format) - order.indexOf(b.format));
+    return { resolved, dataUris };
+  };
+
+  // Deduplicate faces by family|weight|style|unicodeRange. Two sources can supply the same face
+  // with DIFFERENT (correctly- vs wrongly-resolved) src urls — the CSSOM harvest and the css-text
+  // parse both land in `fontFaces`. Keeping the first-inserted face lets a src that resolves to
+  // nothing (a rejected impostor, or a mis-based path) win the slot, so choose validity-aware:
+  // the first face whose src resolves to a downloaded/data-uri source wins; only if NONE in the
+  // group resolves do we fall back to the first-seen face (recorded as unavailable). Ties (more
+  // than one resolving) keep insertion order — determinism preserved.
+  const chosen = new Map<string, { ff: FontFace; res: ReturnType<typeof resolveFace> }>();
+  const orderKeys: string[] = [];
+  for (const ff of fontFaces) {
+    const weight = (ff.weight || "400").trim();
+    const style = (ff.style || "normal").trim();
+    const key = `${ff.family}|${weight}|${style}|${ff.unicodeRange ?? ""}`;
+    const res = resolveFace(ff);
+    const resolves = res.resolved.length > 0 || res.dataUris.length > 0;
+    const prev = chosen.get(key);
+    if (!prev) {
+      chosen.set(key, { ff, res });
+      orderKeys.push(key);
+    } else if (resolves && !(prev.res.resolved.length > 0 || prev.res.dataUris.length > 0)) {
+      // Upgrade: the incumbent resolved to nothing, this candidate resolves — replace it in place
+      // (keeping its original emission position).
+      chosen.set(key, { ff, res });
+    }
+    // Otherwise keep the incumbent (first-resolving wins; ties hold insertion order).
+  }
+
+  const entries: FontEntry[] = [];
+  const cssBlocks: string[] = [];
+
+  for (const key of orderKeys) {
+    const { ff, res } = chosen.get(key)!;
+    const weight = (ff.weight || "400").trim();
+    const style = (ff.style || "normal").trim();
+    const display = (ff.display || "swap").trim();
+    const { resolved, dataUris } = res;
 
     if (resolved.length > 0 || dataUris.length > 0) {
       const srcParts: string[] = [];

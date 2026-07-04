@@ -15,6 +15,7 @@
 import type { IR, IRNode } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import type { RecipeCandidate, RecipeKind, RecipeReport } from "../infer/recipes.js";
+import { detectSectionNodes, heroLikeHeader } from "../infer/sections.js";
 import { subtreeSignature } from "../site/sharedLayout.js";
 
 export type SectionPlan = {
@@ -23,7 +24,7 @@ export type SectionPlan = {
 };
 
 const MIN_SECTION_H = 56;
-const MAX_SECTIONS = 24;
+const MAX_SECTIONS = 32;
 
 function box(n: IRNode, cw: number): { width: number; height: number } | undefined {
   return n.bboxByVp[cw] ?? Object.values(n.bboxByVp)[0];
@@ -31,14 +32,8 @@ function box(n: IRNode, cw: number): { width: number; height: number } | undefin
 function yOf(n: IRNode, cw: number): number {
   return (n.bboxByVp[cw] ?? Object.values(n.bboxByVp)[0])?.y ?? 0;
 }
-function visible(n: IRNode, cw: number): boolean {
-  return !!(n.visibleByVp[cw] ?? Object.values(n.visibleByVp)[0]);
-}
 function elementChildren(n: IRNode): IRNode[] {
   return n.children.filter((c): c is IRNode => !isTextChild(c));
-}
-function significantChildren(n: IRNode, cw: number): IRNode[] {
-  return elementChildren(n).filter((c) => visible(c, cw) && (box(c, cw)?.height ?? 0) >= MIN_SECTION_H);
 }
 
 function subtreeHasTag(n: IRNode, tag: string, depth = 4): boolean {
@@ -103,6 +98,83 @@ function slugWords(text: string): string {
  *  A name that doesn't start with a letter/_/$ (e.g. "3dSection") gets an "S" prefix. */
 function identName(name: string): string {
   return /^[A-Za-z_$]/.test(name) ? name : "S" + name;
+}
+
+// Generic structural words that carry no section identity — dropped from source-derived names.
+const GENERIC_NAME_WORDS = new Set([
+  "section", "sections", "wrapper", "container", "block", "blocks", "template", "templates",
+  "group", "inner", "outer", "content", "contents", "row", "col", "column", "grid", "layout",
+  "shopify", "js", "tvg", "elementor", "wp", "widget", "module", "region", "main", "page",
+  "component", "components", "el", "root", "body", "area", "box", "item", "items", "wrap",
+]);
+
+/** A trailing token looks like a build hash (mixed-case or long alnum entropy, e.g.
+ *  `JtTWTt`, `RbEALJ`, `x19f2a`, `dDMm2q`) rather than a real word — strip it. A token is
+ *  hashy when it is ≥4 chars and either mixes upper+lower case or is a long digit-bearing run. */
+function looksHashy(tok: string): boolean {
+  if (tok.length < 4) return false;
+  const hasUpper = /[A-Z]/.test(tok), hasLower = /[a-z]/.test(tok), hasDigit = /\d/.test(tok);
+  if (hasUpper && hasLower) return true;                 // camel/entropy hash: JtTWTt, dDMm2q
+  if (hasDigit && tok.length >= 6) return true;          // long id run: 19797275672650
+  if (!/[aeiou]/i.test(tok) && tok.length >= 5) return true; // vowelless run: bcdfgh
+  return false;
+}
+
+/** Turn a source id/class token stream into ≤3 semantic PascalCase words, or "" when the
+ *  evidence is all-generic or hashy. Strips CMS prefixes (shopify-section-…__), leading
+ *  numeric template ids, generic structural words, and trailing hash suffixes. Exported for
+ *  tests (the hashy-suffix stripping + generic-word filtering is the load-bearing part). */
+export function nameFromSourceToken(raw: string): string {
+  // Peel known CMS section-id prefixes, keeping the semantic slug after `__` / the hook name.
+  // Case is preserved through prefix-stripping + tokenizing so `looksHashy` can see the
+  // mixed-case entropy of build hashes (RbEALJ, JtTWTt) BEFORE we normalize to lowercase.
+  const s = raw.trim()
+    .replace(/^shopify-section-(?:template|sections)--\d+__/i, "")
+    .replace(/^shopify-(?:section|block)-/i, "")
+    .replace(/^(?:js|tvg|elementor|wp|et|elementor-element)[-_]/i, "");
+  const tokens = s.split(/[\s\-_]+/).filter(Boolean);
+  const kept: string[] = [];
+  for (const t of tokens) {
+    if (kept.length >= 3) break;
+    if (/^\d+$/.test(t)) continue;                  // pure numeric template ids
+    if (GENERIC_NAME_WORDS.has(t.toLowerCase())) continue; // structural noise
+    if (looksHashy(t)) continue;                    // trailing entropy suffix (mixed-case aware)
+    if (t.length < 2) continue;
+    const lc = t.toLowerCase();
+    kept.push(lc[0]!.toUpperCase() + lc.slice(1));
+  }
+  return kept.join("");
+}
+
+// A source `id` (or `data-section-type`) is a DELIBERATE, developer-authored block name only
+// when it carries a recognized CMS section prefix — Shopify's `shopify-section-…__split_callout`,
+// or a generic `section-…`/`…-section`. Arbitrary utility classes (`g_section_space`,
+// `duraldar-cta_section`) are styling noise, so we do NOT mine class names — a truncated heading
+// slug reads better than a made-up name. `js-*` behaviour hooks ARE intentional and allowed.
+const CMS_SECTION_ID = /shopify-section|^section[-_]|[-_]section(?:[-_]|$)|data-section/i;
+
+/** Best semantic name derivable from a section subtree's source *ids* + `js-*` hooks — the
+ *  only source signals reliable enough to beat a heading slug. Scans the root + shallow
+ *  descendants. Returns "" when no trustworthy semantic evidence exists. */
+function sourceNameForSection(sec: IRNode): string {
+  const candidates: string[] = [];
+  const collect = (n: IRNode, depth: number): void => {
+    const id = n.attrs.id;
+    if (id && CMS_SECTION_ID.test(id)) candidates.push(id);
+    const sectionType = n.attrs["data-section-type"] ?? n.attrs["data-section"];
+    if (sectionType) candidates.push(sectionType);
+    if (n.srcClass) {
+      // Only explicit `js-…` behaviour hooks — a deliberate semantic handle, not a utility class.
+      for (const cls of n.srcClass.split(/\s+/)) if (/^js[-_][a-z]/i.test(cls)) candidates.push(cls);
+    }
+    if (depth > 0) for (const c of elementChildren(n)) collect(c, depth - 1);
+  };
+  collect(sec, 2);
+  for (const c of candidates) {
+    const name = nameFromSourceToken(c);
+    if (name && name.length >= 3) return name;
+  }
+  return "";
 }
 
 function looksLikeNav(n: IRNode, cw: number): boolean {
@@ -225,18 +297,11 @@ function recipeFallbackSections(ir: IR, recipes?: RecipeReport): { sections: IRN
 
 export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
   const cw = ir.doc.canonicalViewport;
-  // Descend through the wrapper chain (single significant child) to the container
-  // whose children are the actual sections.
-  let node = ir.root;
-  for (let i = 0; i < 10; i++) {
-    const sig = significantChildren(node, cw);
-    if (sig.length >= 2) break;
-    if (sig.length === 1) { node = sig[0]!; continue; }
-    const kids = elementChildren(node);
-    if (kids.length === 1) { node = kids[0]!; continue; }
-    break;
-  }
-  // Exclude any child that is part of a REPEATED run (≥3 same-signature siblings): that's
+  const pageH = ir.doc.perViewport[cw]?.scrollHeight ?? 0;
+  // The shared recursive band decomposition (infer/sections) — the same roots the
+  // section gate validates, so each emitted file corresponds to a gate section.
+  const bands = detectSectionNodes(ir).filter((n) => n.id !== ir.root.id);
+  // Exclude any band that is part of a REPEATED run (≥3 same-signature siblings): that's
   // a component cluster (a card/logo grid), which component extraction should turn into a
   // `.map()` over a data array — not a wall of near-identical "section" files. Only the
   // distinct, one-off blocks become sections.
@@ -246,29 +311,14 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     return list.filter((s) => (count.get(subtreeSignature(s)) ?? 0) < 3);
   };
 
-  let candidates = significantChildren(node, cw);
-  let sections = distinctOf(candidates);
-  const fallback = recipeFallbackSections(ir, recipes);
-  // If the container yields too few sections, a dominant child is a wrapper (e.g. <main>)
-  // holding the real sections — expand such oversized children into their own significant
-  // children, keeping the other siblings (e.g. a sibling <footer>). Gated on <3 so a page
-  // that already splits cleanly is untouched.
-  if (sections.length < 3) {
-    const pageH = ir.doc.perViewport[cw]?.scrollHeight ?? 0;
-    const expanded: IRNode[] = [];
-    for (const c of candidates) {
-      const inner = significantChildren(c, cw);
-      const h = box(c, cw)?.height ?? 0;
-      if (inner.length >= 3 && pageH > 0 && h >= pageH * 0.4) expanded.push(...inner);
-      else expanded.push(c);
-    }
-    candidates = expanded;
-    sections = distinctOf(candidates);
-  }
+  let sections = distinctOf(bands);
   let recipeNameHints = new Map<string, string>();
-  if (sections.length < 3 && fallback.sections.length >= 3) {
-    sections = fallback.sections;
-    recipeNameHints = fallback.names;
+  if (sections.length < 3) {
+    const fallback = recipeFallbackSections(ir, recipes);
+    if (fallback.sections.length >= 3) {
+      sections = fallback.sections;
+      recipeNameHints = fallback.names;
+    }
   }
   const roots = new Map<string, string>();
   if (sections.length < 3 || sections.length > MAX_SECTIONS) return { roots };
@@ -280,6 +330,10 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     return n === 1 ? base : `${base}${n}`;
   };
 
+  // Hero must actually start near the top of the page; without the gate a
+  // mid-page band inherits the name when the true hero was excluded (e.g. as a
+  // repeated run), which is worse than an honest content-derived name.
+  const heroMaxY = Math.max(900, pageH * 0.25);
   let heroAssigned = false;
   sections.forEach((sec, i) => {
     const isLast = i === sections.length - 1;
@@ -287,18 +341,31 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     let name: string;
     if (sec.tag === "footer" || (isLast && looksLikeNav(sec, cw) === false && subtreeHasTag(sec, "a") && (box(sec, cw)?.height ?? 0) < 700)) {
       name = sec.tag === "footer" ? "Footer" : (titleText(sec) ? slugWords(titleText(sec)) + "Section" : "Footer");
-    } else if (i === 0 && looksLikeNav(sec, cw)) {
+    } else if (sec.tag === "nav"
+      || (i === 0 && looksLikeNav(sec, cw) && !heroLikeHeader(sec, cw))
+      // a thin fixed bar wrapping the real <nav> (often a styled <div>, sorted after
+      // the hero it overlays) is still the navbar
+      || (yOf(sec, cw) <= 160 && (box(sec, cw)?.height ?? 0) <= 160 && subtreeHasTag(sec, "nav"))) {
       name = "Navbar";
-    } else if (sec.tag === "header") {
+    } else if (sec.tag === "header" && !heroLikeHeader(sec, cw)) {
+      // a <header> carrying the page h1 at real height is the hero, not chrome
       name = "Header";
-    } else if (!heroAssigned) {
+    } else if (!heroAssigned && yOf(sec, cw) <= heroMaxY) {
       heroAssigned = true;
       name = "HeroSection";
     } else if (recipeName) {
       name = recipeName;
     } else {
+      // Prefer a clean semantic name from the source markup (Shopify/CMS section ids +
+      // `js-*` hooks, hash suffixes stripped) over a truncated heading slug — the source
+      // slug (`split_callout` → SplitCalloutSection) reads more like a hand-authored name.
+      const sourceName = sourceNameForSection(sec);
       const slug = slugWords(titleText(sec));
-      name = slug ? `${slug}Section` : `Section${i + 1}`;
+      name = sourceName ? `${sourceName}Section`
+        : slug ? `${slug}Section`
+        : subtreeHasTag(sec, "form", 6) ? "ContactSection"
+        : subtreeHasTag(sec, "video", 6) || subtreeHasTag(sec, "iframe", 6) ? "MediaSection"
+        : `Section${i + 1}`;
     }
     roots.set(sec.id, dedupe(identName(name)));
   });

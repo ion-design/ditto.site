@@ -56,6 +56,13 @@ export function buildManifest(args: {
       fallback: fontGraph.entries.filter((f) => f.status === "fallback").length,
     },
     components: { count: componentCount },
+    // Fidelity note: containers whose children were a DIFFERENT SET at some band viewport(s)
+    // (content-identity drift — the source deterministically served other content there). The
+    // clone shows the canonical-viewport children at those widths (faithful-at-canonical) instead
+    // of an empty shell; a perceptual delta against the source at those widths is expected.
+    divergence: {
+      contentDrift: (ir.doc.contentDrift ?? []).map((d) => ({ id: d.id, tag: d.tag, viewports: d.viewports })),
+    },
     // Stage 2: capture-sanity audit — what overlays were dismissed, whether any
     // still covered the page, video stills materialized, and per-viewport quiescence.
     capture: {

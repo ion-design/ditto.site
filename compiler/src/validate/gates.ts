@@ -1,5 +1,5 @@
 import type { IR, IRNode } from "../normalize/ir.js";
-import { isTextChild } from "../normalize/ir.js";
+import { isTextChild, irContentExtent } from "../normalize/ir.js";
 import type { PageSnapshot } from "../capture/walker.js";
 import type { GenNode } from "./render.js";
 import { indexByCid } from "./render.js";
@@ -86,6 +86,32 @@ function hasVisibleElementChild(node: IRNode, vp: number): boolean {
   return false;
 }
 
+/** A source text node that the capture painted VISIBLE but the clone rendered HIDDEN at the same
+ *  viewport is a high-signal regression: the words are in the markup yet fall in an invisible gen
+ *  subtree (off-viewport-shifted, banded-hidden, or width-frozen off-screen). Cheap to detect —
+ *  the gen node exists (matched by cid) but reports `visible === false`. Counts DISTINCT source
+ *  cids over the run (a node hidden at several viewports counts once) so the number reads as
+ *  "how many text nodes went dark", not "hidden-node×viewport". Non-blocking: reported as a metric
+ *  only. Pure + input-driven → deterministic. */
+export function countVisibleInCaptureHiddenInClone(
+  ir: IR,
+  genSnaps: Record<number, PageSnapshot>,
+  viewports: number[],
+): number {
+  const hiddenCids = new Set<string>();
+  for (const vp of viewports) {
+    if (!genSnaps[vp]) continue;
+    const gen = indexByCid(genSnaps[vp]!);
+    for (const s of collectSrcNodes(ir, vp)) {
+      if (!s.visible) continue;
+      if (normText(s.directText).length === 0) continue;
+      const g = gen.get(s.node.id);
+      if (g && !g.visible) hiddenCids.add(s.node.id);
+    }
+  }
+  return hiddenCids.size;
+}
+
 // ---------- Pollution gate (stage 2): is the captured page degenerate? ----------
 // A clone can pass every structural gate while faithfully reproducing the WRONG
 // page: an egress/bot wall, a near-empty shell, or a cookie/consent modal that was
@@ -119,10 +145,29 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   let blocking = capture.dismissal?.blocking ?? false;
   for (const pv of capture.perViewport) { overlaysRemaining = Math.max(overlaysRemaining, pv.overlaysRemaining ?? 0); blocking = blocking || !!pv.blocking; }
   let minHeightRatio = Infinity;
+  let maxHeightRatio = 0;
   for (const pv of capture.perViewport) {
-    if (pv.height > 0) minHeightRatio = Math.min(minHeightRatio, pv.scrollHeight / pv.height);
+    if (pv.height > 0) {
+      const ratio = pv.scrollHeight / pv.height;
+      minHeightRatio = Math.min(minHeightRatio, ratio);
+      maxHeightRatio = Math.max(maxHeightRatio, ratio);
+    }
   }
   if (!Number.isFinite(minHeightRatio)) minHeightRatio = 1;
+
+  // Scroll-locked-capture contradiction: an email-capture/promo popup that sets
+  // body{overflow:hidden;height:100vh} collapses `document.scrollHeight` to EXACTLY the viewport
+  // height at EVERY width (ratio ~1.0 across the board) — yet the real page's IN-FLOW content
+  // (the IR's sections) still lays out several viewports tall. A genuine one-screen landing page
+  // has content extent ~= its scrollHeight, so this only fires when the two disagree: captured
+  // scrollHeight pinned to one viewport WHILE the IR content spans multiple. That is a
+  // scroll-locked, polluted capture — the overlay detector should have caught it, so fail loudly.
+  let maxContentRatio = 0;
+  for (const pv of capture.perViewport) {
+    if (pv.height > 0) maxContentRatio = Math.max(maxContentRatio, irContentExtent(ir.root, pv.viewport) / pv.height);
+  }
+  // scrollHeight never exceeds ~1 viewport at any width, but the IR content is 2+ viewports tall.
+  const scrollLockedContradiction = maxHeightRatio > 0 && maxHeightRatio < 1.15 && maxContentRatio >= 2;
 
   // Degenerate signals. Calibrated against real captures: an egress/bot wall is
   // ~3 nodes / ~24 chars; the most minimal legitimate page in the suite
@@ -131,6 +176,7 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   if (wall && nodeCount < 220) issues.push("bot/egress wall text on a small page");
   if (textChars < 60 && nodeCount < 50) issues.push(`near-empty page: ${textChars} visible text chars, ${nodeCount} nodes`);
   if (blocking) issues.push("a full-viewport modal still scroll-locks the page after dismissal");
+  if (scrollLockedContradiction) issues.push(`scroll-locked capture: scrollHeight pinned to ~1 viewport at every width while IR content spans ${round2(maxContentRatio)} viewports`);
 
   return {
     gate: "pollution",
@@ -138,6 +184,7 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
     metrics: {
       nodeCount, visibleTextChars: textChars, wallTextDetected: wall,
       overlaysRemaining, blocking, minScrollHeightRatio: round2(minHeightRatio),
+      maxScrollHeightRatio: round2(maxHeightRatio), maxContentExtentRatio: round2(maxContentRatio),
       dismissedCount: capture.dismissal?.dismissed.length ?? 0,
       overlaysRemoved: capture.dismissal?.removed ?? 0,
       videoStills: capture.dismissal?.videoStills ?? 0,
@@ -175,7 +222,7 @@ export function gate2Assets(assetGraph: AssetGraph, fontGraph: FontGraph, gen: {
   if (zeroByte > 0) issues.push(`${zeroByte} zero-byte downloaded assets`);
   if (skippedNoReason > 0) issues.push(`${skippedNoReason} skipped assets without reason`);
   if (gen.remoteRefs.length > 0) issues.push(`${gen.remoteRefs.length} generated refs point to remote origin`);
-  if (gen.failed404.length > 0) issues.push(`${gen.failed404.length} generated asset refs 404`);
+  if (gen.failed404.length > 0) issues.push(`${gen.failed404.length} generated asset refs missing (HTTP >= 400 or file absent from export)`);
   const fontsResolvedOrFallback = fontGraph.entries.every((f) => f.status === "resolved" || (f.status === "fallback" && f.reason));
   if (!fontsResolvedOrFallback) issues.push("font declarations not resolved/fallback-recorded");
   return {
@@ -257,6 +304,12 @@ export function gate3Dom(ir: IR, genSnaps: Record<number, PageSnapshot>, viewpor
     }
   }
 
+  // Non-blocking, high-signal diagnostic: source text the capture painted VISIBLE that the clone
+  // renders HIDDEN at the same viewport (off-screen-shifted / banded / width-frozen subtree). Does
+  // NOT gate pass — text presence already covers markup fidelity — but surfaces the "went dark"
+  // count so a banner/feed row vanishing is legible in the report instead of hiding inside a 99.x.
+  const textHiddenInClone = countVisibleInCaptureHiddenInClone(ir, genSnaps, viewports);
+
   const matchPct = totalVisible ? matched / totalVisible : 1;
   const textPct = textTotal ? textPresent / textTotal : 1;
   const linkPct = linksTotal ? linksOk / linksTotal : 1;
@@ -275,6 +328,7 @@ export function gate3Dom(ir: IR, genSnaps: Record<number, PageSnapshot>, viewpor
       nodeMatchPct: round4(matchPct), textPresentPct: round4(textPct),
       linkPct: round4(linkPct), mediaPct: round4(mediaPct),
       totalVisible, matched, textTotal, textPresent, linksTotal, mediaTotal, inventedText,
+      textHiddenInClone,
     },
     issues,
   };
@@ -292,8 +346,12 @@ function isValidRetag(srcTag: string, genTag: string): boolean {
   return genTag === "div" && /^(ul|ol|menu|dl|p|h[1-6])$/.test(srcTag); // content-model → div
 }
 
-function normHref(href: string, origin: string): string {
+export function normHref(href: string, origin: string): string {
   if (!href) return "";
+  // A `javascript:*` href is a script trigger, not a navigable URL. Generation emits an inert `#`
+  // for it (React blocks the literal), so treat every javascript: href — on either side — as `#`
+  // and let the two sides match instead of failing on the un-reproducible script string.
+  if (/^\s*javascript:/i.test(href)) return "#";
   if (href.startsWith("#")) return href;
   try {
     const u = new URL(href, origin);
@@ -346,7 +404,10 @@ export function gate4Style(ir: IR, genSnaps: Record<number, PageSnapshot>, viewp
         // equal, only numerically far apart. Treat any two such large radii as equivalent so the
         // idiomatic `rounded-full` doesn't trip the exact-px compare; real radii stay ±2px.
         if (p === "borderTopLeftRadius" && pxNum(s.computed[p] ?? "") >= PILL_PX && pxNum(g.computed[p] ?? "") >= PILL_PX) continue;
-        if (!cmpNum(s.computed[p], g.computed[p], 2, 0)) { nodeOk = false; fails.push(p); }
+        const eq = p === "letterSpacing"
+          ? letterSpacingEquivalent(s.computed[p], g.computed[p])
+          : cmpNum(s.computed[p], g.computed[p], 2, 0);
+        if (!eq) { nodeOk = false; fails.push(p); }
       }
       for (const p of PX4_PROPS) {
         // `gap: normal` is the initial value and resolves to 0 for flex/grid, so it
@@ -403,6 +464,19 @@ function cmpNum(a: string | undefined, b: string | undefined, abs: number, pct: 
   const na = pxNum(a), nb = pxNum(b);
   if (Number.isNaN(na) || Number.isNaN(nb)) return (a ?? "") === (b ?? "");
   return withinAbs(na, nb, abs) || (pct > 0 && withinPct(na, nb, pct));
+}
+
+/** Compare two computed `letter-spacing` values within the ±2px style tolerance, treating the keyword
+ *  `normal` as `0px`. `letter-spacing: normal` is the initial value and adds no extra spacing (it
+ *  computes to 0), so `normal` ≡ `0px`; crucially, Chromium serializes a computed `letter-spacing: 0`
+ *  BACK as the keyword `normal`, so a genuinely-zero (or sub-0.1px, snapped-to-zero) tracking shows up
+ *  as `normal` on one side and `0px` on the other — a spelling difference that `cmpNum` alone reads as
+ *  a NaN → exact-string mismatch. Normalizing the keyword before the numeric compare removes that false
+ *  failure while a real tracking delta (> 2px) still fails. Mirrors the `gap: normal → 0px` handling. */
+export function letterSpacingEquivalent(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined) return true;
+  const norm = (v: string | undefined): string => (v ?? "").replace(/\bnormal\b/g, "0px");
+  return cmpNum(norm(a), norm(b), 2, 0);
 }
 
 // ---------- Gate 5: layout / section equivalence ----------

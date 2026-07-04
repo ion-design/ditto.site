@@ -1,142 +1,141 @@
 /**
- * Code-quality audit — count the "bad code" tells that make a generated clone read robotic, for any
- * number of app source trees, side by side. Repeatable: point it at shipped deliverables and it
- * prints one column per tree.
+ * Code-quality audit — an honest, human-readable report over one or more generated app
+ * trees. Built directly on the dimension scorer in ./qualityScore, so the audit and the
+ * shipped `code-quality.md` quality number never disagree.
  *
- *   npm run audit                                  # auto: every output/<site>/app
- *   npm run audit -- <dir> [<dir> ...]             # explicit trees; .clone resolves to sibling app/
- *   npm run audit -- output/example/app
+ *   npm run audit                                  # auto: every runs/<site>/latest/generated/app
+ *   npm run audit -- <appDir> [<appDir> ...]       # explicit app trees
+ *   npm run audit -- runs/example/latest/generated/app
+ *   npm run audit -- <dir> --json                  # machine-readable
  *
- * Scans .tsx/.jsx/.ts/.css under each dir (skips node_modules/.next/out/dotfiles). Every metric is a
- * COUNT where lower is better, except the two "good" context rows (fluid width / standard scale).
- * The decisive "decimal" tell is non-integer-PX: each arbitrary px/rem is converted to px and flagged
- * if it isn't a whole pixel (a frozen measurement), so a clean 12.5rem (=200px) does NOT count.
+ * For each tree it prints:
+ *   • the LETTER GRADE + numeric score (and any hard-cap reason),
+ *   • a per-DIMENSION table (payload / decomposition / duplication / semantics / hygiene
+ *     / runtime) with the visible sub-metrics behind each score,
+ *   • the TOP OFFENDERS (file, metric, value) — the worst individual tells.
+ * When several trees are passed it also prints a side-by-side grade comparison.
+ *
+ * Pure static analysis over generated source (.tsx/.jsx/.ts/.astro/.css). No builds, no
+ * browser. See qualityScore.ts for the rubric + the (calibration-guide) thresholds.
  */
-import { readdirSync, statSync, readFileSync, existsSync } from "node:fs";
-import { join, resolve, basename, dirname, sep } from "node:path";
+import { readdirSync, statSync, existsSync } from "node:fs";
+import { join, resolve, basename } from "node:path";
+import { scoreApp, type QualityReport } from "./qualityScore.js";
 
-type Row = { label: string; lowerBetter: boolean; values: number[] };
-type Target = { inputDir: string; scanDir: string; validationDir?: string };
+// ---------------------------------------------------------------------------
+// Target resolution — accept an app dir directly, or discover deliverables.
+// ---------------------------------------------------------------------------
 
-function readTree(dir: string): { tsx: string; css: string; all: string } {
-  const tsxParts: string[] = [], cssParts: string[] = [];
-  const walk = (d: string): void => {
-    for (const n of readdirSync(d)) {
-      if (n === "node_modules" || n === ".next" || n === "out" || n.startsWith(".")) continue;
-      const p = join(d, n);
-      const st = statSync(p);
-      if (st.isDirectory()) walk(p);
-      else if (/\.(tsx|jsx|ts)$/.test(n)) tsxParts.push(readFileSync(p, "utf8"));
-      else if (/\.css$/.test(n)) cssParts.push(readFileSync(p, "utf8"));
+/** Is `dir` a scannable app tree (has a src/ with code in it, or is itself full of code)? */
+function isAppDir(dir: string): boolean {
+  if (!existsSync(dir)) return false;
+  if (existsSync(join(dir, "src"))) return true;
+  try { return readdirSync(dir).some((n) => /\.(tsx|jsx|ts|css|astro)$/.test(n)); } catch { return false; }
+}
+
+/** Discover every runs/<site>/latest/generated/app deliverable, newest layout first.
+ *  Checks both the cwd and its parent, so `npm run audit` works whether invoked from the
+ *  repo root or from compiler/ (where runs/ lives one level up). */
+function discoverTargets(): string[] {
+  const out: string[] = [];
+  const roots = ["runs", "output", "../runs", "../output"].map((r) => resolve(r)).filter(existsSync);
+  for (const root of roots) {
+    let sites: string[];
+    try { sites = readdirSync(root); } catch { continue; }
+    for (const site of sites) {
+      for (const app of [
+        join(root, site, "latest", "generated", "app"),
+        join(root, site, "app"),
+      ]) {
+        if (isAppDir(app)) { out.push(app); break; }
+      }
     }
-  };
-  walk(dir);
-  const tsx = tsxParts.join("\n"), css = cssParts.join("\n");
-  return { tsx, css, all: tsx + "\n" + css };
+  }
+  return out;
 }
 
-/** All metric counts for one tree. */
-function audit(target: Target): Record<string, number> {
-  const dir = target.scanDir;
-  const { tsx, css, all } = readTree(dir);
-  const n = (re: RegExp, s = all): number => (s.match(re) || []).length;
-  const validationDataCid = target.validationDir && existsSync(target.validationDir)
-    ? (readTree(target.validationDir).all.match(/data-cid/g) || []).length
-    : 0;
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
-  // Arbitrary px/rem values + the non-integer-px ("decimal") subset, the decisive measurement tell.
-  let arb = 0, decimal = 0;
-  for (const m of all.matchAll(/\[(-?[0-9]+\.?[0-9]*)(px|rem)\]/g)) {
-    arb++;
-    const px = parseFloat(m[1]!) * (m[2] === "rem" ? 16 : 1);
-    if (Math.abs(px - Math.round(px)) > 0.02) decimal++;
-  }
-
-  return {
-    "files (tsx+css)": (tsx ? 1 : 0), // overwritten below with real file counts
-    "── BAD (lower=better) ──": -1,
-    "fixed width  w-[Npx/rem]": n(/\bw-\[-?[0-9.]+(?:px|rem)\]/g),
-    "fixed height h-[Npx/rem]": n(/\bh-\[-?[0-9.]+(?:px|rem)\]/g),
-    "breakpoint utilities": n(/\b(?:sm|md|lg|xl|2xl|max-sm|max-md|max-lg|max-xl):/g),
-    "arbitrary bands min/max-[Npx]:": n(/\b(?:min|max)-\[[0-9]+px\]:/g),
-    "arbitrary […px/rem] total": arb,
-    "decimal (non-integer px)": decimal,
-    "baked position top/left/inset-[N]": n(/\b(?:top|left|right|bottom|inset(?:-x|-y)?)-\[-?[0-9.]+(?:px|rem)\]/g),
-    "raw color literal [#hex/rgb]": n(/\[(?:#[0-9a-fA-F]{3,8}|rgba?\([^\]]*)\]/g),
-    "per-side border longhand": n(/\[border-(?:top|right|bottom|left)-(?:style|color):/g),
-    "data-cid (shipped)": n(/data-cid/g),
-    "data-cid (validation-only)": validationDataCid,
-    "dangerouslySetInnerHTML": n(/dangerouslySetInnerHTML/g),
-    "': any' props": n(/:\s*any\b/g),
-    "robotic 'Generated by' comments": n(/Generated by clone|clone-static/g),
-    "── GOOD (higher=better) ──": -1,
-    "fluid width (w-full/auto/fraction)": n(/\bw-(?:full|auto|fit|screen|\d{1,2}\/\d{1,2})\b/g),
-    "standard scale (gap-2/w-10/p-4…)": n(/\b(?:gap|p|px|py|pt|pb|pl|pr|m|mx|my|mt|mb|w|h)-(?:0|0\.5|1|1\.5|2|2\.5|3|3\.5|4|5|6|7|8|9|10|11|12|14|16|20|24|28|32|36|40|44|48|52|56|60|64|72|80|96|px)\b/g),
-  };
+/** A readable column label for a target (its site/run name where possible). */
+function labelFor(dir: string): string {
+  const parts = resolve(dir).split("/");
+  const runsIdx = parts.lastIndexOf("runs");
+  const outIdx = parts.lastIndexOf("output");
+  const i = runsIdx >= 0 ? runsIdx : outIdx;
+  if (i >= 0 && parts[i + 1]) return parts[i + 1]!.slice(0, 22);
+  return (parts[parts.length - 2] ?? basename(dir)).slice(0, 22);
 }
 
-function fileCount(dir: string): number {
-  let c = 0;
-  const walk = (d: string): void => { for (const x of readdirSync(d)) { if (x === "node_modules" || x === ".next" || x === "out" || x.startsWith(".")) continue; const p = join(d, x); statSync(p).isDirectory() ? walk(p) : (/\.(tsx|jsx|ts|css)$/.test(x) && c++); } };
-  walk(dir);
-  return c;
+const pad = (s: string, w: number): string => s + " ".repeat(Math.max(0, w - s.length));
+const padL = (s: string, w: number): string => " ".repeat(Math.max(0, w - s.length)) + s;
+
+function renderReport(label: string, rep: QualityReport): string {
+  const L: string[] = [];
+  L.push("");
+  L.push(`━━━ ${label} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  L.push(`  GRADE ${rep.grade}   (${rep.total}/100)`);
+  if (rep.caps.length) {
+    L.push(`  HARD CAP → grade limited to D-range:`);
+    for (const c of rep.caps) L.push(`    • ${c}`);
+  }
+  L.push("");
+  L.push(`  ${pad("dimension", 15)}${padL("score", 9)}   sub-metrics`);
+  L.push(`  ${"─".repeat(66)}`);
+  for (const [dim, cat] of Object.entries(rep.categories)) {
+    const metrics = Object.entries(cat.metrics).map(([k, v]) => `${k}=${v}`).join(" ");
+    L.push(`  ${pad(dim, 15)}${padL(`${cat.score}/${cat.max}`, 9)}   ${metrics}`);
+  }
+  if (rep.offenders.length) {
+    L.push("");
+    L.push(`  top offenders`);
+    L.push(`  ${pad("metric", 34)}${padL("value", 12)}  file`);
+    L.push(`  ${"─".repeat(66)}`);
+    for (const o of rep.offenders.slice(0, 10)) {
+      L.push(`  ${pad(o.metric, 34)}${padL(String(o.value), 12)}  ${o.file}`);
+    }
+  }
+  return L.join("\n");
 }
 
-function normalizeTarget(input: string): Target {
-  const d = resolve(input);
-  const asApp = (appDir: string, validationDir?: string): Target => ({ inputDir: d, scanDir: appDir, validationDir });
-  if (basename(d) === ".clone") {
-    const app = join(dirname(d), "app");
-    const validation = join(d, "generated", "app");
-    if (existsSync(join(app, "src"))) return asApp(app, existsSync(validation) ? validation : undefined);
+function renderComparison(labels: string[], reps: QualityReport[]): string {
+  const L: string[] = [];
+  const colW = Math.max(12, ...labels.map((l) => l.length + 2));
+  L.push("");
+  L.push(`━━━ comparison ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  L.push("  " + pad("dimension", 15) + labels.map((l) => padL(l, colW)).join(""));
+  const dims = Object.keys(reps[0]!.categories);
+  for (const d of dims) {
+    L.push("  " + pad(d, 15) + reps.map((r) => padL(String(r.categories[d]!.score), colW)).join(""));
   }
-  const generatedSuffix = `${sep}.clone${sep}generated${sep}app`;
-  if (d.endsWith(generatedSuffix)) {
-    const cloneDir = d.slice(0, -`${sep}generated${sep}app`.length);
-    const app = join(dirname(cloneDir), "app");
-    if (existsSync(join(app, "src"))) return asApp(app, d);
-  }
-  if (basename(d) === "generated" && existsSync(join(d, "app", "src"))) {
-    const cloneDir = dirname(d);
-    const app = join(dirname(cloneDir), "app");
-    if (basename(cloneDir) === ".clone" && existsSync(join(app, "src"))) return asApp(app, join(d, "app"));
-  }
-  return { inputDir: d, scanDir: d };
+  L.push("  " + pad("GRADE", 15) + reps.map((r) => padL(`${r.grade} (${r.total})`, colW)).join(""));
+  return L.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 function main(): void {
   const args = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-  let targets: Target[];
-  if (args.length) targets = args.map(normalizeTarget);
-  else {
-    // Auto: every output/<site>/app deliverable.
-    const outRoot = resolve("output");
-    const sites = existsSync(outRoot)
-      ? readdirSync(outRoot).map((s) => join(outRoot, s, "app")).filter((p) => existsSync(join(p, "src")))
-      : [];
-    targets = sites.map(normalizeTarget);
-  }
-  targets = targets.filter((t) => existsSync(t.scanDir));
-  if (!targets.length) { console.error("no app trees found — pass dirs explicitly"); process.exit(1); }
+  const asJson = process.argv.includes("--json");
+  const targets = (args.length ? args.map((a) => resolve(a)) : discoverTargets()).filter(isAppDir);
+  if (!targets.length) { console.error("no app trees found — pass app dirs explicitly (e.g. runs/<site>/latest/generated/app)"); process.exit(1); }
 
-  // A readable column label: the deliverable dir's parent name, or the scanned dir name.
-  const label = (t: Target): string => (basename(dirname(t.scanDir)) || basename(t.scanDir)).slice(0, 16);
-  const labels = targets.map(label);
-  const audits = targets.map(audit);
-  audits.forEach((a, i) => { a["files (tsx+css)"] = fileCount(targets[i]!.scanDir); });
+  const labels = targets.map(labelFor);
+  const reports = targets.map((t) => scoreApp(t));
 
-  const keys = Object.keys(audits[0]!);
-  const w0 = Math.max(...keys.map((k) => k.length));
-  const colW = Math.max(11, ...labels.map((l) => l.length));
-  const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
-  console.log("\n" + pad("metric", w0) + "  " + labels.map((l) => pad(l, colW)).join(""));
-  console.log("─".repeat(w0 + 2 + colW * labels.length));
-  for (const k of keys) {
-    if (audits[0]![k] === -1) { console.log(pad(k, w0)); continue; } // section header
-    const cells = audits.map((a) => pad(String(a[k] ?? 0), colW)).join("");
-    console.log(pad(k, w0) + "  " + cells);
+  if (asJson) {
+    console.log(JSON.stringify(reports.map((r, i) => ({ label: labels[i], ...r })), null, 2));
+    return;
   }
-  console.log("\n(counts; lower is better in the BAD block, higher in the GOOD block. 'decimal' = the\n arbitrary value's px isn't a whole pixel — the frozen-measurement tell.)\n");
+
+  for (let i = 0; i < reports.length; i++) console.log(renderReport(labels[i]!, reports[i]!));
+  if (reports.length > 1) console.log(renderComparison(labels, reports));
+  console.log("\n(scores are out of each dimension's max; grade is the weighted blend, capped to\n D-range if any single file/line/blob is in catastrophic payload territory.)\n");
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

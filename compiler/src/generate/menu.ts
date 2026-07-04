@@ -94,7 +94,7 @@ export function dropdownMenuImportPath(depth: number): string {
 
 /** The fixed DropdownMenu client component, written once per generated app. */
 export const DROPDOWN_MENU_TSX = `"use client";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
 type RTMenu = { trigger: string; hoverOpen: boolean; gap: number; align: "left" | "right"; html: string };
 const byCid = (cid: string): HTMLElement | null => document.querySelector('[data-cid="' + cid + '"]');
@@ -103,10 +103,10 @@ const byCid = (cid: string): HTMLElement | null => document.querySelector('[data
  *  user interaction does it inject the captured panel fragment under its trigger. The base
  *  render is therefore unchanged. */
 export default function DropdownMenu({ menus }: { menus: RTMenu[] }) {
-  const wired = useRef(false);
   useEffect(() => {
-    if (wired.current) return;
-    wired.current = true;
+    const ac = new AbortController();
+    const { signal } = ac;
+    const openPanels: HTMLElement[] = [];
     for (const m of menus) {
       const trig = byCid(m.trigger);
       if (!trig) continue;
@@ -127,27 +127,41 @@ export default function DropdownMenu({ menus }: { menus: RTMenu[] }) {
         panel = wrap.firstElementChild as HTMLElement | null;
         if (!panel) return;
         document.body.appendChild(panel);
+        openPanels.push(panel);
         place();
         trig.setAttribute("aria-expanded", "true");
       };
-      const close = () => { if (panel) { panel.remove(); panel = null; } trig.setAttribute("aria-expanded", "false"); };
+      const close = () => {
+        if (panel) {
+          const i = openPanels.indexOf(panel);
+          if (i !== -1) openPanels.splice(i, 1);
+          panel.remove();
+          panel = null;
+        }
+        trig.setAttribute("aria-expanded", "false");
+      };
       const toggle = () => (panel ? close() : open());
       if (m.hoverOpen) {
         const root = trig.parentElement ?? trig;
-        root.addEventListener("mouseenter", open);
-        root.addEventListener("mouseleave", close);
+        root.addEventListener("mouseenter", open, { signal });
+        root.addEventListener("mouseleave", close, { signal });
       } else {
-        trig.addEventListener("click", (e) => { e.preventDefault(); toggle(); });
+        trig.addEventListener("click", (e) => { e.preventDefault(); toggle(); }, { signal });
       }
-      document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); }, { signal });
       document.addEventListener("click", (e) => {
         const t = e.target as Node;
         if (panel && !trig.contains(t) && !panel.contains(t)) close();
-      });
-      window.addEventListener("resize", place);
-      window.addEventListener("scroll", place, { passive: true });
+      }, { signal });
+      window.addEventListener("resize", place, { signal });
+      window.addEventListener("scroll", place, { passive: true, signal });
     }
     (window as any).__dittoMenuReady = true; // wiring done — lets the gate drive deterministically
+    return () => {
+      ac.abort();
+      // Remove any still-open panels appended to document.body so unmount leaves no orphan nodes.
+      for (const p of openPanels.splice(0)) p.remove();
+    };
   }, [menus]);
   return null;
 }

@@ -151,7 +151,7 @@ export function accordionJsx(specs: AccordionRuntimeSpec[], indent: number): str
 }
 
 export const ACCORDION_TSX = `"use client";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
 type CapStyle = Record<string, string>;
 type RTAcc = { trigger: string; region: string; expanded: boolean; triggerOn: CapStyle; triggerOff: CapStyle; regionShown: CapStyle; regionHidden: CapStyle };
@@ -167,10 +167,9 @@ function applyStyle(el: HTMLElement | null, s: CapStyle) {
 /** Wires captured accordion rows with small explicit state.
  *  Hydration initializes the captured base state, then clicks toggle only the target row. */
 export default function Accordion({ specs }: { specs: AccordionSpec[] }) {
-  const wired = useRef(false);
   useEffect(() => {
-    if (wired.current) return;
-    wired.current = true;
+    const ac = new AbortController();
+    const { signal } = ac;
     for (const spec of specs) {
       const state = spec.items.map((it) => it.expanded);
       const renderItem = (i: number) => {
@@ -193,10 +192,11 @@ export default function Accordion({ specs }: { specs: AccordionSpec[] }) {
           e.preventDefault();
           state[i] = !state[i];
           renderItem(i);
-        });
+        }, { signal });
         renderItem(i);
       });
     }
+    return () => ac.abort();
   }, [specs]);
   return null;
 }
@@ -204,7 +204,7 @@ export default function Accordion({ specs }: { specs: AccordionSpec[] }) {
 
 /** The fixed DittoWire client component, written once per generated app. */
 export const DITTO_WIRE_TSX = `"use client";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
 type CapStyle = Record<string, string>;
 type RTTab = { trigger: string; panel: string; triggerOn: CapStyle; triggerOff: CapStyle; panelShown: CapStyle; panelHidden: CapStyle; descendants?: Record<string, CapStyle> };
@@ -235,10 +235,9 @@ function applyDesc(d?: Record<string, CapStyle>) {
  *  on mount: the server-rendered markup + per-node CSS already reproduce the captured
  *  base state exactly, so state styles are applied only on user interaction. */
 export default function DittoWire({ spec }: { spec: Spec }) {
-  const wired = useRef(false);
   useEffect(() => {
-    if (wired.current) return;
-    wired.current = true;
+    const ac = new AbortController();
+    const { signal } = ac;
     if (spec.kind === "tabs") {
       let active = spec.active;
       const render = () => spec.tabs.forEach((t, i) => {
@@ -254,7 +253,7 @@ export default function DittoWire({ spec }: { spec: Spec }) {
       spec.tabs.forEach((t, i) => {
         const trig = byCid(t.trigger);
         if (!trig) return;
-        trig.addEventListener("click", (e) => { e.preventDefault(); active = i; render(); });
+        trig.addEventListener("click", (e) => { e.preventDefault(); active = i; render(); }, { signal });
         trig.addEventListener("keydown", (e) => {
           const k = (e as KeyboardEvent).key;
           if (k === "ArrowRight" || k === "ArrowLeft") {
@@ -263,7 +262,7 @@ export default function DittoWire({ spec }: { spec: Spec }) {
             render();
             byCid(spec.tabs[active].trigger)?.focus();
           }
-        });
+        }, { signal });
       });
       // No initial render() — the static base state is already correct.
     } else if (spec.kind === "accordion") {
@@ -278,7 +277,7 @@ export default function DittoWire({ spec }: { spec: Spec }) {
       };
       spec.items.forEach((it, i) => {
         const trig = byCid(it.trigger);
-        if (trig) trig.addEventListener("click", (e) => { e.preventDefault(); state[i] = !state[i]; renderItem(i); });
+        if (trig) trig.addEventListener("click", (e) => { e.preventDefault(); state[i] = !state[i]; renderItem(i); }, { signal });
       });
       // No initial renderItem — the static base state is already correct.
     } else if (spec.kind === "carousel") {
@@ -293,9 +292,9 @@ export default function DittoWire({ spec }: { spec: Spec }) {
       };
       const nextEl = spec.next ? byCid(spec.next) : null;
       const prevEl = spec.prev ? byCid(spec.prev) : null;
-      nextEl?.addEventListener("click", (e) => { e.preventDefault(); go(index + 1); });
-      prevEl?.addEventListener("click", (e) => { e.preventDefault(); go(index - 1); });
-      spec.bullets.forEach((b, bi) => byCid(b)?.addEventListener("click", (e) => { e.preventDefault(); go(bi); }));
+      nextEl?.addEventListener("click", (e) => { e.preventDefault(); go(index + 1); }, { signal });
+      prevEl?.addEventListener("click", (e) => { e.preventDefault(); go(index - 1); }, { signal });
+      spec.bullets.forEach((b, bi) => byCid(b)?.addEventListener("click", (e) => { e.preventDefault(); go(bi); }, { signal }));
       // No initial go() — the static base state is already correct.
     } else {
       // Disclosure: dropdown / mega-menu / modal — a trigger reveals a hidden overlay.
@@ -311,18 +310,19 @@ export default function DittoWire({ spec }: { spec: Spec }) {
           if (o) applyDesc(it.descendants);
           if (o) panel.removeAttribute("hidden"); else panel.setAttribute("hidden", "");
         };
-        trig.addEventListener("click", (e) => { e.preventDefault(); set(it.isDialog ? true : !open); });
+        trig.addEventListener("click", (e) => { e.preventDefault(); set(it.isDialog ? true : !open); }, { signal });
         if (it.hoverOpen) {
           const root = trig.parentElement ?? trig;
-          root.addEventListener("mouseenter", () => set(true));
-          root.addEventListener("mouseleave", () => set(false));
+          root.addEventListener("mouseenter", () => set(true), { signal });
+          root.addEventListener("mouseleave", () => set(false), { signal });
         }
-        it.closes.forEach((c) => byCid(c)?.addEventListener("click", (e) => { e.preventDefault(); set(false); }));
-        if (it.backdropClose) panel.addEventListener("click", (e) => { if (e.target === panel) set(false); });
-        document.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Escape" && open) set(false); });
+        it.closes.forEach((c) => byCid(c)?.addEventListener("click", (e) => { e.preventDefault(); set(false); }, { signal }));
+        if (it.backdropClose) panel.addEventListener("click", (e) => { if (e.target === panel) set(false); }, { signal });
+        document.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Escape" && open) set(false); }, { signal });
       });
       // No initial set() — the static base state is already correct.
     }
+    return () => ac.abort();
   }, [spec]);
   return null;
 }

@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { writeText } from "../util/fsx.js";
-import type { IR, IRNode, IRChild, IRTextNode } from "../normalize/ir.js";
+import type { IR, IRNode, IRChild, IRTextNode, StyleMap } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import { generateCss, RESET_CSS } from "./css.js";
 import { generateInteractionCss } from "./interactionCss.js";
@@ -17,7 +17,7 @@ import { buildClassMap } from "./classMap.js";
 import { buildTailwind, tailwindGlobalsCss } from "./tailwind.js";
 import { planSections, type SectionPlan } from "./sectionSplit.js";
 import type { RecipeReport } from "../infer/recipes.js";
-import { emitSeoAssetFiles, emitSeoRoutes, jsonLdHeadMarkup, metadataExport, routeSummaryFromIr, seoStaticFiles, viewportExport, type SeoInventory } from "./seo.js";
+import { emitSeoAssetFiles, emitSeoRoutes, jsonLdHeadMarkup, metadataExport, routeSummaryFromIr, seoStaticFiles, siteOriginImportLine, SITE_ORIGIN_LAYOUT_IMPORT, SITE_ORIGIN_MODULE, viewportExport, type SeoInventory } from "./seo.js";
 import { emitGeneratedDocs } from "./docs.js";
 
 const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
@@ -282,6 +282,17 @@ function jsxText(raw: string): string {
   return `{${escapeText(raw)}}`;
 }
 
+/** Collapse a text run under `white-space: normal` the way CSS renders it: every run of
+ *  whitespace (captured \n\t indentation, doubled spaces) becomes a single space, so the
+ *  markup carries content — not the source file's frozen formatting. Leading/trailing single
+ *  spaces are KEPT (JSX-significant for inline flow); the boundary is preserved so `word <b>x</b>`
+ *  keeps its space. A run that is entirely whitespace collapses to a single space. The text gate
+ *  compares whitespace-normalized (gates.ts:normText), so this stays faithful. */
+function collapseWs(raw: string): string {
+  const collapsed = raw.replace(/\s+/g, " ");
+  return collapsed;
+}
+
 /** The ordered [propKey, valueExpr] list a node emits — rendered to clean JSX attributes
  *  by renderAttrs. Each valueExpr is ready-to-emit JS source (a JSON literal,
  *  `true`, or a `{ __html: … }` object). Component extraction reuses this so the
@@ -358,11 +369,20 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
       if (kept.length === 0) continue;
       value = kept.join(", ");
     } else if (key === "href") {
-      // Preserve in-page anchors. For multi-route sites a linkRewrite maps internal
-      // links to the generated clone routes (and collapsed-collection links to their
-      // representative); otherwise absolutize so it never 404s inside the clone
-      // (external navigation is allowed by the rubric).
-      if (!value.startsWith("#")) value = ctx?.linkRewrite ? ctx.linkRewrite(value) : resolveUrl(value, sourceUrl);
+      // A `javascript:*` href (announcement bars, JS-driven buttons authored as links) is a
+      // script trigger, not a navigable URL. React refuses to render one: it rewrites the
+      // attribute to a long `javascript:throw new Error('React has blocked a javascript: URL…')`
+      // string, which no longer matches the source href in the link gate. The behaviour is
+      // script we don't reproduce anyway, so emit an inert `#` and keep the anchor navigable-inert.
+      if (/^\s*javascript:/i.test(value)) {
+        value = "#";
+      } else if (!value.startsWith("#")) {
+        // Preserve in-page anchors. For multi-route sites a linkRewrite maps internal
+        // links to the generated clone routes (and collapsed-collection links to their
+        // representative); otherwise absolutize so it never 404s inside the clone
+        // (external navigation is allowed by the rubric).
+        value = ctx?.linkRewrite ? ctx.linkRewrite(value) : resolveUrl(value, sourceUrl);
+      }
     }
 
     let reactName = isCustom ? key : (ATTR_RENAME[key] ?? key);
@@ -380,24 +400,44 @@ export function propsList(node: IRNode, assetMap: Map<string, string>, sourceUrl
 
   if (isVideo && !videoLocal && !props.some(([k]) => k === "preload")) props.push(["preload", JSON.stringify("none")]);
 
+  // A canvas emitted as its raster still (<img> — see resolveTag) is decorative
+  // painted surface with no captured alt text; emit alt="" so the img is valid.
+  if (node.tag === "canvas" && node.attrs.src && !props.some(([k]) => k === "alt")) props.push(["alt", JSON.stringify("")]);
+
   if (node.rawHTML && node.tag === "svg") {
     // Strip the Stage-4 capture-id (`data-cid-cap`) the interaction pass stamps on
     // elements: it's internal instrumentation, render-inert, and would otherwise
     // surface verbatim in the markup and (post-extraction) as a bogus data field.
     const inner = svgInnerForNode(node, ctx);
     const svgAttrs = extractSvgAttrs(node.rawHTML);
-    let hasFillAttr = false;
+    let rawFill: string | undefined;
     for (const [k, v] of svgAttrs) {
-      if (k.toLowerCase() === "fill") hasFillAttr = true;
+      if (k.toLowerCase() === "fill") { rawFill = v; continue; } // the root fill is resolved below, not copied verbatim
       if (k === "class" || k === "style" || k === "data-cid-cap" || k.includes(":")) continue;
       const reactName = SVG_ATTR_RENAME[k] ?? k;
       const propKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(reactName) ? reactName : JSON.stringify(reactName);
       if (!props.some(([pk]) => pk === propKey)) props.push([propKey, JSON.stringify(v)]);
     }
-    // Raw SVG icons often rely on site CSS (`svg { fill: currentColor }` or a class) that is
-    // stripped during extraction. If the root didn't declare a fill, inherit the surrounding text
-    // color so monochrome wordmarks/icons don't fall back to the browser's black default.
-    if (!hasFillAttr && !props.some(([pk]) => pk === "fill")) props.push(["fill", JSON.stringify("currentColor")]);
+    // Reconcile the root fill against the captured COMPUTED paint. A raw `fill="none"` only looks
+    // unfilled: site CSS (`fill: currentColor` on the wordmark, an inherited color) may actually
+    // paint it, and that CSS is stripped during extraction. resolveSvgRootFill recovers the real
+    // paint — as currentColor when the computed fill tracks the element's color (emit that color
+    // too), else the literal value — and leaves a genuinely unfilled svg as fill="none". When the
+    // root declared no fill at all we fall back to currentColor so monochrome icons don't drop to
+    // the browser's black default.
+    if (!props.some(([pk]) => pk === "fill")) {
+      const resolved = resolveSvgRootFill(rawFill, node.svgPaint);
+      if (resolved.mode === "keep") {
+        if (rawFill !== undefined) props.push(["fill", JSON.stringify(rawFill)]);
+      } else if (resolved.mode === "emit") {
+        props.push(["fill", JSON.stringify(resolved.value!)]);
+        if (resolved.emitColor && !props.some(([pk]) => pk === "color")) {
+          props.push(["color", JSON.stringify(resolved.emitColor)]);
+        }
+      } else {
+        props.push(["fill", JSON.stringify("currentColor")]);
+      }
+    }
     props.push(["dangerouslySetInnerHTML", `{ __html: ${JSON.stringify(inner)} }`]);
   }
 
@@ -443,6 +483,50 @@ function extractSvgAttrs(outerHTML: string): Array<[string, string]> {
     out.push([name, val]);
   }
   return out;
+}
+
+/** A resolved paint value is "real" (paints something) when it is neither absent nor an explicit
+ * non-paint (`none`) nor fully transparent. `currentColor` counts as real (it paints the inherited
+ * color). Case/whitespace-insensitive. */
+export function isRealPaint(value: string | null | undefined): boolean {
+  const v = (value ?? "").trim().toLowerCase();
+  if (!v || v === "none" || v === "transparent") return false;
+  if (v === "rgba(0, 0, 0, 0)" || v === "rgba(0,0,0,0)") return false;
+  return true;
+}
+
+/**
+ * Decide what `fill` an inline <svg> ROOT should emit, reconciling the raw `fill` attribute against
+ * the svg's COMPUTED paint (captured from the live source). Pure and deterministic.
+ *
+ * - Raw `fill` present and itself a real paint → keep it (`keep`): the author meant that fill.
+ * - Raw `fill="none"` but the computed fill IS a real paint → the root only looked unfilled because
+ *   `fill="none"` is a presentation attribute the site's CSS overrode. Recover the real paint:
+ *   emit `currentColor` when the computed fill equals the computed `color` (a `fill: currentColor`
+ *   class — the common wordmark case; caller must also emit `color`), else the literal computed fill.
+ * - Raw `fill="none"` and computed fill also not a real paint → genuinely unfilled: keep `none`.
+ * - Raw `fill` absent → `fallback`: caller applies its existing currentColor default.
+ */
+export function resolveSvgRootFill(
+  rawFill: string | null | undefined,
+  computed?: { fill?: string; color?: string } | null,
+): { mode: "keep" | "fallback" | "emit"; value?: string; emitColor?: string } {
+  const raw = (rawFill ?? "").trim();
+  if (raw && raw.toLowerCase() !== "none") return { mode: "keep" };
+  if (raw.toLowerCase() === "none") {
+    const cf = computed?.fill;
+    if (isRealPaint(cf)) {
+      const color = (computed?.color ?? "").trim();
+      // fill:currentColor resolves to the element's color; recover it as currentColor so the clone
+      // tracks whatever color the surrounding CSS supplies, and signal the caller to emit that color.
+      if (color && cf!.trim().toLowerCase() === color.toLowerCase() && isRealPaint(color)) {
+        return { mode: "emit", value: "currentColor", emitColor: color };
+      }
+      return { mode: "emit", value: cf!.trim() };
+    }
+    return { mode: "keep" }; // genuinely unfilled — leave fill="none"
+  }
+  return { mode: "fallback" };
 }
 
 // SVG presentation attributes that React requires in camelCase (kebab in JSX is silently
@@ -546,6 +630,12 @@ export function resolveTag(node: IRNode, insideInteractive: boolean, insideTable
   // children inside <iframe> are unrendered fallback content, so emit a <div> container
   // carrying the iframe's box/styles (CSS is keyed by cid, so the geometry is identical).
   if (tag === "iframe" && node.children.some((c) => !isTextChild(c))) tag = "div";
+  // A canvas is runtime-drawn surface the clone cannot reproduce; when capture
+  // rasterized it (canvas-still synthetic URL stamped as `src` — see
+  // captureCanvasStillsInPage) emit the still as an <img> filling the canvas's box
+  // (CSS is keyed by cid, so the geometry is identical). A canvas with no still
+  // keeps rendering as an empty <canvas> box, same as before.
+  if (tag === "canvas" && node.attrs.src) tag = "img";
   if (TABLE_SCOPED.has(tag) && !insideTable) tag = "div"; // orphan table element → neutral box
   if (violatesContentModel(node, tag)) tag = "div";
   return tag;
@@ -591,7 +681,7 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
     return `${pad}<${tag}${attrs} />`;
   }
 
-  const childParts = emitChildren(node.children, tag, assetMap, sourceUrl, indent + 1, childInteractive, ctx, childTable);
+  const childParts = emitChildren(node.children, tag, assetMap, sourceUrl, indent + 1, childInteractive, ctx, childTable, preservesWhitespace(node));
   if (childParts.length === 0) {
     return `${pad}<${tag}${attrs} />`;
   }
@@ -602,7 +692,7 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
  *  `{Name_data.map(...)}` call for any run of extracted-component instances. Shared
  *  by renderNode (parentTag is the element tag) and the body/chrome fragment
  *  renderers (parentTag null → no element-only-parent whitespace rule). */
-function emitChildren(children: IRChild[], parentTag: string | null, assetMap: Map<string, string>, sourceUrl: string, indent: number, childInteractive: boolean, ctx?: RenderCtx, insideTable = false): string[] {
+function emitChildren(children: IRChild[], parentTag: string | null, assetMap: Map<string, string>, sourceUrl: string, indent: number, childInteractive: boolean, ctx?: RenderCtx, insideTable = false, preserveWs = false): string[] {
   const pad = "  ".repeat(indent);
   const parts: string[] = [];
   // Coalesce consecutive text children into one. Emitting them as separate JSX
@@ -612,7 +702,12 @@ function emitChildren(children: IRChild[], parentTag: string | null, assetMap: M
   let textBuf = "";
   const flushText = () => {
     if (parentTag && ELEMENT_ONLY_PARENTS.has(parentTag) && textBuf.trim() === "") { textBuf = ""; return; }
-    if (textBuf.length) parts.push(`${pad}${jsxText(textBuf)}`);
+    // Under white-space:normal, collapse the captured formatting (\n\t runs, doubled/leading
+    // multi-space) to CSS-equivalent single spaces so markup ships content, not source-file
+    // indentation. A whitespace-only run collapses to a single significant space ({" "}) — the
+    // huge `{"          "}` literals disappear. Preserve verbatim under pre/pre-wrap/pre-line.
+    const out = preserveWs ? textBuf : collapseWs(textBuf);
+    if (out.length) parts.push(`${pad}${jsxText(out)}`);
     textBuf = "";
   };
   const reg = ctx?.components;
@@ -708,12 +803,20 @@ function takeCid(coll: CidCollector, instances: IRNode[]): number {
   return idx;
 }
 
-/** A self-contained class-name merger emitted into each component module that needs it
- *  (kept import-free so component files stay standalone). Skips falsy parts and joins —
- *  exact for our output because a node's baked base classes and its per-instance overrides
- *  are disjoint token sets. Swap in `tailwind-merge` if you want conflict-aware merging
- *  when hand-editing the ./_styles overrides. */
-const CN_HELPER = `function cn(...parts: Array<string | false | null | undefined>) {\n  return parts.filter(Boolean).join(" ");\n}`;
+/** The single shared `cn()` module (`src/lib/utils.ts`), imported by every module that
+ *  merges class names — one definition per clone instead of a copy per component file.
+ *  Skips falsy parts and joins — exact for our output because a node's baked base classes
+ *  and its per-instance overrides are disjoint token sets. Swap in `tailwind-merge` if you
+ *  want conflict-aware merging when hand-editing the ./_styles overrides. */
+export const CN_UTILS_MODULE = `export function cn(...parts: Array<string | false | null | undefined>) {\n  return parts.filter(Boolean).join(" ");\n}\n`;
+
+/** The `import { cn } from "…/lib/utils"` line a module emits when it references `cn(`.
+ *  `depth` is how many directory levels the consuming file sits BELOW `src` (page.tsx in
+ *  `src/app` → 1; a component in `src/app/components` → 2), so the relative path always
+ *  resolves to the single `src/lib/utils`. */
+export function cnImportLine(depth: number): string {
+  return `import { cn } from "${"../".repeat(Math.max(1, depth))}lib/utils";`;
+}
 
 /** Split a className value SOURCE (a JSON string literal as emitted by propsList) into its
  *  whitespace-separated tokens. Returns [] for a non-string / unparseable source. */
@@ -850,6 +953,15 @@ function canonicalViewportFor(n: IRNode): number {
   if (n.computedByVp[1280] || n.visibleByVp[1280] !== undefined) return 1280;
   const keys = Object.keys(n.computedByVp).map(Number).filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
   return keys[0] ?? 1280;
+}
+
+/** Whether a node's `white-space` preserves captured whitespace verbatim (pre/pre-wrap/pre-line/
+ *  break-spaces) — in which case emission must NOT collapse its text runs. `<pre>`/`<textarea>`
+ *  default to pre even without an explicit declaration. Normal/nowrap collapse per CSS. */
+function preservesWhitespace(n: IRNode): boolean {
+  const ws = (n.computedByVp[canonicalViewportFor(n)] ?? Object.values(n.computedByVp)[0])?.whiteSpace;
+  if (ws) return /^(pre|pre-wrap|pre-line|break-spaces)$/.test(ws);
+  return n.tag === "pre" || n.tag === "textarea";
 }
 
 type TextLeaf = { text: string; node: IRNode; index: number; ancestorTags: string[] };
@@ -1594,7 +1706,8 @@ export function componentPreamble(reg: ComponentRegistry | undefined): string {
   const cids = reg.cidDecls.map((c) => `const ${c.varName}: string[][] = ${c.body};`);
   const styles = reg.styleDecls.map((s) => `const ${s.varName} = ${s.body};`);
   const fns = [...reg.funcDefs.values()];
-  const cn = fns.some((f) => f.includes("cn(")) ? [CN_HELPER] : [];
+  // Inlined into a chrome module at src/app (layout.tsx) or src/ (Chrome.tsx) — depth 1.
+  const cn = fns.some((f) => f.includes("cn(")) ? [cnImportLine(1)] : [];
   const parts = [...cn, ...fns, ...data, ...cids, ...styles];
   return parts.length ? parts.join("\n\n") : "";
 }
@@ -1818,13 +1931,13 @@ function describeComponent(name: string): string {
   return map[base] ?? `${base.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()} component.`;
 }
 
-export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgRegistry): Array<{ name: string; module: string }> {
+export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgRegistry, depth = 2): Array<{ name: string; module: string }> {
   if (!reg || reg.funcDefs.size === 0) return [];
   return [...reg.funcDefs].map(([name, src]) => {
     const agg = reg.byName.get(name);
     void agg;
     const header = `/** ${describeComponent(name)} */`;
-    const cnDef = src.includes("cn(") ? CN_HELPER + "\n" : "";
+    const cnImport = src.includes("cn(") ? cnImportLine(depth) : "";
     // The component's props-data type is DEFINED here (colocated), not imported from a central content
     // file — and exported so the section that supplies the data can type its array. Per-instance class
     // overrides still come from _styles.ts (pure styling plumbing).
@@ -1842,9 +1955,9 @@ export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgReg
     for (const c of scanRefs(src).comps) {
       if (svgs?.defs.has(c)) svgImports.push(`import ${c} from "../svgs/${svgFileBase(c)}";`);
     }
-    const imports = [...typeImports, ...svgImports];
+    const imports = [...typeImports, ...svgImports, ...(cnImport ? [cnImport] : [])];
     const importBlock = imports.length ? imports.join("\n") + "\n" : "";
-    return { name, module: `${importBlock}${typeDef}${header}\n${cnDef}export default ${src}\n` };
+    return { name, module: `${importBlock}${typeDef}${header}\nexport default ${src}\n` };
   });
 }
 
@@ -2082,6 +2195,7 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
     ];
     const params = paramParts.length ? `{ ${paramParts.join(", ")} } = {}` : "";
     const header = `/** ${describeSection(name)} */`;
+    if (/\bcn\(/.test(body)) lines.push(cnImportLine(2)); // sections live at src/app/sections
     const importBlock = lines.length ? lines.join("\n") + "\n" : "";
     const allConsts = consts;
     const constBlock = allConsts.length ? allConsts.join("\n") + "\n" : "";
@@ -2121,6 +2235,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
     hasMotion ? `import DittoMotion from "${dittoMotionImportPath(0)}";` : "",
     hasLottie ? `import DittoLottie from "${dittoLottieImportPath(0)}";` : "",
     hasMenus ? `import DropdownMenu from "${dropdownMenuImportPath(0)}";` : "",
+    /\bcn\(/.test(body) ? cnImportLine(1) : "", // page.tsx lives at src/app
     ...compImports,
   ].filter(Boolean).join("\n");
   const importBlock = imports ? imports + "\n\n" : "";
@@ -2137,31 +2252,33 @@ ${body}${wiresBlock}${accordionBlock}${motionBlock}${lottieBlock}${menusBlock}
 /** SEO scaffolding (Next App Router): robots.ts + sitemap.ts + an llms.txt route, generated
  *  from the captured URL / title / description — the discovery files a real site ships. */
 function seoFiles(ir: IR): Array<[string, string]> {
-  let origin = "https://example.com";
-  try { origin = new URL(ir.doc.sourceUrl).origin; } catch { /* keep default */ }
-  const url = ir.doc.sourceUrl || origin + "/";
   const title = ir.doc.title || "Home";
   const desc = ir.doc.head?.description || "";
+  // robots.ts / sitemap.ts live at src/app → depth 1 below src. URLs resolve against the
+  // clone's own origin (SITE_ORIGIN, relative by default), never the source domain.
+  const siteImport = siteOriginImportLine(1);
   const robots = `import type { MetadataRoute } from "next";
+${siteImport}
 
 export const dynamic = "force-static";
 
 export default function robots(): MetadataRoute.Robots {
   return {
     rules: { userAgent: "*", allow: "/" },
-    sitemap: ${JSON.stringify(origin + "/sitemap.xml")},
+    sitemap: SITE_ORIGIN + "/sitemap.xml",
   };
 }
 `;
   const sitemap = `import type { MetadataRoute } from "next";
+${siteImport}
 
 export const dynamic = "force-static";
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  return [{ url: ${JSON.stringify(url)}, changeFrequency: "weekly", priority: 1 }];
+  return [{ url: SITE_ORIGIN + "/", changeFrequency: "weekly", priority: 1 }];
 }
 `;
-  const llmsText = [`# ${title}`, ...(desc ? ["", `> ${desc}`] : []), "", "## Pages", "", `- [${title}](${url})`, ""].join("\n");
+  const llmsText = [`# ${title}`, ...(desc ? ["", `> ${desc}`] : []), "", "## Pages", "", `- [${title}](/)`, ""].join("\n");
   const llms = `export const dynamic = "force-static";
 
 export function GET() {
@@ -2183,10 +2300,11 @@ function generateLayoutTsx(ir: IR, bodyClass?: string, seo?: SeoInventory): stri
   const viewport = seo ? viewportExport(seo) : `export const viewport = { width: "device-width", initialScale: 1 };\n`;
   const jsonLd = seo ? jsonLdHeadMarkup(seo, 8) : "";
   const head = jsonLd ? `      <head>\n${jsonLd}\n      </head>\n` : "";
+  const siteImport = seo ? SITE_ORIGIN_LAYOUT_IMPORT + "\n" : "";
   return `import "./globals.css";
 import "./ditto.css";
 import type { ReactNode } from "react";
-
+${siteImport}
 ${metadata}${viewport}
 
 export default function RootLayout({ children }: { children: ReactNode }) {
@@ -2201,10 +2319,36 @@ ${head}      <body${bodyAttrs}>
 `;
 }
 
+const TRANSPARENT_BG = "rgba(0, 0, 0, 0)";
+
+/** Decide what background (if any) the clone's `html` element should paint.
+ *
+ * Per CSS 2.1 §14.2, when `html` is transparent the `body` background propagates
+ * to the canvas and paints *beneath* every descendant — including negative-z-index
+ * layers (full-bleed hero video/image/canvas backdrops). The moment `html` paints
+ * an opaque background, `body` stops propagating and paints its own in-flow block
+ * background, which sits *above* negative-z descendants and buries them.
+ *
+ * So we only give `html` a background when the SOURCE `html` actually painted one.
+ * A transparent source `html` stays transparent (returns null → no rule emitted), so
+ * the captured body background propagates to the canvas exactly as in the source.
+ * The white fallback applies only when BOTH html and body are transparent, otherwise
+ * the UA-default canvas would show through. Deterministic: pure function of the IR. */
+export function resolveHtmlBg(pv: { htmlBg?: string; bodyBg?: string } | undefined): string | null {
+  const srcHtmlBg = pv?.htmlBg && pv.htmlBg !== TRANSPARENT_BG ? pv.htmlBg : null;
+  const srcBodyBg = pv?.bodyBg && pv.bodyBg !== TRANSPARENT_BG ? pv.bodyBg : null;
+  return srcHtmlBg ?? (srcBodyBg ? null : "#ffffff");
+}
+
+/** `html { background: … }` rule, or empty string when html should stay transparent. */
+export function htmlBgRule(htmlBg: string | null): string {
+  return htmlBg !== null ? `html { background: ${htmlBg}; }\n` : "";
+}
+
 function generateGlobalsCss(ir: IR, fontGraph: FontGraph, tokensCss: string): string {
   const cw = ir.doc.canonicalViewport;
   const pv = ir.doc.perViewport[cw];
-  const htmlBg = pv?.htmlBg && pv.htmlBg !== "rgba(0, 0, 0, 0)" ? pv.htmlBg : (pv?.bodyBg ?? "#ffffff");
+  const htmlBg = resolveHtmlBg(pv);
   // If the SOURCE page never scrolls horizontally (its scrollWidth fits the
   // viewport at every captured width), neither should the clone. JS-driven
   // widgets (custom-element carousels, sliders) position children off-axis via
@@ -2222,8 +2366,7 @@ ${fontGraph.css}
 ${tokensCss}
 
 /* page base */
-html { background: ${htmlBg}; }
-body { font-family: ${SYSTEM_FALLBACK}; }${clip}
+${htmlBgRule(htmlBg)}body { font-family: ${SYSTEM_FALLBACK}; }${clip}
 `;
 }
 
@@ -2345,17 +2488,113 @@ ${input}
 `;
 }
 
-function recipeResponsiveClassCleaner(recipes: RecipeReport | undefined, opts: { tailwind: boolean }): (cid: string, className: string | undefined) => string | undefined {
+// Number of explicit column tracks in a computed `grid-template-columns` value. The capture
+// resolves the property to a used track list (e.g. `284px 284px 284px`), so track count is the
+// whitespace-separated token count; `none`/empty means the element is not a track grid.
+function computedTrackCount(value: string | undefined): number {
+  if (!value || value === "none") return 0;
+  return value.trim().split(/\s+/).filter(Boolean).length;
+}
+
+// Resolved px widths of the explicit column tracks in a computed `grid-template-columns` value. The
+// capture resolves the property to a used track list (`260px 1020px`), so each token is a definite
+// px length. Non-px tokens (`auto`, `min-content`, a leftover `1fr`) make the track set unquantifiable
+// and yield null — the plan then cannot claim the tracks are uniform.
+function computedTrackWidths(value: string | undefined): number[] | null {
+  if (!value || value === "none") return null;
+  const toks = value.trim().split(/\s+/).filter(Boolean);
+  const out: number[] = [];
+  for (const t of toks) {
+    const m = /^(-?\d*\.?\d+)px$/.exec(t);
+    if (!m) return null;
+    out.push(parseFloat(m[1]!));
+  }
+  return out.length ? out : null;
+}
+
+// A `grid-cols-N` plan rewrites the container to `repeat(N, minmax(0, 1fr))` — N EQUAL tracks. It is
+// only a faithful replacement for the authored template when the computed tracks actually are ~equal
+// width. An asymmetric template (`260px 1fr` → a 260/1020 sidebar layout) has the same track COUNT as
+// the heuristic column count but a different geometry; collapsing it to equal halves destroys the
+// authored layout, so such templates always keep their computed tracks.
+function tracksNearEqual(widths: number[]): boolean {
+  if (widths.length <= 1) return true;
+  const max = Math.max(...widths);
+  const min = Math.min(...widths);
+  if (!(max > 0)) return false;
+  // Tolerance: a couple of px (gap/rounding) or 2% of the widest track, whichever is larger.
+  return max - min <= Math.max(1.5, 0.02 * max);
+}
+
+// Track span of a grid item from its resolved `grid-column-start`/`grid-column-end`. A spanning
+// item (`span 2`, or an explicit line pair `1 / 3`) means row-length item-counting under-reports
+// the real track count, so the column-count heuristic is not trustworthy for this container.
+function computedColumnSpan(cs: StyleMap | undefined): number {
+  if (!cs) return 1;
+  const end = cs["gridColumnEnd"];
+  const start = cs["gridColumnStart"];
+  const span = /^span\s+(\d+)$/.exec(end ?? "") ?? /^span\s+(\d+)$/.exec(start ?? "");
+  if (span) return Math.max(1, Number(span[1]));
+  if (start && end && /^-?\d+$/.test(start) && /^-?\d+$/.test(end)) {
+    const diff = Number(end) - Number(start);
+    if (Number.isFinite(diff) && diff > 1) return diff;
+  }
+  return 1;
+}
+
+export function recipeResponsiveClassCleaner(ir: IR, recipes: RecipeReport | undefined, opts: { tailwind: boolean }): (cid: string, className: string | undefined) => string | undefined {
   const recipeParents = new Set<string>();
   const repeatedGridParents = new Set<string>();
   const fillGridParents = new Set<string>();
+  // Containers whose computed geometry agreed with the item-count heuristic — a genuinely uniform
+  // repeated grid the recipe may re-flow. Row-track utilities are only stripped here; on containers
+  // where the geometry disagreed (spanning items / differing track count) the authored row and
+  // column tracks are ground truth and must survive.
+  const uniformGridParents = new Set<string>();
   const columnPlans = new Map<string, string[]>();
+  const nodeByCid = new Map<string, IRNode>();
+  const index = (n: IRNode): void => { nodeByCid.set(n.id, n); for (const c of n.children) if (!isTextChild(c)) index(c); };
+  index(ir.root);
+  // The captured/computed grid geometry is ground truth. A recipe may add semantic structure, but
+  // its column count is inferred by grouping item bounding boxes into rows — which under-reports the
+  // real track count whenever an item spans multiple columns. Before letting a recipe's synthesized
+  // column plan override the authored grid, cross-check it against the computed `grid-template-columns`
+  // track count and per-item `grid-column` spans at each regime viewport. On disagreement, keep the
+  // emitted (computed) geometry and drop the plan so spans and track count survive.
+  const planAgreesWithComputed = (c: RecipeReport["candidates"][number], regimeVps: number[]): boolean => {
+    const parent = c.itemParentCid ? nodeByCid.get(c.itemParentCid) : undefined;
+    if (!parent) return false;
+    const itemCids = (c.repeatedItems ?? []).map((i) => i.cid);
+    for (const vp of regimeVps) {
+      const gtc = parent.computedByVp[vp]?.["gridTemplateColumns"];
+      const tracks = computedTrackCount(gtc);
+      // Only trust the heuristic where the computed grid actually is a track grid at this viewport.
+      if (tracks === 0) continue;
+      const regime = c.responsiveRegimes.find((r) => r.viewport === vp);
+      const heuristicCols = regime?.columns ?? 0;
+      if (heuristicCols > 0 && heuristicCols !== tracks) return false;
+      // A `grid-cols-N` plan means N EQUAL tracks. If the computed tracks are asymmetric (a sidebar
+      // template like `260px 1020px`), the count agrees but the geometry does not — collapsing to
+      // equal columns would destroy the authored layout. Keep the authored template in that case.
+      if (tracks >= 2) {
+        const widths = computedTrackWidths(gtc);
+        if (!widths || !tracksNearEqual(widths)) return false;
+      }
+      for (const cid of itemCids) {
+        if (computedColumnSpan(nodeByCid.get(cid)?.computedByVp[vp]) > 1) return false;
+      }
+    }
+    return true;
+  };
   const gridColumnTokens = (c: RecipeReport["candidates"][number]): string[] | null => {
     if (c.kind !== "card-grid" && c.kind !== "feature-grid" && c.kind !== "product-grid") return null;
     const regimes = c.responsiveRegimes
       .filter((r) => (r.visibleItems ?? 0) > 0 && (r.columns ?? 0) > 0)
       .sort((a, b) => a.viewport - b.viewport);
     if (regimes.length < 2) return null;
+    // The computed track geometry disagrees with the item-count heuristic (spanning items or a
+    // differing track count) — defer to the authored grid rather than synthesize a column plan.
+    if (!planAgreesWithComputed(c, regimes.map((r) => r.viewport))) return null;
     const prefixFor = (vp: number): string => vp >= 1536 ? "2xl:" : vp >= 1024 ? "lg:" : vp >= 768 ? "md:" : "";
     const tokens: string[] = [];
     let last: number | undefined;
@@ -2377,6 +2616,12 @@ function recipeResponsiveClassCleaner(recipes: RecipeReport | undefined, opts: {
   for (const c of recipes?.candidates ?? []) {
     if ((c.kind === "card-grid" || c.kind === "feature-grid" || c.kind === "product-grid" || c.kind === "gallery-showcase" || c.kind === "logo-cloud") && c.confidence >= 0.86 && c.itemParentCid) {
       recipeParents.add(c.itemParentCid);
+      // A container is a uniform repeated grid only if its computed track geometry agrees with the
+      // item-count heuristic at every sampled regime viewport (no spanning items, matching track
+      // count). Non-grid containers (flex/stack) have no computed tracks to disagree with, so they
+      // stay eligible; a track grid whose geometry disagrees is excluded and keeps its authored rows.
+      const sampledVps = c.responsiveRegimes.map((r) => r.viewport);
+      if (planAgreesWithComputed(c, sampledVps)) uniformGridParents.add(c.itemParentCid);
       if (c.kind === "card-grid" || c.kind === "feature-grid" || c.kind === "product-grid" || c.kind === "gallery-showcase") repeatedGridParents.add(c.itemParentCid);
       if (c.kind === "card-grid" || c.kind === "feature-grid" || c.kind === "product-grid") fillGridParents.add(c.itemParentCid);
       const columns = gridColumnTokens(c);
@@ -2390,8 +2635,8 @@ function recipeResponsiveClassCleaner(recipes: RecipeReport | undefined, opts: {
     const columnPlan = opts.tailwind ? columnPlans.get(cid) : undefined;
     const keep = tokens.filter((token) => {
       if (columnPlan && /^(?:[a-z0-9-]+:)*grid-cols-(?:\d+|\[[^\]]+\])$/.test(token)) return false;
-      if (/^(?:[a-z0-9-]+:)*grid-rows-\[(?:auto_?)+\]$/.test(token)) return false;
-      if (repeatedGridParents.has(cid) && /^(?:[a-z0-9-]+:)*grid-rows-\d+$/.test(token)) return false;
+      if (uniformGridParents.has(cid) && /^(?:[a-z0-9-]+:)*grid-rows-\[(?:auto_?)+\]$/.test(token)) return false;
+      if (uniformGridParents.has(cid) && repeatedGridParents.has(cid) && /^(?:[a-z0-9-]+:)*grid-rows-\d+$/.test(token)) return false;
       const initialCols = /^(?:(.*):)?grid-cols-\[initial\]$/.exec(token);
       if (initialCols) {
         const prefix = initialCols[1] ? `${initialCols[1]}:` : "";
@@ -2436,9 +2681,12 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const mode = input.humanizeMode ?? "tailwind";
   // Tailwind mode (default): translate each node's exact decls to utility classes.
   // CSS mode: dedup into shared semantic CSS classes. Both fidelity-neutral.
-  const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow }) : undefined;
+  // Lottie mount boxes are pinned to their captured height (replaced-like) so the runtime player's
+  // aspect-sized svg fills a definite box instead of inflating. The spec item cid IS the mount cid.
+  const lottieMounts = new Set(lottieSpec.items.map((it) => it.cid));
+  const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow, lottieMounts }) : undefined;
   const classMap = humanize && mode === "css" ? buildClassMap(ir, assetMap, input.colorVar, input.primitives, input.tokenResolver) : undefined;
-  const cleanRecipeClass = recipeResponsiveClassCleaner(input.recipeReport, { tailwind: !!tw });
+  const cleanRecipeClass = recipeResponsiveClassCleaner(ir, input.recipeReport, { tailwind: !!tw });
   const classOf = tw ? (cid: string) => cleanRecipeClass(cid, tw.classOf.get(cid)) : classMap ? (cid: string) => classMap.classOf.get(cid) : undefined;
   const styleOf = tw ? (cid: string) => tw.styleOf.get(cid) : undefined;
   // Section split (single-page humanized): plan section roots, render each into its own
@@ -2527,7 +2775,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   if (tw) {
     const cw = ir.doc.canonicalViewport;
     const pv = ir.doc.perViewport[cw];
-    const htmlBg = pv?.htmlBg && pv.htmlBg !== "rgba(0, 0, 0, 0)" ? pv.htmlBg : (pv?.bodyBg ?? "#ffffff");
+    const htmlBg = resolveHtmlBg(pv);
     const noHScroll = Object.entries(ir.doc.perViewport).every(([vp, d]) => d.scrollWidth <= Number(vp) * 1.03);
     const clip = noHScroll ? "\nhtml, body { overflow-x: clip; }" : "";
     const globals = tailwindGlobalsCss({
@@ -2541,6 +2789,9 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
     writeText(join(rootDir, "globals.css"), framework === "vite" ? viteGlobalsCss(globals) : globals);
   }
   writeText(join(rootDir, "ditto.css"), cloneCss);
+  writeText(join(appDir, "src", "lib", "utils.ts"), CN_UTILS_MODULE);
+  // SITE_ORIGIN constant for SEO/metadata routes (Next only — Vite ships static SEO files).
+  if (framework === "next") writeText(join(appDir, "src", "lib", "site.ts"), SITE_ORIGIN_MODULE);
   if (wires.length) writeText(join(rootDir, "ditto", "DittoWire.tsx"), DITTO_WIRE_TSX);
   if (accordions.length) writeText(join(rootDir, "ditto", "Accordion.tsx"), ACCORDION_TSX);
   if (motionHasContent(motionSpec)) writeText(join(rootDir, "ditto", "DittoMotion.tsx"), DITTO_MOTION_TSX);

@@ -195,3 +195,54 @@ describe("generated Next config", () => {
     assert.ok(NEXT_CONFIG.includes("devIndicators: false"));
   });
 });
+
+describe("SEO origin references the clone, not the source domain (fix 6)", () => {
+  it("sitemap.ts / robots.ts resolve against SITE_ORIGIN, not the source origin", () => {
+    const ir = fixtureIr();
+    const report = buildSeoInventory(ir, fixtureAssets(), fixtureCapture());
+    const files = seoRouteFiles(report, [routeSummaryFromIr(ir, "/", "/", ir.doc.sourceUrl)]);
+    const robots = files.find(([p]) => p === "robots.ts")![1];
+    const sitemap = files.find(([p]) => p === "sitemap.ts")![1];
+    for (const body of [robots, sitemap]) {
+      assert.ok(body.includes('import { SITE_ORIGIN } from "../lib/site";'), "imports SITE_ORIGIN");
+      assert.ok(body.includes("SITE_ORIGIN +"), "builds URLs from SITE_ORIGIN");
+      assert.ok(!body.includes("example.test"), "never bakes the source domain");
+    }
+    // sitemap path is relativized off the source origin.
+    assert.ok(sitemap.includes('SITE_ORIGIN + "/seo"') || sitemap.includes('SITE_ORIGIN + "/"'));
+  });
+
+  it("metadata sets metadataBase from SITE_ORIGIN and relativizes the canonical", () => {
+    const ir = fixtureIr();
+    const report = buildSeoInventory(ir, fixtureAssets(), fixtureCapture());
+    const metadata = metadataExport(report);
+    assert.ok(metadata.includes('new URL(SITE_ORIGIN || "http://localhost:3000")'), "metadataBase from SITE_ORIGIN");
+    assert.ok(metadata.includes('"canonical": "/seo"'), "canonical relativized to a path");
+    // The source domain must not survive in canonical (og:image assets are localized elsewhere).
+    assert.ok(!metadata.includes('"canonical": "https://example.test'), "canonical is not absolute to source");
+  });
+
+  it("relativizes og:url off the source origin", () => {
+    const ir = fixtureIr();
+    ir.doc.head!.meta!.push({ property: "og:url", content: "https://example.test/seo" });
+    const report = buildSeoInventory(ir, fixtureAssets(), fixtureCapture());
+    const metadata = metadataExport(report);
+    assert.ok(metadata.includes('"url": "/seo"'), "og:url relativized to a path");
+    assert.ok(!metadata.includes('"url": "https://example.test/seo"'), "og:url not absolute to source");
+  });
+
+  it("rewrites on-origin JSON-LD @id/url off the source domain via SITE_ORIGIN", () => {
+    const ir = fixtureIr();
+    // JSON-LD carrying the source origin in @id/url (escaped-slash form, like WordPress emits).
+    ir.doc.head!.jsonLd = [{
+      id: "graph",
+      text: '{"@context":"https:\\/\\/schema.org","@id":"https:\\/\\/example.test\\/#website","url":"https:\\/\\/example.test\\/"}',
+    }];
+    const report = buildSeoInventory(ir, fixtureAssets(), fixtureCapture());
+    const markup = jsonLdHeadMarkup(report);
+    assert.ok(markup.includes(".join(SITE_ORIGIN)"), "rejoins segments with SITE_ORIGIN at runtime");
+    // The source origin must not survive as a literal (schema.org context is off-origin, kept).
+    assert.ok(!markup.includes("example.test"), "source origin removed from JSON-LD");
+    assert.ok(markup.includes("schema.org"), "off-origin @context left untouched");
+  });
+});

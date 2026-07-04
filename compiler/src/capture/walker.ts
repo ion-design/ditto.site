@@ -44,6 +44,18 @@ export type RawNode = {
   computed: RawStyle;
   bbox: RawBBox;
   visible: boolean;
+  // A font-metric / measurement scratch node injected by the SOURCE site's own JS (typography
+  // libraries, FontFaceObserver): absolutely positioned, parked far off-screen, and non-painting.
+  // Never user-visible; excluded from emission so it doesn't ship as page markup.
+  probe?: boolean;
+  // This element hosts an OPEN shadow root: its serialized children are the composed (flattened)
+  // shadow tree — the shadowRoot's children with each <slot> replaced by its assigned light-DOM
+  // nodes — NOT the host's light-DOM children. Custom elements (`<product-info>`) render all their
+  // swatches/title/price inside this shadow tree, so a childNodes-only walk captured them empty.
+  shadowHost?: boolean;
+  // This node was serialized from inside a shadow tree (a shadowRoot descendant, or the shadow
+  // subtree of a slotted light node). Tagged so generation can emit it as ordinary light DOM.
+  inShadow?: boolean;
   sizing?: RawSizing;
   before?: RawStyle;
   after?: RawStyle;
@@ -51,6 +63,10 @@ export type RawNode = {
   // clone renders the browser's default gray, losing the authored placeholder color/type.
   placeholder?: RawStyle;
   rawHTML?: string; // set for inline <svg>
+  // Computed paint of an inline <svg> root (fill/stroke/color). A raw `fill="none"` attribute may
+  // still resolve to a real paint via site CSS (`fill: currentColor`); these resolved values let
+  // codegen recover a paint the extraction stripped. Set only for svg roots.
+  svgPaint?: { fill: string; stroke: string; color: string };
   children: RawChild[];
 };
 
@@ -64,6 +80,10 @@ export type FontFace = {
   display?: string;
   unicodeRange?: string;
   stretch?: string;
+  // Url of the stylesheet this face was declared in (undefined for an inline <style>, or for faces
+  // parsed out-of-band where the base is already baked into `src`). The src descriptor's relative
+  // url()s resolve against this, not the document — see readRules and parseSrcUrls.
+  baseHref?: string;
 };
 
 export type PageSnapshot = {
@@ -134,6 +154,11 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     "letterSpacing", "wordSpacing", "textAlign", "textTransform",
     "textDecorationLine", "textDecorationColor", "textDecorationStyle",
     "whiteSpace", "wordBreak", "overflowWrap", "textOverflow", "textIndent",
+    // Modern line-wrapping: `text-wrap: balance/pretty` rebalances heading line breaks
+    // (getComputedStyle reports the shorthand — "balance"/"pretty"/"wrap"). Without it a
+    // balanced heading wraps differently in the clone (an even two-line title collapses
+    // to a lopsided break). Default "wrap" is elided downstream.
+    "textWrap",
     "textShadow", "fontVariantCaps", "fontFeatureSettings",
     // Line clamping (`display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:N`):
     // the mechanism that keeps cards equal height regardless of text length. Without it the engine
@@ -286,7 +311,24 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     return true;
   };
 
-  const serializeElement = (el: Element): RawNode | null => {
+  // A measurement/probe scratch node: out-of-flow (absolute/fixed), parked far off-screen
+  // (≥10000px beyond any edge — real drawers/sr-only content never live out there), AND
+  // non-painting (visibility:hidden / collapse / opacity:0). The two together are exclusive to
+  // font-metric / measurement scratch elements the source's own JS injects (a11y sr-only text
+  // stays visibility:visible so AT can read it, so it never matches). Tagged so emission drops it.
+  const OFFSCREEN_PROBE_PX = 10000;
+  const isProbe = (cs: CSSStyleDeclaration, bbox: RawBBox): boolean => {
+    if (cs.position !== "absolute" && cs.position !== "fixed") return false;
+    const nonPainting = cs.visibility === "hidden" || cs.visibility === "collapse" || parseFloat(cs.opacity || "1") === 0;
+    if (!nonPainting) return false;
+    const rightEdge = bbox.x + bbox.width;
+    const bottomEdge = bbox.y + bbox.height;
+    const pageH = round2(scrollEl.scrollHeight);
+    return rightEdge <= -OFFSCREEN_PROBE_PX || bottomEdge <= -OFFSCREEN_PROBE_PX
+      || bbox.x >= OFFSCREEN_PROBE_PX + vpW || bbox.y >= OFFSCREEN_PROBE_PX + pageH;
+  };
+
+  const serializeElement = (el: Element, inShadow = false): RawNode | null => {
     if (nodeCount >= MAX_NODES) { truncated = true; return null; }
     const tag = el.tagName.toLowerCase();
     nodeCount++;
@@ -359,9 +401,36 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
         const hf = el.getBoundingClientRect().height;
         // Tight 0.5px: only call a dimension "reproduced" when auto/100% lands essentially exactly,
         // so a drop can't accumulate a visible shift across many elements (favours fidelity).
+        let hAuto = Math.abs(ha - r.height) <= 0.5;
+        let hFill = Math.abs(hf - r.height) <= 0.5;
+        // Circular-height guard: a box whose fill child (height:100%) pins it back up makes BOTH
+        // `height:auto` and `height:100%` reproduce the box, so the raw verdict reads hAuto (drop) —
+        // even though the height is authored (e.g. `100vh` on a hero, an explicit px section). Both
+        // sides then wait on each other and the box collapses. When this element's own cascade/inline
+        // style declares an explicit definite height, trust that declaration: the height is authored,
+        // so it is neither content-sized (hAuto) nor a parent fill (hFill). Only overrides when auto
+        // actually reproduced — a genuine explicit height that auto already shrinks stays hAuto:false.
+        if ((hAuto || hFill) && r.height > 2 && authorsExplicitHeight(el, sh)) {
+          hAuto = false;
+          hFill = false;
+        }
+        let wAuto = Math.abs(wa - r.width) <= 0.5;
+        let wFill = Math.abs(wf - r.width) <= 0.5;
+        // Circular-WIDTH guard (the mirror of the height guard above): an authored `width:24px` inside a
+        // SHRINK-TO-FIT parent (a color-swatch link in a span that shrink-wraps to it) makes BOTH
+        // `width:auto` and `width:100%` reproduce the box — the parent's width still holds while the
+        // child re-measures — so the raw verdict reads wAuto/wFill (drop) and the clone collapses the
+        // child to 0 content width (and the shrink-wrap span to its borders). When this element's own
+        // cascade/inline style declares an explicit definite width, trust it: the width is authored, so
+        // it is neither content-sized (wAuto) nor a parent fill (wFill). Only overrides when a probe
+        // actually reproduced — a genuine explicit width that auto already shrinks stays wAuto:false.
+        if ((wAuto || wFill) && r.width > 2 && authorsExplicitWidth(el, sw)) {
+          wAuto = false;
+          wFill = false;
+        }
         sizing = {
-          wAuto: Math.abs(wa - r.width) <= 0.5, wFill: Math.abs(wf - r.width) <= 0.5, hAuto: Math.abs(ha - r.height) <= 0.5,
-          hFill: Math.abs(hf - r.height) <= 0.5,
+          wAuto, wFill, hAuto,
+          hFill,
           wMin: Math.round(wmin * 100) / 100, wMax: Math.round(wmax * 100) / 100,
         };
       } finally {
@@ -401,6 +470,8 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       computed,
       bbox,
       visible: isVisible(el, cs, bbox),
+      ...(isProbe(cs, bbox) ? { probe: true } : {}),
+      ...(inShadow ? { inShadow: true } : {}),
       ...(sizing ? { sizing } : {}),
       children: [],
     };
@@ -429,6 +500,14 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     // Inline SVG → raw markup, no recursion.
     if (tag === "svg") {
       node.rawHTML = el.outerHTML;
+      // Capture the svg root's COMPUTED paint (fill/stroke/color) separately from the general
+      // computed-prop list. A raw `fill="none"` presentation attribute paints nothing on its own; a
+      // wordmark/icon is visible on the source only because site CSS (a `fill: currentColor` class,
+      // an inherited `color`) overrides it. Extraction strips that CSS, so the raw attribute alone is
+      // misleading — codegen consults these resolved values to decide whether the root truly paints.
+      try {
+        node.svgPaint = { fill: cs.fill, stroke: cs.stroke, color: cs.color };
+      } catch { /* getComputedStyle already read above; guard against exotic UAs */ }
       return node;
     }
 
@@ -436,8 +515,28 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     // code blocks with highlighted spans separated by newlines).
     const preserveWs = /^(pre|pre-wrap|break-spaces)/.test(cs.whiteSpace || "");
 
+    // Composed (flattened) child list — the tree the user actually sees, matching what
+    // getComputedStyle/getBoundingClientRect already report for every node:
+    //   - An open shadow HOST renders its shadow tree, not its light children: iterate the
+    //     shadowRoot's children and tag them (and the host) so generation emits them as light DOM.
+    //   - A <slot> is a placeholder for the light-DOM nodes distributed into it: replace it with its
+    //     assignedNodes (or its own fallback children when nothing is assigned). Assigned nodes are
+    //     the author's real light content, so they are NOT tagged inShadow — only genuine shadow
+    //     descendants are. Walking the shadow tree (never the host's raw light children) means a
+    //     slotted child is serialized once, at the slot position, with no double-emission.
+    const sr = (el as HTMLElement).shadowRoot; // open roots only; closed roots are null here
+    let childInShadow = inShadow;
+    let childNodes: Node[];
+    if (sr) {
+      node.shadowHost = true;
+      childInShadow = true;
+      childNodes = Array.from(sr.childNodes);
+    } else {
+      childNodes = Array.from(el.childNodes);
+    }
+
     // Recurse children (elements + text nodes), preserving order.
-    for (const child of Array.from(el.childNodes)) {
+    for (const child of childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
         const t = child.textContent || "";
         if (preserveWs && t.length > 0) {
@@ -457,8 +556,28 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       }
       if (child.nodeType !== Node.ELEMENT_NODE) continue;
       const childEl = child as Element;
-      if (SKIP_TAGS.has(childEl.tagName.toLowerCase())) continue;
-      const sn = serializeElement(childEl);
+      const childTag = childEl.tagName.toLowerCase();
+      if (SKIP_TAGS.has(childTag)) continue;
+      // A slot nested deeper inside a shadow tree: expand its assigned light nodes in place. The
+      // assigned nodes are light DOM (author content), so they drop back to inShadow=false.
+      if (childTag === "slot" && childInShadow) {
+        const assigned = (childEl as HTMLSlotElement).assignedNodes({ flatten: true });
+        const slotKids = assigned.length ? assigned : Array.from(childEl.childNodes);
+        for (const sk of slotKids) {
+          if (sk.nodeType === Node.TEXT_NODE) {
+            const t = sk.textContent || "";
+            if (t.trim().length > 0) node.children.push({ text: t });
+            continue;
+          }
+          if (sk.nodeType !== Node.ELEMENT_NODE) continue;
+          const skEl = sk as Element;
+          if (SKIP_TAGS.has(skEl.tagName.toLowerCase())) continue;
+          const skn = serializeElement(skEl, assigned.length ? false : true);
+          if (skn) node.children.push(skn);
+        }
+        continue;
+      }
+      const sn = serializeElement(childEl, childInShadow);
       if (sn) node.children.push(sn);
     }
 
@@ -470,22 +589,107 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
   const cssUrlSet = new Set<string>();
   const keyframes: string[] = [];
   const cssVars: Record<string, string> = {};
+  // Selectors that AUTHOR an explicit, definite height/min-height (px/rem/em/vh/vw/…,
+  // NOT auto, NOT a percentage, NOT a keyword). Harvested once from the cascade below and
+  // consulted by the sizing probe to break circular parent/child height verdicts: when a box
+  // and its fill child mutually justify each other's height, `height:auto` reproduces the box
+  // for a reason that is NOT "content-sized", so the probe alone reads hAuto:true and the
+  // authored dimension gets dropped downstream. A declared explicit length is ground truth that
+  // the height is load-bearing, so we trust the declaration over the reflow verdict.
+  const explicitHeightSelectors: string[] = [];
+  // The WIDTH twin of explicitHeightSelectors: selectors that author an explicit definite `width`/
+  // `min-width` (px/rem/em/…, not auto/%/keyword). Consulted by the sizing probe to break a CIRCULAR
+  // width verdict — an authored `width:24px` inside a shrink-to-fit parent reproduces at both auto and
+  // 100% (the parent's width still holds), so the probe alone reads wAuto and the authored width gets
+  // dropped, collapsing the box in the clone.
+  const explicitWidthSelectors: string[] = [];
 
-  const absUrl = (u: string): string => {
-    try { return new URL(u, document.baseURI).href; } catch { return u; }
+  const absUrl = (u: string, base?: string): string => {
+    try { return new URL(u, base || document.baseURI).href; } catch { return u; }
   };
 
-  const harvestUrlsFromText = (text: string): void => {
+  // A relative url() inside a stylesheet resolves against THAT STYLESHEET'S url, not the document —
+  // `url("../media/x.woff2")` in `/a/b/css/sheet.css` points at `/a/b/media/x.woff2`, which is a
+  // different file from the document-relative `/media/x.woff2`. Resolving font/image srcs against
+  // `document.baseURI` fetches the wrong path (often the SPA router's 200+HTML shell), so a harvested
+  // face src must carry its owning sheet's base. Walk up through `@import` nesting (parentStyleSheet
+  // via ownerRule) to the nearest sheet that actually has an href; an inline `<style>` has none, so
+  // it correctly falls back to the document base.
+  const sheetBaseHref = (sheet: CSSStyleSheet | null | undefined): string | undefined => {
+    let s: CSSStyleSheet | null | undefined = sheet;
+    // Bound the walk defensively; @import chains are shallow in practice.
+    for (let i = 0; s && i < 32; i++) {
+      if (s.href) return s.href;
+      s = s.ownerRule?.parentStyleSheet ?? null;
+    }
+    return undefined;
+  };
+
+  const harvestUrlsFromText = (text: string, base?: string): void => {
     const re = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
       const raw = m[2];
       if (!raw || raw.startsWith("data:")) continue;
-      cssUrlSet.add(absUrl(raw));
+      cssUrlSet.add(absUrl(raw, base));
     }
   };
 
-  const readRules = (rules: CSSRuleList): void => {
+  // True when a `height`/`min-height` value is an explicit, definite length the browser resolves
+  // to a fixed px box (px/rem/em/vh/vw/vmin/vmax/ch/…, or a calc/min/max/clamp over them). False for
+  // `auto`, an empty value, a pure percentage (resolves against the parent — that's the fill case the
+  // hFill probe already handles), `0`, and intrinsic keywords (fit-/min-/max-content). A definite
+  // authored height is load-bearing and must survive even when the reflow probe reads hAuto:true.
+  const isExplicitHeight = (raw: string): boolean => {
+    const v = (raw || "").trim().toLowerCase();
+    if (!v || v === "auto" || v === "0" || v === "0px" || v === "none") return false;
+    if (v === "fit-content" || v === "min-content" || v === "max-content" || v === "inherit" ||
+      v === "initial" || v === "unset" || v === "revert" || v === "revert-layer") return false;
+    // A bare percentage resolves against the parent (fill), not an authored definite length.
+    if (/^[\d.]+%$/.test(v)) return false;
+    // A definite length unit (or a calc()/min()/max()/clamp() that contains one) anchors the box.
+    return /(?:^|[\s(*/+-])[\d.]+(?:px|rem|em|vh|vw|vmin|vmax|svh|lvh|dvh|cm|mm|in|pt|pc|ex|ch|q)\b/.test(v);
+  };
+
+  // Does this element author an explicit definite height — via its own inline style (passed as
+  // `inlineHeight`, already read by the probe) or via any matched cascade rule harvested into
+  // `explicitHeightSelectors`? getComputedStyle resolves height to used px (so `100vh` reads as a
+  // plain number and is indistinguishable from a content height there); the specified value is only
+  // recoverable from the inline declaration and the cascade, which is why we consult both.
+  const authorsExplicitHeight = (el: Element, inlineHeight: string): boolean => {
+    if (isExplicitHeight(inlineHeight)) return true;
+    try {
+      const inlineMin = (el as HTMLElement).style?.getPropertyValue("min-height") || "";
+      if (isExplicitHeight(inlineMin)) return true;
+    } catch { /* ignore */ }
+    for (const sel of explicitHeightSelectors) {
+      try { if (el.matches(sel)) return true; } catch { /* invalid/unsupported selector */ }
+    }
+    return false;
+  };
+
+  // The WIDTH twin of authorsExplicitHeight: does this element author an explicit definite width via
+  // its own inline style (`inlineWidth`, already read by the probe) or any matched harvested rule?
+  // `isExplicitHeight` is unit-agnostic (it only rejects auto/%/keywords and matches definite lengths),
+  // so it doubles as the width predicate.
+  const authorsExplicitWidth = (el: Element, inlineWidth: string): boolean => {
+    if (isExplicitHeight(inlineWidth)) return true;
+    try {
+      const inlineMin = (el as HTMLElement).style?.getPropertyValue("min-width") || "";
+      if (isExplicitHeight(inlineMin)) return true;
+    } catch { /* ignore */ }
+    for (const sel of explicitWidthSelectors) {
+      try { if (el.matches(sel)) return true; } catch { /* invalid/unsupported selector */ }
+    }
+    return false;
+  };
+
+  // `base` is the url of the stylesheet these rules live in (undefined for an inline <style>, which
+  // resolves against the document). It is threaded so every harvested url() — @font-face src and
+  // ordinary style-rule url() alike — resolves relative to its OWNING sheet, not the page. The src
+  // string is left verbatim on the FontFace (parseSrcUrls re-absolutizes it downstream against the
+  // same base), but the base still drives the cssUrlSet entry that triggers the download.
+  const readRules = (rules: CSSRuleList, base?: string): void => {
     for (const rule of Array.from(rules)) {
       const type = rule.constructor.name;
       if (type === "CSSFontFaceRule") {
@@ -502,30 +706,77 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
             display: s.getPropertyValue("font-display") || undefined,
             unicodeRange: s.getPropertyValue("unicode-range") || undefined,
             stretch: s.getPropertyValue("font-stretch") || undefined,
+            baseHref: base,
           });
-          harvestUrlsFromText(src);
+          harvestUrlsFromText(src, base);
         }
       } else if (type === "CSSKeyframesRule") {
         keyframes.push((rule as CSSKeyframesRule).cssText);
       } else if (type === "CSSStyleRule") {
         const r = rule as CSSStyleRule;
-        if (r.style && r.style.cssText.includes("url(")) harvestUrlsFromText(r.style.cssText);
+        if (r.style && r.style.cssText.includes("url(")) harvestUrlsFromText(r.style.cssText, base);
+        if (r.selectorText && r.style &&
+          (isExplicitHeight(r.style.getPropertyValue("height")) ||
+            isExplicitHeight(r.style.getPropertyValue("min-height")))) {
+          explicitHeightSelectors.push(r.selectorText);
+        }
+        if (r.selectorText && r.style &&
+          (isExplicitHeight(r.style.getPropertyValue("width")) ||
+            isExplicitHeight(r.style.getPropertyValue("min-width")))) {
+          explicitWidthSelectors.push(r.selectorText);
+        }
       } else if (type === "CSSMediaRule" || type === "CSSSupportsRule") {
-        try { readRules((rule as CSSGroupingRule).cssRules); } catch { /* ignore */ }
+        // Nested grouping rules live in the same sheet — keep the base.
+        try { readRules((rule as CSSGroupingRule).cssRules, base); } catch { /* ignore */ }
       } else if (type === "CSSImportRule") {
+        // The imported sheet is a separate file: its rules resolve against ITS url, falling back to
+        // the importing sheet's base only if the imported sheet reports none.
         const imp = rule as CSSImportRule;
-        try { if (imp.styleSheet) readRules(imp.styleSheet.cssRules); } catch { /* cross-origin */ }
+        try { if (imp.styleSheet) readRules(imp.styleSheet.cssRules, sheetBaseHref(imp.styleSheet) ?? base); } catch { /* cross-origin */ }
       }
     }
   };
 
   for (const sheet of Array.from(document.styleSheets)) {
     try {
-      readRules(sheet.cssRules);
+      readRules(sheet.cssRules, sheetBaseHref(sheet));
     } catch {
       // Cross-origin sheet — record its href so the capture layer can fetch the
       // raw text out-of-band and parse font-faces/urls from it.
       if (sheet.href) cssUrlSet.add(absUrl(sheet.href));
+    }
+  }
+
+  // Custom elements (web components) carry their styles INSIDE their open shadow root — via
+  // `adoptedStyleSheets` (constructable sheets) and/or `<style>`/`<link>` in the shadow tree
+  // (`shadowRoot.styleSheets`). Those sheets never appear in `document.styleSheets`, so an authored
+  // rule like `color-swatch a { width: 24px }` is invisible to the harvest above and the sizing probe
+  // can't see the explicit width. Walk every open shadow root (composed-tree sweep, matching the
+  // serializer) and read its sheets too — same `readRules` (font-faces, url()s, explicit width/height
+  // selectors). Closed roots return null and are skipped, exactly as elsewhere.
+  const shadowRoots: ShadowRoot[] = [];
+  const collectShadowRoots = (): void => {
+    const stack: Element[] = [];
+    const pushChildren = (parent: Element | Document | ShadowRoot): void => {
+      let c = parent.firstElementChild;
+      while (c) { stack.push(c); c = c.nextElementSibling; }
+    };
+    pushChildren(document);
+    // Depth-first over the composed element tree, descending into every open shadow root.
+    while (stack.length) {
+      const node = stack.pop()!;
+      const sr = (node as HTMLElement).shadowRoot;
+      if (sr) { shadowRoots.push(sr); pushChildren(sr); }
+      pushChildren(node);
+    }
+  };
+  try { collectShadowRoots(); } catch { /* ignore */ }
+  for (const sr of shadowRoots) {
+    const sheets: CSSStyleSheet[] = [];
+    try { sheets.push(...(sr.adoptedStyleSheets || [])); } catch { /* ignore */ }
+    try { sheets.push(...Array.from(sr.styleSheets || [])); } catch { /* ignore */ }
+    for (const sheet of sheets) {
+      try { readRules(sheet.cssRules, sheetBaseHref(sheet)); } catch { if ((sheet as CSSStyleSheet).href) cssUrlSet.add(absUrl((sheet as CSSStyleSheet).href!)); }
     }
   }
 

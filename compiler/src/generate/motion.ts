@@ -41,12 +41,31 @@ function capToCid(ir: IR): Map<string, string> {
   return m;
 }
 
+/** Map every IR node's cid → node, so an emission guard can inspect the resolved target. */
+function cidToNode(ir: IR): Map<string, IRNode> {
+  const m = new Map<string, IRNode>();
+  const walk = (n: IRNode): void => {
+    m.set(n.id, n);
+    for (const c of n.children) if (!isTextChild(c)) walk(c);
+  };
+  walk(ir.root);
+  return m;
+}
+
+/** True when an IR node has ≥1 element child. A genuine rotating word/phrase is a text leaf
+ *  (no element children); a container captured as a rotator would have the runtime flatten its
+ *  whole subtree to one text node, destroying every descendant element. */
+function hasElementChild(n: IRNode | undefined): boolean {
+  return !!n && n.children.some((c) => !isTextChild(c));
+}
+
 /** Resolve cap-keyed motion specs to cids that survived into this IR (optionally
  *  scoped by an include filter, for multi-route body/chrome splitting). Specs whose
  *  element was pruned are dropped (left static). */
 export function buildMotionSpec(ir: IR, motion: MotionCapture | undefined, include?: (cid: string) => boolean): MotionSpec {
   if (!motion) return { waapi: [], rotators: [], reveals: [], marquees: [] };
   const map = capToCid(ir);
+  const nodeByCid = cidToNode(ir);
   const ok = (cid: string | undefined): cid is string => !!cid && (!include || include(cid));
   const waapi: RTWaapi[] = [];
   for (const w of motion.waapi as WaapiAnim[]) {
@@ -58,6 +77,11 @@ export function buildMotionSpec(ir: IR, motion: MotionCapture | undefined, inclu
   for (const r of motion.rotators as RotatorSpec[]) {
     const cid = map.get(r.cap);
     if (!ok(cid)) continue;
+    // A rotator cycles the text of a single leaf word/phrase. If the resolved target has element
+    // children, capture misclassified a structural container (e.g. one whose rows were injected at
+    // runtime, uncapped, after cid-cap tagging) as a rotator. Emitting it would let the runtime
+    // flatten every descendant element to one text node; drop it so the static subtree survives.
+    if (hasElementChild(nodeByCid.get(cid))) continue;
     rotators.push({ cid, texts: r.texts, intervalMs: r.intervalMs });
   }
   const reveals: RTReveal[] = [];
@@ -157,7 +181,7 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
   useEffect(() => {
     if ((window as any).__dittoMotionStopped) return; // measurement mode — apply nothing
     const intervals: ReturnType<typeof setInterval>[] = [];
-    const rotators: Array<{ el: HTMLElement; original: string | null }> = [];
+    const rotators: Array<{ el: HTMLElement; original: Node[] }> = [];
     const anims: Animation[] = [];
     // per-reveal "show now" fns (also the cleanup); animate=false jumps to the settled frame
     const revealed: Array<(animate: boolean) => void> = [];
@@ -196,8 +220,15 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
     for (const r of spec.rotators) {
       const el = byCid(r.cid);
       if (!el || r.texts.length < 2) continue;
-      const original = el.textContent;
-      const start = r.texts.findIndex((t) => t === (original || "").replace(/\\s+/g, " ").trim());
+      // Defense in depth: a genuine rotating word is a text leaf. If the target has element
+      // children, it was misclassified (its subtree would be destroyed by a text write) — skip it
+      // so the static structure survives even if the emission guard was bypassed.
+      if (el.childElementCount > 0) continue;
+      // Save the ORIGINAL child nodes (cloned) rather than a flattened textContent string, so the
+      // settle/restore path rebuilds the exact subtree via replaceChildren — never a lossy text
+      // node. For a real text leaf this is just the single text node round-tripped intact.
+      const original = Array.from(el.childNodes).map((n) => n.cloneNode(true));
+      const start = r.texts.findIndex((t) => t === (el.textContent || "").replace(/\\s+/g, " ").trim());
       let i = start < 0 ? 0 : start;
       rotators.push({ el, original });
       intervals.push(setInterval(() => { i = (i + 1) % r.texts.length; el.textContent = r.texts[i]!; }, Math.max(400, r.intervalMs)));
@@ -274,7 +305,7 @@ export default function DittoMotion({ spec }: { spec: MotionSpec }) {
     const stopAll = () => {
       (window as any).__dittoMotionStopped = true;
       for (const id of intervals) clearInterval(id);
-      for (const r of rotators) r.el.textContent = r.original;
+      for (const r of rotators) r.el.replaceChildren(...r.original.map((n) => n.cloneNode(true)));
       for (const a of anims) { try { a.cancel(); } catch { /* ignore */ } }
       if (io) io.disconnect();
       if (forceTimer) clearTimeout(forceTimer);
