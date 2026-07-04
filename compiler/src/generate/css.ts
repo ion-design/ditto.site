@@ -294,7 +294,7 @@ function isFluidFillItem(node: IRNode, layoutParent: IRNode | undefined, viewpor
  *  captured viewport (so gates 0–6, measured only at those widths, are unmoved) yet scales
  *  fluidly everywhere else — the same generalisation `isFluidFullBleed` already applies to
  *  full-viewport elements, extended to "fills/centres within its container". */
-export type WidthPlan = { kind: "fixed" } | { kind: "auto" } | { kind: "percent"; pct: string } | { kind: "percentVp"; pctByVp: Record<number, string> } | { kind: "flexfill" } | { kind: "fill" } | { kind: "fillcap"; cap: string } | { kind: "basis"; px: string };
+export type WidthPlan = { kind: "fixed" } | { kind: "auto" } | { kind: "percent"; pct: string } | { kind: "percentVp"; pctByVp: Record<number, string> } | { kind: "flexfill" } | { kind: "fill" } | { kind: "fillcap"; cap: string } | { kind: "basis"; px: string } | { kind: "basisFull" };
 const PLAN_FIXED: WidthPlan = { kind: "fixed" };
 
 const pf = (v: string | undefined): number => { const n = parseFloat(v ?? ""); return Number.isFinite(n) ? n : 0; };
@@ -530,6 +530,35 @@ function gridAutoTrackMask(node: IRNode, vps: number[], count: number): boolean[
 }
 
 function fluidGridColumns(node: IRNode, viewports: number[]): Map<number, string> | null {
+  // A SINGLE fixed-px grid track that FILLS its container at every sampled viewport is a full-bleed
+  // fill column baked as `grid-cols-[Npx]` (a full-viewport hero carousel `uwp-carousel` with one
+  // track = the viewport width, re-baked per breakpoint). It freezes at the nearest band's px, so the
+  // grid — and everything it lays out — over-widens at any unsampled width (the splide02 hero measuring
+  // 768px inside a 572px window: the whole hero subtree inherits the frozen track). Re-express the lone
+  // track as `minmax(0,1fr)` (fills, reproduces the captured px exactly — gate-neutral). This is proven
+  // purely from the box geometry (track == content), so it is safe even on a REPLACED/custom-element
+  // grid, which the general solver below (it walks children) correctly still skips.
+  {
+    const filled: { vp: number; content: number }[] = [];
+    for (const vp of viewports) {
+      const cs = node.computedByVp[vp]; const nb = node.bboxByVp[vp];
+      if (!cs || !nb) continue;
+      if (!/^(grid|inline-grid)$/.test(cs.display || "")) continue;
+      const tracks = parseTracks(cs.gridTemplateColumns);
+      if (!tracks || tracks.length !== 1) { filled.length = 0; break; }        // must be single-track at EVERY grid vp
+      const gap = pf(cs.columnGap && cs.columnGap !== "normal" ? cs.columnGap : cs.gap);
+      if (gap !== 0) { filled.length = 0; break; }
+      const content = nb.width - pf(cs.paddingLeft) - pf(cs.paddingRight) - pf(cs.borderLeftWidth) - pf(cs.borderRightWidth);
+      if (content <= 0) { filled.length = 0; break; }
+      if (Math.abs(tracks[0]! - content) > Math.max(1.5, 0.01 * content)) { filled.length = 0; break; } // track must FILL
+      filled.push({ vp, content });
+    }
+    if (filled.length >= 2) {
+      const m = new Map<number, string>();
+      for (const f of filled) m.set(f.vp, "minmax(0, 1fr)");
+      return m;
+    }
+  }
   if (REPLACED.has(node.tag) || node.tag.includes("-")) return null;
   type S = { vp: number; tracks: number[]; gap: number; content: number };
   // Replace a solved template's fixed `Npx` tracks with `auto` where the column provably sizes to its
@@ -585,10 +614,17 @@ function fluidGridColumns(node: IRNode, viewports: number[]): Map<number, string
   for (const s of perVp) { const c = s.tracks.length; const g = byCount.get(c); if (g) g.push(s); else byCount.set(c, [s]); }
   const result = new Map<number, string>();
   for (const [count, samples] of byCount) {
-    // Every sample in the regime has ~equal tracks ⇒ a clean `repeat(N, 1fr)`. (1fr divides the
+    // Every sample in the regime has ~equal tracks ⇒ a candidate `repeat(N, 1fr)`. (1fr divides the
     // container content evenly, reproducing the equal baked px at each captured width.)
     const allEqual = samples.every((s) => Math.max(...s.tracks) - Math.min(...s.tracks) <= Math.max(1.5, 0.02 * Math.max(...s.tracks)));
-    const tmpl = allEqual ? `repeat(${count}, minmax(0, 1fr))` : (samples.length >= 2 ? frTemplate(samples, count) : null);
+    // `repeat(N,1fr)` divides the CONTAINER content among the tracks — valid only when the tracks +
+    // gaps actually FILL the container (the same fill law frTemplate enforces before solving an fr
+    // model). A fixed-track scrolling list (`overflow-x:auto` with `grid-cols-[173.5px…]` × 50 summing
+    // to 8675px inside a 1066px container) has equal tracks too, but rewriting it as `repeat(50,1fr)`
+    // shrinks every slide to viewport/50 and kills the horizontal scroll. When the equal tracks
+    // OVERFLOW the container, keep the baked fixed-px template (fall through, leaving these vps unset).
+    const fillsContainer = samples.every((s) => Math.abs(s.tracks.reduce((a, b) => a + b, 0) + (count - 1) * s.gap - s.content) <= Math.max(2, 0.01 * s.content));
+    const tmpl = (allEqual && fillsContainer) ? `repeat(${count}, minmax(0, 1fr))` : (samples.length >= 2 ? frTemplate(samples, count) : null);
     if (tmpl) { const t2 = withAuto(tmpl, samples); for (const s of samples) result.set(s.vp, t2); continue; }
     // Rescue a MIXED-track regime where frTemplate bailed only because the column PROPORTIONS
     // change at a breakpoint — the ridge footer signup grid is 70/30 (`2.333fr 1fr`) at ≥768 but
@@ -908,6 +944,90 @@ function isFlexFillItem(node: IRNode, parentNode: IRNode | undefined, viewports:
     widths.push(pf(cs.width));
   }
   return widths.length >= 2 && Math.max(...widths) - Math.min(...widths) > 8;
+}
+
+/** A CIRCULAR-DEPENDENCY flex/grid item whose width has NO in-flow source and would collapse to 0.
+ *
+ *  A Splide (and similar JS carousel) slide is a `shrink-0` flex item whose width is set only by the
+ *  library's INJECTED inline `width:Npx`. The sizing probe therefore reads it as content/fill-sized
+ *  (`wAuto`/`wFill` both true), so generation drops the width. But the slide's only in-flow children
+ *  FILL it (`w-full h-full`, often `aspect-square`) — they take their width FROM the slide. With the
+ *  slide's width dropped and every child filling, nothing establishes a definite width: the slide, the
+ *  fill children, and the track all resolve to 0×0 (the "Explore Our Oven Range" carousel collapsing
+ *  to a −640px hole).
+ *
+ *  Detect exactly that circular case and pin the captured px so the fill children have a definite basis:
+ *    - the node is an IN-FLOW flex or grid ITEM with `flex-shrink:0` (a carousel slide, never shrinks),
+ *    - it has a definite positive captured width at every painted viewport,
+ *    - it has NO in-flow width source: every in-flow ELEMENT child either FILLS it
+ *      (probe `wFill && !wAuto` → width derives from the slide) or is absolutely/fixed positioned,
+ *      and at least one such fill child exists (the thing that would collapse).
+ *  Requires probe data (older captures return false → inert). Scoped hard so it fires only on the
+ *  genuine circular collapse, never on a normal content-sized shrink-0 item. */
+function isCircularShrinkSlide(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
+  if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return false;
+  let painted = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp]; const nb = node.bboxByVp[vp];
+    if (!cs || !pcs || !nb) continue;
+    if (!node.visibleByVp[vp] || (cs.display || "") === "none") continue; // judge only where painted
+    if (!/^(flex|inline-flex|grid|inline-grid)$/.test(pcs.display || "")) return false; // parent must lay it out as a flex/grid item
+    const pos = cs.position || "static";
+    if (pos !== "static" && pos !== "relative") return false;               // in-flow item only
+    if ((cs.float || "none") !== "none") return false;
+    if (pf(cs.flexShrink) !== 0) return false;                              // a slide is shrink-0 (never collapses to content)
+    if (!(nb.width > 0) || !(pf(cs.width) > 0)) return false;               // need a definite captured px to pin
+    // No in-flow width source: every in-flow element child fills the slide (its width derives from the
+    // slide) or is out of flow; at least one fill child must exist (else nothing collapses).
+    let fillChildren = 0;
+    for (const c of node.children) {
+      if (isTextChild(c)) continue;
+      const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
+      if (!ccs || !cb || !c.visibleByVp[vp] || (ccs.display || "") === "none") continue;
+      const cpos = ccs.position || "static";
+      if (cpos === "absolute" || cpos === "fixed") continue;                // out of flow → no width contribution
+      const csz = c.sizingByVp?.[vp];
+      if (csz && csz.wFill === true && csz.wAuto === false) { fillChildren++; continue; } // fills the slide → derives width from it
+      return false;                                                         // a genuine in-flow width source → not circular
+    }
+    if (fillChildren === 0) return false;
+    painted++;
+  }
+  return painted >= 1;
+}
+
+/** A FULL-WIDTH carousel slide: a `shrink-0` flex-ROW item whose border box FILLS its flex
+ *  container's content width at every painted viewport (a full-viewport hero slide in a Splide list;
+ *  the slides sit side by side and the track clips via overflow). The naive emission `width:100%` on
+ *  a `shrink-0` flex item does NOT stay at 100%: flex sizes the item from its MAX-CONTENT (the
+ *  shrink-0 item can't drop below it), and a full-bleed slide's max-content (its absolutely-positioned
+ *  aspect-ratio media) freezes the whole list wider than the container at any unsampled width (the
+ *  splide02 hero list measuring 768px inside a 572px window). Emitting `flex-basis:100%` gives the
+ *  slide a DEFINITE main size = the container content width, so the flex row stays exactly one
+ *  container wide at every width (gate-neutral at samples, correct in between). Distinct from
+ *  isCircularShrinkSlide (a FIXED-width sub-container slide that pins its captured px). */
+function isFullWidthShrinkSlide(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
+  if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return false;
+  let painted = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const pcs = parentNode.computedByVp[vp];
+    const nb = node.bboxByVp[vp]; const pb = parentNode.bboxByVp[vp];
+    if (!cs || !pcs || !nb || !pb) continue;
+    if (!node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    if (!/^(flex|inline-flex)$/.test(pcs.display || "")) return false;       // flex parent
+    const dir = pcs.flexDirection || "row";
+    if (dir !== "row" && dir !== "row-reverse") return false;                // width is the main axis
+    const pos = cs.position || "static";
+    if (pos !== "static" && pos !== "relative") return false;
+    if ((cs.float || "none") !== "none") return false;
+    if (pf(cs.flexShrink) !== 0) return false;                              // a slide is shrink-0
+    if (pf(cs.marginLeft) !== 0 || pf(cs.marginRight) !== 0) return false;   // margins make the width load-bearing
+    if ((cs.boxSizing || "border-box") === "content-box") return false;     // basis:100% would overflow by padding
+    const content = pb.width - pf(pcs.paddingLeft) - pf(pcs.paddingRight) - pf(pcs.borderLeftWidth) - pf(pcs.borderRightWidth);
+    if (Math.abs(nb.width - content) > 1.5) return false;                    // must actually FILL the flex container
+    painted++;
+  }
+  return painted >= 1;
 }
 
 /** A flex/grid ITEM whose border box fills its container's content width at every viewport —
@@ -1872,6 +1992,12 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
     // child's trailing margin-bottom, because whether that margin extends the box (height includes
     // it) or collapses through depends on the box; we accept the box if its height matches EITHER.
     let bottom = nb.y + pf(cs.paddingTop) + pf(cs.borderTopWidth); let bottomMargin = bottom; let hasChild = false;
+    // Are ALL in-flow element children FILL children (height:100% / probe hFill) whose height DERIVES
+    // from THIS box? Then their extent reaching the box bottom is not content evidence — it is the
+    // box's own authored height reflected back (a `h-full aspect-video` hero image inside a fixed-height
+    // header). Dropping the height then lets the fill child re-derive from its aspect ratio and inflate
+    // (a 240px hero → 720px @16/9). Do NOT flow such a box's height.
+    let allInflowFill = true;
     for (const c of node.children) {
       if (isTextChild(c)) continue;
       const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
@@ -1879,9 +2005,15 @@ function heightFlows(node: IRNode, parentNode: IRNode | undefined, viewports: nu
       if (ccs.position === "absolute" || ccs.position === "fixed") continue;
       if ((ccs.float || "none") !== "none") continue;
       hasChild = true;
+      const csz = c.sizingByVp?.[vp];
+      if (!(csz && csz.hFill === true && csz.hAuto === false)) allInflowFill = false;
       bottom = Math.max(bottom, cb.y + cb.height);
       bottomMargin = Math.max(bottomMargin, cb.y + cb.height + Math.max(0, pf(ccs.marginBottom)));
     }
+    // Authored height whose only in-flow children fill it (circular): keep the height (don't flow).
+    // Guarded by the parent's own probe: hAuto===false means auto did NOT reproduce the box → real
+    // authored height, not a content coincidence.
+    if (hasChild && allInflowFill && node.sizingByVp?.[vp]?.hAuto === false) return false;
     const pad = pf(cs.paddingBottom) + pf(cs.borderBottomWidth);
     const contentH = bottom - nb.y + pad; const contentHMargin = bottomMargin - nb.y + pad;
     // Content-driven when the box is exactly its in-flow children's extent — with OR without their
@@ -2115,6 +2247,9 @@ function declsForViewport(
   // The band-delta machinery collapses equal neighbours, so equal regimes emit a single rule.
   else if (widthPlan.kind === "percentVp") { const p = widthPlan.pctByVp[vp]; if (p) out.set("width", p); }
   else if (widthPlan.kind === "flexfill") { out.set("flex-grow", "1"); out.set("flex-basis", "0%"); }
+  // A full-width shrink-0 carousel slide: definite main size = container content width, so the flex
+  // row stays exactly one container wide (no max-content over-widening). Keeps flex-shrink:0 (source).
+  else if (widthPlan.kind === "basisFull") { out.set("flex-basis", "100%"); out.set("flex-shrink", "0"); }
   // A flex-line item's RECOVERED natural width (its flex base size), emitted as a constant at
   // every viewport so the captured per-viewport px collapse to one value — flex-grow/shrink then
   // re-derives the resolved widths. Verified to reproduce every sample before being chosen.
@@ -2152,6 +2287,11 @@ function declsForViewport(
     let contentBottom = top;       // includes trailing margins (for taller detection)
     let borderBottom = top;        // border-box extent only (for overflow detection)
     let inflowCount = 0;
+    // Are ALL the in-flow element children fill children whose height DERIVES from this
+    // node (height:100% / probe hFill)? If so their measured extent equals this box's
+    // height only BECAUSE they fill it — it is not content-derived evidence, so it must
+    // not be allowed to "explain away" an authored height below.
+    let allInflowFill = true;
     for (const c of node.children) {
       if (isTextChild(c)) continue;
       const ccs = c.computedByVp[vp]; const cb = c.bboxByVp[vp];
@@ -2162,6 +2302,10 @@ function declsForViewport(
       if (ccs.position === "absolute" || ccs.position === "fixed") continue;
       if ((ccs.float || "none") !== "none") continue;
       inflowCount++;
+      const csz = c.sizingByVp?.[vp];
+      // A fill child: the probe measured height:100% reproduces AND auto does not (hFill && !hAuto).
+      // No probe data (older captures) ⇒ treat as real content (conservative: leave allInflowFill off).
+      if (!(csz && csz.hFill === true && csz.hAuto === false)) allInflowFill = false;
       contentBottom = Math.max(contentBottom, cb.y + cb.height + (parseFloat(ccs.marginBottom || "0") || 0));
       borderBottom = Math.max(borderBottom, cb.y + cb.height);
     }
@@ -2169,6 +2313,13 @@ function declsForViewport(
     const contentHeight = contentBottom - nb.y + padBottom;
     if (nb.height > contentHeight + 2) explicitHeight = true;
     if (inflowCount === 0 && nb.height > 2) explicitHeight = true;
+    // Authored height whose only in-flow children FILL it (height:100%). The child extent measured
+    // the parent's own height back at it (circular), so the "taller than content" test above can never
+    // fire — yet dropping the height lets each fill child re-derive its height from content/aspect
+    // (a `h-full aspect-video` child then resolves 16/9 of its width, inflating a 240px hero to 720px).
+    // Keep the authored height so the fill chain has a definite basis. Probe hFill (not `!hAuto` on the
+    // parent) is the guard: hAuto:false on the parent means auto did NOT reproduce, i.e. real authored.
+    if (inflowCount > 0 && allInflowFill && node.sizingByVp?.[vp]?.hAuto === false && nb.height > 2) explicitHeight = true;
     // Overflow case: the box is meaningfully SHORTER than its in-flow content's
     // border boxes. Content cannot shrink a box below its own size, so the height
     // is authored (e.g. html,body{height:100%} with overflowing content). Compare
@@ -2850,7 +3001,15 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     // track. A `flex gap w-1/3` equal-fill row item: re-express as flex:1 1 0 so it scales.
     const gridFill = isGridItemFill(node, parentNode, sampleVps);
     const flexFill = !gridFill && isFlexFillItem(node, parentNode, sampleVps);
-    const fillsContainer = !gridFill && !flexFill && isFillsContainerWidth(node, parentNode, sampleVps);
+    // A carousel slide (`shrink-0` flex/grid item) whose width was set only by the library's injected
+    // inline px and whose children all FILL it → the probe reads it as fill/content and drops the
+    // width, collapsing the slide + its fill children + the track to 0×0. Pin the captured px so the
+    // fill chain has a definite basis. Wins over the probe/fill detectors below (it IS the width source).
+    const circularSlide = !isContents && !gridFill && !flexFill && isCircularShrinkSlide(node, parentNode, sampleVps);
+    // A full-VIEWPORT-width shrink-0 carousel slide → flex-basis:100% (definite main size) instead of
+    // width:100%, so the flex row can't over-widen from the slide's max-content (the splide02 hero).
+    const fullWidthSlide = !isContents && !gridFill && !flexFill && !circularSlide && isFullWidthShrinkSlide(node, parentNode, sampleVps);
+    const fillsContainer = !gridFill && !flexFill && !circularSlide && !fullWidthSlide && isFillsContainerWidth(node, parentNode, sampleVps);
     const replacedFill = replacedFillsContainer(node, parentNode, sampleVps); // an img/video filling its cell → w-full
     const sourceFill = sourceWidthFillIntent(node);
     // A full-bleed banner image (width ≈ viewport, grows) baked to per-vp px → w-full so it keeps
@@ -2864,6 +3023,18 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const blockFill = !gridFill && !flexFill && !fillsContainer && !maxWidthFill && fillsBlockContainer(node, parentNode, sampleVps);
     // An absolute box pinned by both left+right insets → drop width (auto stretches between them).
     const insetSpanned = !isContents && insetSpannedAbsolute(node, parentNode, sampleVps);
+    // If that inset-spanned box ALSO carries an authored aspect-ratio (a full-bleed hero slide:
+    // `absolute inset-x-0 aspect-video min-h-[…]`), `width:auto` does NOT stay pinned to the insets:
+    // with a definite height (min-height) and a definite aspect-ratio, the width BACK-COMPUTES from
+    // height × aspect and over-widens at any width the capture didn't sample (the splide02 hero
+    // measuring 768/641px wide inside a 572px window — the responsive full-bleed violations). Emit an
+    // explicit `width:100%` instead: it fills the containing block (identical to the inset-0 span at
+    // every sampled width, gate-neutral) and, being definite, WINS the width axis so the aspect-ratio
+    // drives only the height. Scoped to inset-spanned boxes that actually have an aspect-ratio.
+    const insetSpannedAspect = insetSpanned && sampleVps.some((vp) => {
+      const ar = node.computedByVp[vp]?.aspectRatio;
+      return !!ar && ar !== "auto" && node.visibleByVp[vp];
+    });
     // Combine: the full-bleed chain wins (it proved the box spans the viewport), then grid/flex
     // fill, then "fills its container" / "fills under a max-width cap" (→ width:100%), then the
     // inferred generalisations.
@@ -2891,6 +3062,9 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
     const widthPlan: WidthPlan =
       fillCap ? { kind: "fillcap", cap: fillCap }
       : sourceFixedSize ? inferred.plan
+      : circularSlide ? { kind: "fixed" }
+      : fullWidthSlide ? { kind: "basisFull" }
+      : insetSpannedAspect ? { kind: "fill" }
       : probe === "auto" ? { kind: "auto" }
       : probe === "fill" ? { kind: "fill" }
       : (!lockWidth && autoWidthFlex.has(node.id)) ? { kind: "auto" }

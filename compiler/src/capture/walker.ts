@@ -196,6 +196,21 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
   const scrollX = window.scrollX;
   const scrollY = window.scrollY;
 
+  // Viewport + page extents used by isVisible's off-screen test. bbox coords are in
+  // DOCUMENT space (r + scroll), so the visible window on each axis is
+  // [scroll, scroll + inner]. A box whose border box lies wholly outside that window
+  // on a NON-scrollable axis is unreachable and paints nothing to the user.
+  const vpW = window.innerWidth;
+  const vpH = window.innerHeight;
+  const scrollEl = document.scrollingElement || document.documentElement;
+  // Horizontal scrolling is legitimate when the page is wider than the viewport (RTL
+  // carousels, horizontal galleries). In that case content parked to the RIGHT is
+  // reachable by scrolling, so we only reject boxes fully off the LEFT edge (x <= 0
+  // start-of-page, never reachable). Vertical always scrolls, so we never reject
+  // in-flow content below the fold — only position:fixed boxes, which do NOT scroll
+  // with the page and so are truly gone if parked above/below the viewport.
+  const horizScrollable = round2(scrollEl.scrollWidth) > vpW + 1;
+
   // Resolve `line-height: normal` to a concrete px value by probing the actual
   // line-box height for each (font-family, font-size, font-weight, font-style).
   // getComputedStyle reports the keyword "normal", which renders font-metric-
@@ -234,12 +249,39 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
 
   const isVisible = (el: Element, cs: CSSStyleDeclaration, bbox: RawBBox): boolean => {
     if (cs.display === "none") return false;
+    // getComputedStyle already resolves `visibility` inheritance: a descendant that
+    // sets visibility:visible inside a hidden ancestor reports "visible" here (and is
+    // genuinely painted), so this test is exactly CSS computed semantics — no separate
+    // ancestor walk is needed. The off-screen test below is what catches un-hidden
+    // content parked outside the viewport (e.g. a slide-in drawer's inner nodes).
     if (cs.visibility === "hidden" || cs.visibility === "collapse") return false;
     if (parseFloat(cs.opacity || "1") === 0) return false;
     if (bbox.width === 0 && bbox.height === 0) {
       // zero-size but might still matter (e.g. absolutely positioned icon); treat
       // as not visible for matching purposes.
       return false;
+    }
+    // Off-screen test. bbox is document-space (x/y already include scroll). The box is
+    // invisible only when it lies WHOLLY outside a non-scrollable axis window — a box
+    // that merely straddles an edge (negative-margin / overflow-hidden decoration
+    // peeking in) still paints and stays visible.
+    //
+    // Horizontal: the page never scrolls left of origin, so anything whose right edge
+    // is at/left of 0 is unreachable. When the page is NOT horizontally scrollable we
+    // also reject boxes whose left edge is at/right of the viewport width; when it IS
+    // scrollable (wide/RTL/carousel pages), right-parked content is reachable, so only
+    // the fully-left case counts.
+    const rightEdge = bbox.x + bbox.width;
+    if (rightEdge <= 0) return false;
+    if (!horizScrollable && bbox.x >= vpW) return false;
+    // Vertical: the page scrolls, so below-/above-fold in-flow content is reachable and
+    // must stay visible. Only position:fixed boxes are pinned to the viewport and do NOT
+    // scroll into view — a fixed box parked entirely above or below the viewport is gone.
+    if (cs.position === "fixed") {
+      const top = bbox.y - scrollY;
+      const bottom = top + bbox.height;
+      if (bottom <= 0) return false;
+      if (top >= vpH) return false;
     }
     return true;
   };

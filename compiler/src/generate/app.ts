@@ -2053,7 +2053,10 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
     let body = jsx;
     for (const v of usedData) {
       const p = dataProps.get(v) ?? camelVar(v);
-      if (p !== v) body = body.split(`${v}.map(`).join(`${p}.map(`);
+      // Word-boundary rewrite: a plain substring replace of `${v}.map(` would also match
+      // inside a longer var (e.g. `Tile2_data` is a suffix of `MediaTile2_data`), corrupting
+      // it. Anchor on a non-identifier char before the name so only the whole var is renamed.
+      if (p !== v) body = body.replace(new RegExp(`(^|[^\\w$])${escapeRegExp(v)}\\.map\\(`, "g"), `$1${p}.map(`);
       const binding = contentBindings.get(v);
       if (binding) {
         const alias = safeIdent(`${p}Content`, "contentData");

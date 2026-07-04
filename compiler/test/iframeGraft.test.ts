@@ -47,13 +47,19 @@ function pageSnap(root: RawNode, url = "https://host.test/page"): PageSnapshot {
 }
 
 describe("planForFrameUrl", () => {
-  it("skips blank/js frames and ad/analytics/captcha domains", () => {
-    assert.equal(planForFrameUrl(""), "skip");
-    assert.equal(planForFrameUrl("about:blank"), "skip");
+  it("skips javascript: frames and ad/analytics/captcha domains", () => {
     assert.equal(planForFrameUrl("javascript:void(0)"), "skip");
     assert.equal(planForFrameUrl("https://googleads.g.doubleclick.net/pagead/ads"), "skip");
     assert.equal(planForFrameUrl("https://www.googletagmanager.com/ns.html?id=GTM-X"), "skip");
     assert.equal(planForFrameUrl("https://www.google.com/recaptcha/api2/anchor"), "skip");
+  });
+
+  it("grafts blank/empty-src frames (JS-populated same-origin embeds), visibility-gated upstream", () => {
+    // Klaviyo lightbox signup, loyalty popups etc. render into a blank same-origin iframe via
+    // script — no navigable URL, but real content. Invisible tracking pixels sharing a blank
+    // src are dropped by the cand.visible gate in capture.ts, not here.
+    assert.equal(planForFrameUrl(""), "graft");
+    assert.equal(planForFrameUrl("about:blank"), "graft");
   });
 
   it("screenshots media-player embeds instead of grafting their JS-built DOM", () => {

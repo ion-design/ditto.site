@@ -36,10 +36,22 @@ const FRAME_SKIP_RE =
 const FRAME_STILL_RE =
   /(?:youtube(?:-nocookie)?\.com\/embed|player\.vimeo\.com|\bwistia\b|fast\.wistia|players?\.brightcove|open\.spotify\.com|w\.soundcloud\.com|google\.com\/maps\/embed)/i;
 
-/** How to materialize a frame's content, from its URL alone (deterministic). */
+/**
+ * How to materialize a frame's content, from its URL alone (deterministic).
+ *
+ * NOTE on blank/empty-src frames: a frame with no `src` (or `about:blank`/`javascript:`)
+ * is NOT inert — many form/widget embeds (Klaviyo lightbox signup, loyalty popups) mount a
+ * same-origin blank iframe and inject their rendered DOM into it via script, so the element
+ * carries real, sized content with no navigable URL. Those must GRAFT (the frame document is
+ * same-origin, so collectPage evaluates in it directly). The dead pixels that also use a blank
+ * src (analytics sandboxes, 0×0 tracking iframes) are filtered upstream by the `cand.visible`
+ * gate in capture.ts — a blank frame only reaches a graft when it actually rendered at
+ * ≥ MIN_FRAME_DIM on both axes, which a tracking pixel never does.
+ */
 export function planForFrameUrl(url: string): FramePlan {
   const u = (url || "").trim();
-  if (!u || u === "about:blank" || u.startsWith("javascript:")) return "skip";
+  if (u.startsWith("javascript:")) return "skip";
+  if (!u || u === "about:blank") return "graft"; // JS-populated same-origin frame (visibility-gated)
   if (FRAME_SKIP_RE.test(u)) return "skip";
   if (FRAME_STILL_RE.test(u)) return "still";
   return "graft";
