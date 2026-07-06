@@ -3,6 +3,7 @@ import { isTextChild } from "../normalize/ir.js";
 import type { PrimitiveType } from "./primitives.js";
 import type { Section } from "./sections.js";
 import { round } from "../util/canonical.js";
+import { matchCatalogNode, type PatternDef, type PatternHints } from "../knowledge/patternIndex.js";
 
 export type RecipeKind = "logo-cloud" | "feature-grid" | "card-grid" | "product-grid" | "gallery-showcase" | "cta-band";
 
@@ -60,6 +61,8 @@ export type RecipeReport = {
     highConfidence: number;
     byKind: Record<string, number>;
     templateReadyKinds: RecipeKind[];
+    /** page-level frozen-catalog pattern ids (from resolvePatternHints), when provided */
+    catalogPatterns?: string[];
   };
   candidates: RecipeCandidate[];
 };
@@ -78,6 +81,10 @@ type RecipeContext = {
   parentById: ParentMap;
   sectionByNodeId: SectionMap;
   primitives: Map<string, PrimitiveType>;
+  /** per-node frozen-catalog matches, memoized (pattern catalog as a 4th evidence source) */
+  catalogByCid: Map<string, PatternDef[]>;
+  /** page-level catalog flags from resolvePatternHints (e.g. platform_shopify, ecommerce) */
+  pageFlags: Set<string>;
 };
 
 type ItemStats = {
@@ -233,7 +240,7 @@ function nodeStats(ctx: RecipeContext, n: IRNode): ItemStats {
   };
 }
 
-function buildContext(ir: IR, sections: Section[], primitives: Map<string, PrimitiveType>): RecipeContext {
+function buildContext(ir: IR, sections: Section[], primitives: Map<string, PrimitiveType>, patternHints?: PatternHints): RecipeContext {
   const nodes: IRNode[] = [];
   const byId: NodeMap = new Map();
   const parentById: ParentMap = new Map();
@@ -254,7 +261,30 @@ function buildContext(ir: IR, sections: Section[], primitives: Map<string, Primi
     parentById,
     sectionByNodeId: new Map(sections.map((s) => [s.nodeId, s])),
     primitives,
+    catalogByCid: new Map(),
+    pageFlags: new Set(patternHints?.flags ?? []),
   };
+}
+
+function catalogDefs(ctx: RecipeContext, node: IRNode): PatternDef[] {
+  let defs = ctx.catalogByCid.get(node.id);
+  if (!defs) {
+    defs = matchCatalogNode(node);
+    ctx.catalogByCid.set(node.id, defs);
+  }
+  return defs;
+}
+
+/** First catalog pattern in `root`'s subtree matching `pred` (pre-order; memoized
+ *  per node). The frozen catalog is deterministic, so recipe evidence stays
+ *  byte-stable across regenerations. */
+function subtreeCatalogMatch(ctx: RecipeContext, root: IRNode, pred: (d: PatternDef) => boolean): PatternDef | null {
+  for (const d of catalogDefs(ctx, root)) if (pred(d)) return d;
+  for (const c of elementChildren(root)) {
+    const hit = subtreeCatalogMatch(ctx, c, pred);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 function nearestSection(ctx: RecipeContext, n: IRNode): Section | undefined {
@@ -545,18 +575,23 @@ function detectLogoClouds(ctx: RecipeContext): RecipeDraft[] {
     const rootText = textContent(root, 1200);
     const layout = isLayoutish(ctx, parent, logos.map((s) => s.node));
     const avgHeight = logos.reduce((sum, s) => sum + (s.bbox?.height ?? 0), 0) / logos.length;
+    // Logo strips often ride marquee libraries (react-fast-marquee, ticker) —
+    // a catalog marquee hit is strong logo-cloud evidence.
+    const catalogMarquee = subtreeCatalogMatch(ctx, parent, (d) => d.kind === "marquee");
     const signals = [
       `${logos.length} repeated media-light children`,
       layout ? "item parent behaves like grid/flex/wrapped row" : "item parent has repeated logo geometry",
       TRUSTED_COPY.test(rootText) ? "nearby copy matches trusted-by/brand language" : "",
       avgHeight <= 96 ? "logo item boxes stay small" : "",
+      catalogMarquee ? `pattern catalog identifies a ${catalogMarquee.id} strip` : "",
     ].filter(Boolean);
     const confidence = 0.58
       + Math.min(0.18, logos.length * 0.025)
       + (logos.length / kids.length) * 0.12
       + (layout ? 0.08 : 0)
       + (TRUSTED_COPY.test(rootText) ? 0.10 : 0)
-      + (avgHeight <= 96 ? 0.04 : 0);
+      + (avgHeight <= 96 ? 0.04 : 0)
+      + (catalogMarquee ? 0.04 : 0);
     out.push(baseDraft(ctx, "logo-cloud", parent, logos, confidence, signals));
   }
   return out;
@@ -568,6 +603,10 @@ function detectGrids(ctx: RecipeContext): RecipeDraft[] {
   for (const parent of ctx.nodes) {
     if (parent.id === ctx.ir.root.id) continue;
     if (subtreeSourceClassMatches(parent, DEFERRED_INTERACTIVE_COLLECTION)) continue;
+    // Catalog-known carousel/marquee libraries the regex misses (embla, flickity,
+    // keen-slider, glide, tns, …) are the same deferred-interactive class: their
+    // children are slides, not a static grid.
+    if (subtreeCatalogMatch(ctx, parent, (d) => d.kind === "carousel" || d.kind === "marquee")) continue;
     const kids = visibleElementChildren(parent, ctx.cw);
     if (kids.length < 2 || kids.length > 36) continue;
     const stats = kids.map((k) => nodeStats(ctx, k));
@@ -581,7 +620,10 @@ function detectGrids(ctx: RecipeContext): RecipeDraft[] {
     const rootTooBroad = rootInfo.root.id === ctx.ir.root.id || (!!pageH && !!rootBox && rootBox.height > pageH * 0.55);
     const localText = textContent(parent, 1200);
     const parentText = rootTooBroad ? localText : textContent(rootInfo.root, 1600);
-    const galleryContext = subtreeAttrOrSourceMatches(parent, GALLERY_SOURCE) || (!rootTooBroad && subtreeAttrOrSourceMatches(rootInfo.root, GALLERY_SOURCE));
+    // Lightbox libraries (fancybox, photoswipe, lightGallery, …) mark a thumbnail
+    // grid as a gallery even when no gallery-ish class names are present.
+    const catalogLightbox = subtreeCatalogMatch(ctx, parent, (d) => d.kind === "lightbox");
+    const galleryContext = subtreeAttrOrSourceMatches(parent, GALLERY_SOURCE) || (!rootTooBroad && subtreeAttrOrSourceMatches(rootInfo.root, GALLERY_SOURCE)) || !!catalogLightbox;
     const testimonialContext = subtreeAttrOrSourceMatches(parent, TESTIMONIAL_SOURCE) || TESTIMONIAL_COPY.test(localText);
     const featureItems = stats.filter(isLikelyFeatureItem);
     const cardItems = stats.filter(isLikelyCardItem);
@@ -598,6 +640,7 @@ function detectGrids(ctx: RecipeContext): RecipeDraft[] {
         const signals = [
           `${cardLikeItems.length} repeated ${testimonialContext ? "testimonial/gallery" : "media/gallery"} items`,
           galleryContext ? "source attributes/classes identify a gallery or carousel track" : "",
+          catalogLightbox ? `pattern catalog identifies a ${catalogLightbox.id} lightbox gallery` : "",
           testimonialContext ? "source text/classes identify a testimonial or horizontal story strip" : "",
           oneRowRegimes >= 2 ? "items remain in a horizontal gallery row across sampled widths" : "",
           mediaRatio >= 0.6 ? "most gallery items include media" : "",
@@ -619,9 +662,13 @@ function detectGrids(ctx: RecipeContext): RecipeDraft[] {
     const productItems = stats.filter(isLikelyProductItem);
     const forbiddenProductContext = subtreeAttrOrSourceMatches(parent, /\b(?:footer|directory|nav|menu)\b/i)
       || (!rootTooBroad && subtreeAttrOrSourceMatches(rootInfo.root, /\b(?:footer|directory|nav|menu)\b/i));
+    // Page-level catalog prior: a Shopify/WooCommerce page makes repeated card
+    // grids product grids even when per-node class names carry no commerce words.
+    const catalogCommerce = ctx.pageFlags.has("ecommerce") || ctx.pageFlags.has("platform_shopify");
     const productContext = !forbiddenProductContext &&
       (PRODUCT_COPY.test(localText) || subtreeAttrOrSourceMatches(parent, PRODUCT_SOURCE)
-        || (!rootTooBroad && (PRODUCT_COPY.test(parentText) || subtreeAttrOrSourceMatches(rootInfo.root, PRODUCT_SOURCE))));
+        || (!rootTooBroad && (PRODUCT_COPY.test(parentText) || subtreeAttrOrSourceMatches(rootInfo.root, PRODUCT_SOURCE)))
+        || catalogCommerce);
     const productStats = productItems.length >= 2 ? productItems : (productContext ? cardLikeItems : []);
     if (productStats.length >= 2 && productStats.length / kids.length >= 0.45 && productContext) {
       const key = itemSetKey("product-grid", productStats);
@@ -635,6 +682,7 @@ function detectGrids(ctx: RecipeContext): RecipeDraft[] {
           productCopyRatio >= 0.5 ? "most items contain commerce/product copy" : "",
           ctaRatio >= 0.5 ? "most products include link/button affordances" : "",
           (subtreeAttrOrSourceMatches(parent, PRODUCT_SOURCE) || (!rootTooBroad && subtreeAttrOrSourceMatches(rootInfo.root, PRODUCT_SOURCE))) ? "source context is product/promo/commerce-like" : "",
+          catalogCommerce ? "pattern catalog identifies an e-commerce platform page" : "",
         ].filter(Boolean);
         const confidence = 0.58
           + Math.min(0.14, productStats.length * 0.025)
@@ -642,7 +690,8 @@ function detectGrids(ctx: RecipeContext): RecipeDraft[] {
           + (layout ? 0.10 : 0)
           + (productCopyRatio >= 0.5 ? 0.07 : 0)
           + (ctaRatio >= 0.5 ? 0.05 : 0)
-          + ((subtreeAttrOrSourceMatches(parent, PRODUCT_SOURCE) || (!rootTooBroad && subtreeAttrOrSourceMatches(rootInfo.root, PRODUCT_SOURCE))) ? 0.06 : 0);
+          + ((subtreeAttrOrSourceMatches(parent, PRODUCT_SOURCE) || (!rootTooBroad && subtreeAttrOrSourceMatches(rootInfo.root, PRODUCT_SOURCE))) ? 0.06 : 0)
+          + (catalogCommerce ? 0.05 : 0);
         out.push(baseDraft(ctx, "product-grid", parent, productStats, confidence, signals));
       }
       continue;
@@ -832,8 +881,8 @@ function candidateSort(ctx: RecipeContext, a: RecipeDraft, b: RecipeDraft): numb
     || b.confidence - a.confidence;
 }
 
-export function buildRecipeReport(ir: IR, sections: Section[], primitives: Map<string, PrimitiveType>): RecipeReport {
-  const ctx = buildContext(ir, sections, primitives);
+export function buildRecipeReport(ir: IR, sections: Section[], primitives: Map<string, PrimitiveType>, patternHints?: PatternHints): RecipeReport {
+  const ctx = buildContext(ir, sections, primitives, patternHints);
   const drafts = suppressDuplicates(ctx, [
     ...detectLogoClouds(ctx),
     ...detectGrids(ctx),
@@ -853,6 +902,7 @@ export function buildRecipeReport(ir: IR, sections: Section[], primitives: Map<s
       highConfidence: candidates.filter((c) => c.confidence >= 0.82).length,
       byKind,
       templateReadyKinds: TEMPLATE_READY,
+      ...(patternHints ? { catalogPatterns: patternHints.matches.map((m) => m.id) } : {}),
     },
     candidates,
   };
@@ -880,6 +930,7 @@ export function recipeReportToMarkdown(report: RecipeReport): string {
   lines.push("");
   lines.push(`- Candidates: ${report.summary.totalCandidates}`);
   lines.push(`- High confidence: ${report.summary.highConfidence}`);
+  if (report.summary.catalogPatterns?.length) lines.push(`- Catalog patterns on page: ${report.summary.catalogPatterns.join(", ")}`);
   lines.push(`- By kind: ${Object.entries(report.summary.byKind).map(([k, v]) => `${k} ${v}`).join(", ") || "none"}`);
   lines.push("");
   lines.push("## Candidates");

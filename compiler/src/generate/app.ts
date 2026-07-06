@@ -14,6 +14,7 @@ import type { FontGraph } from "../infer/fonts.js";
 import { SYSTEM_FALLBACK } from "../infer/fonts.js";
 import { detectComponents, type ComponentPlan, type ComponentCluster } from "../infer/components.js";
 import { buildClassMap } from "./classMap.js";
+import { generatePreviewHtml } from "./preview.js";
 import { buildTailwind, tailwindGlobalsCss } from "./tailwind.js";
 import { planSections, type SectionPlan } from "./sectionSplit.js";
 import type { RecipeReport } from "../infer/recipes.js";
@@ -2659,7 +2660,7 @@ export function recipeResponsiveClassCleaner(ir: IR, recipes: RecipeReport | und
   };
 }
 
-export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx: string; cloneCss: string; components: ExtractedComponent[] } {
+export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx: string; cloneCss: string; components: ExtractedComponent[]; previewHtml: string } {
   const { ir, assetGraph, fontGraph, appDir, sourceUrl } = input;
   const assetMap = buildAssetMap(assetGraph);
   const framework = input.framework ?? "next";
@@ -2789,6 +2790,16 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
     writeText(join(rootDir, "globals.css"), framework === "vite" ? viteGlobalsCss(globals) : globals);
   }
   writeText(join(rootDir, "ditto.css"), cloneCss);
+  // Fast, self-contained static preview (runtime-free single HTML file) the service can
+  // render within seconds of `generate`, BEFORE the Next build + deploy completes. Emitted
+  // at generated/app/preview.html (assets relative to public/); shares the same IR + css.ts
+  // rule/banding collectors and the same propsList/resolveTag decision code as the app,
+  // so it shows what the built app will show without a second maintained emission path.
+  const previewPath = "preview.html";
+  writeText(join(appDir, previewPath), generatePreviewHtml({
+    ir, assetMap, fontGraph, tokensCss, sourceUrl,
+    colorVar: input.colorVar, tokenResolver: input.tokenResolver,
+  }));
   writeText(join(appDir, "src", "lib", "utils.ts"), CN_UTILS_MODULE);
   // SITE_ORIGIN constant for SEO/metadata routes (Next only — Vite ships static SEO files).
   if (framework === "next") writeText(join(appDir, "src", "lib", "site.ts"), SITE_ORIGIN_MODULE);
@@ -2830,7 +2841,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
     ],
   });
 
-  return { pageTsx, cloneCss, components: components ? summarizeComponents(components) : [] };
+  return { pageTsx, cloneCss, components: components ? summarizeComponents(components) : [], previewHtml: previewPath };
 }
 
 /** Add lottie-web to a generated package.json's dependencies — DittoLottie imports it at

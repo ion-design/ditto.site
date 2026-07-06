@@ -1,5 +1,5 @@
 import type { CloneOptions, RouteInfo } from "@cloner/core";
-import type { RestCloneResult } from "./rest.js";
+import type { RestCloneResult, RestCloneSummary } from "./rest.js";
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cached";
 
@@ -22,7 +22,7 @@ export type JobView = {
 };
 
 export type SubmitOutcome =
-  | { jobId: string; status: "succeeded" | "cached"; httpStatus: 200; result: RestCloneResult }
+  | { jobId: string; status: "succeeded" | "cached"; httpStatus: 200; result: RestCloneResult | RestCloneSummary }
   | { jobId: string; status: "queued"; httpStatus: 202 };
 
 export type ResultOutcome =
@@ -56,4 +56,6 @@ export interface Backend {
   facets(jobId: string): Promise<FileFacet[] | null>;
   /** The whole app as one compressed archive (null if not ready/found). */
   bundle(jobId: string, format?: BundleFormat): Promise<CloneBundle | null>;
+  /** Pipeline progress events for polling UIs (null if unsupported or job unknown). */
+  events?(jobId: string, after?: number): Promise<Array<Record<string, unknown>> | null>;
 }

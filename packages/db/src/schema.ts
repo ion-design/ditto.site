@@ -1,4 +1,4 @@
-import { pgTable, text, jsonb, integer, timestamp, uuid } from "drizzle-orm/pg-core";
+import { pgTable, text, jsonb, integer, timestamp, uuid, index } from "drizzle-orm/pg-core";
 
 /** Job lifecycle row. Status mirrors the queue; `cacheKey` ties it to the cache row.
  *  `options`/`timings` are jsonb (the service's typed shapes). */
@@ -66,6 +66,17 @@ export const signupTokens = pgTable("signup_tokens", {
   consumedAt: timestamp("consumed_at", { withTimezone: true }),
 });
 
+/** Structured clone progress events (mirrors in-memory backend event stream). */
+export const jobEvents = pgTable("job_events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  jobId: uuid("job_id")
+    .notNull()
+    .references(() => jobs.id, { onDelete: "cascade" }),
+  seq: integer("seq").notNull(),
+  payload: jsonb("payload").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("job_events_job_id_seq_idx").on(t.jobId, t.seq)]);
+
 export type Job = typeof jobs.$inferSelect;
 export type NewJob = typeof jobs.$inferInsert;
 export type Clone = typeof clones.$inferSelect;
@@ -74,3 +85,4 @@ export type CacheRow = typeof cache.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;
 export type SignupToken = typeof signupTokens.$inferSelect;
 export type NewSignupToken = typeof signupTokens.$inferInsert;
+export type JobEvent = typeof jobEvents.$inferSelect;

@@ -1,6 +1,6 @@
 import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { Db } from "./client.js";
-import { jobs, clones, cache, apiKeys, signupTokens, type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey, type SignupToken } from "./schema.js";
+import { jobs, clones, cache, apiKeys, signupTokens, jobEvents, type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey, type SignupToken } from "./schema.js";
 
 // ---- jobs ----
 
@@ -110,4 +110,25 @@ export async function consumeSignupToken(db: Db, tokenHash: string): Promise<Sig
     .where(and(eq(signupTokens.tokenHash, tokenHash), gt(signupTokens.expiresAt, new Date()), isNull(signupTokens.consumedAt)))
     .returning();
   return row;
+}
+
+// ---- job events ----
+
+export async function appendJobEvent(db: Db, jobId: string, payload: Record<string, unknown>): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`coalesce(max(${jobEvents.seq}), 0)` })
+    .from(jobEvents)
+    .where(eq(jobEvents.jobId, jobId));
+  const seq = (row?.n ?? 0) + 1;
+  await db.insert(jobEvents).values({ jobId, seq, payload: { t: Date.now(), ...payload } });
+  return seq;
+}
+
+export async function listJobEvents(db: Db, jobId: string, after = 0): Promise<Array<Record<string, unknown>>> {
+  const rows = await db
+    .select()
+    .from(jobEvents)
+    .where(and(eq(jobEvents.jobId, jobId), sql`${jobEvents.seq} > ${after}`))
+    .orderBy(jobEvents.seq);
+  return rows.map((r) => r.payload as Record<string, unknown>);
 }

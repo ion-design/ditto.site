@@ -26,6 +26,9 @@ export type CloneOptions = {
   mode?: CloneMode;
   styling?: CloneStyling;
   framework?: CloneFramework;
+  /** Build a browsable static export of the clone into `public/app-preview/`
+   *  (served by the API's app-preview route). Defaults ON for single-page clones. */
+  preview?: boolean;
   verify?: boolean;
   /** DB/worker mode: persist the clone first, then attach verify in the background. */
   asyncVerify?: boolean;
@@ -75,7 +78,7 @@ export type CaptureSanity = {
   blocked: boolean; // bot/egress wall text detected
 };
 
-export type CloneTimings = { captureMs: number; generateMs: number; verifyMs?: number };
+export type CloneTimings = { captureMs: number; generateMs: number; verifyMs?: number; previewMs?: number };
 
 export type RouteInfo = { route: string; representativeOf?: string };
 

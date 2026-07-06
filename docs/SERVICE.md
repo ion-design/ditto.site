@@ -24,11 +24,34 @@ packages/
 
 Two run modes, same HTTP surface:
 
-- **In-memory (no `DATABASE_URL`)** — the API runs single-page clones **inline** and
-  holds results in memory. Handy for a quick local demo.
+- **In-memory (no `DATABASE_URL`)** — `POST` enqueues (202) and runs the clone in the
+  background within the API process, holding results in memory. Handy for a quick
+  local demo; same poll-to-completion contract as production.
 - **DB + queue (`DATABASE_URL` set)** — `POST` enqueues a job (202); a separate
   **worker** process consumes the queue, runs the clone, stores artifacts, and the
   client polls to completion. This is the production mode.
+
+In both modes the job emits structured progress events as it runs — the compiler's
+granular log stream (`{ event: "captured", ... }`, `{ event: "generated", ... }`,
+`{ event: "build_start", ... }`, etc.) plus service phases (`{ event: "clone_done" }`,
+`{ event: "clone_error", error }`). Every event carries a millisecond wall-clock
+timestamp `t`; the rest of each object is the payload the emitter logged, so field sets
+vary by event. There is no fixed enum of event types — treat unknown `event` strings as
+opaque progress and drive UI off the coarse job `status` from `GET /v1/clones/:id`.
+
+Poll `GET /v1/clones/:id/events?after=N` → `{ jobId, events: [{ t, ... }] }`. `after` is a
+**sequence cursor** (a 1-based event count, not a timestamp): pass the number of events
+you have already consumed to get only newer ones. Caveats:
+
+- The returned event bodies do **not** include the `seq` value, so track the cursor
+  yourself as a running count of events received.
+- The in-memory backend **ignores `after`** and returns the full list on every poll — so
+  in that mode you always get all events and must de-duplicate by count. The DB backend
+  honors `after` (`seq > N`).
+
+In production (DB) mode events persist in the `job_events` table (migration
+`0002_productive_wallflower.sql`) with a per-job `seq`, so they survive worker restarts
+and remain readable after completion.
 
 ## Local development
 
@@ -84,8 +107,10 @@ POST   /v1/signup/request         { email } → 202 {message}                 (s
 POST   /v1/signup/verify          { token } → 201 {apiKey,message}          (consume email token)
 GET    /v1/clones                  → list (metadata)
 GET    /v1/clones/:id              → status + metadata (fileCount, totalBytes, capture, timings)
+GET    /v1/clones/:id/events?after=N → { jobId, events } — progress events after cursor N (poll while running)
 GET    /v1/clones/:id/result       → the eager CloneResult (text files inline; binaries by URL)
-GET    /v1/clones/:id/files/*      → stream one file
+GET    /v1/clones/:id/files/*      → stream one generated file (e.g. .../files/preview.html — see Preview)
+GET    /v1/clones/:id/app-preview/*  → serve the clone's built static export when present (404 until built)
 GET    /v1/clones/:id/bundle?format=tgz|zip  → the whole app as one archive (302 → S3 when configured)
 DELETE /v1/clones/:id              → purge artifacts
 GET    /healthz                    → { ok: true }  (unauthenticated)
@@ -106,8 +131,10 @@ one-time email link, and `POST /v1/signup/verify` consumes the token, stores
 only the API key's SHA-256 hash in Postgres, stores the verified email in the
 key label for attribution, and returns the raw key once.
 
-Normal product `options` are `{ mode?: "single" | "multi", styling?: "tailwind" | "css", framework?: "next" | "vite" }`.
-`mode` defaults to `"single"`, `styling` defaults to `"tailwind"`, and `framework` defaults to `"next"`. Operational options
+Normal product `options` are `{ mode?: "single" | "multi", styling?: "tailwind" | "css", framework?: "next" | "vite", preview?: boolean }`.
+`mode` defaults to `"single"`, `styling` defaults to `"tailwind"`, and `framework` defaults to `"next"`. `preview`
+controls the browsable built export served at `/v1/clones/:id/app-preview/` (see **Preview** below); it is on by
+default for single-page clones, so pass `preview:true` to force it for a multi-page clone. Operational options
 remain `{ verify?, asyncVerify?, maxRoutes?, maxCollection?, captureConcurrency?, validationConcurrency?, viewportConcurrency?, noCache? }`; `noCache` is service-level and
 bypasses the cache. Deprecated aliases (`multiPage`, `humanizeMode`) and dev-only escape
 hatches are still accepted for compatibility, but are not part of the normal product surface.
@@ -121,6 +148,46 @@ When running with the DB worker, `asyncVerify:true` persists the clone result fi
 attaches the verify report afterward while the worker still has the run artifacts. This is the
 current async QA path; a post-hoc verify endpoint would require persisting full capture artifacts,
 not just the generated app bundle.
+
+## Preview
+
+Every clone emits a flat, self-contained **`preview.html`** at generate time — it is a
+regular entry in the result file map (path `preview.html`, at the app root), and the
+manifest records it as `preview_html: "preview.html"` (always present). It exists as soon
+as the compiler's `generate` step finishes emitting the file map — well before any Next
+build or deploy — so a consumer can show the cloned page within seconds. Its arrival is
+visible in the event stream as a `{ event: "generated", ... }` event.
+
+Fetch it through the ordinary files route:
+
+```bash
+curl -sS -H "authorization: Bearer $DITTO_API_KEY" \
+  "$DITTO_API_URL/v1/clones/$JOB_ID/files/preview.html" -o preview.html
+```
+
+**What it is — and isn't.** `preview.html` is a single HTML file with inline CSS and **no
+JavaScript** (no runtime scripts). It renders the captured page statically: animations are
+frozen at their captured start frame, Lottie/`<video>` mounts show their captured
+poster/first-frame still, and nothing is interactive — no menus, no hover, no scroll
+effects. It is a faithful *picture* of the page, not a working app. For interaction, use the
+built export (`/v1/clones/:id/app-preview/`) or the deployed app.
+
+**Relative assets.** `preview.html` references its images and fonts with relative paths
+(`public/assets/cloned/...`), so those sub-paths resolve against the same files route the
+HTML itself came from (`/v1/clones/:id/files/public/assets/cloned/...`). Serve or proxy the
+file under that mount and the assets load with no rewriting.
+
+**Iframe auth caveat.** Because the files route is authenticated (when `API_KEYS`/DB keys
+are set), you cannot drop `.../files/preview.html` straight into an `<iframe src=...>` — the
+browser can't attach your `Authorization` header to the iframe's asset sub-requests, so
+images and fonts 404. Front it with a small server-side proxy that injects the key and
+re-serves both the HTML and its `public/assets/...` sub-paths from your own origin, then
+point the iframe at the proxy.
+
+**Intended staging.** The preview is the middle rung of a three-step reveal for a consumer
+UI: show the **original site** first (instant), swap to **`preview.html`** the moment
+`generate` finishes (seconds — a static, frozen likeness), then swap to the **deployed app**
+once the build + deploy completes (fully interactive).
 
 **Incremental clone (single → multi, for speed).** Clone one URL single-page first
 (fast app back), then POST the **same URL** with `{ mode: "multi" }` — the second call

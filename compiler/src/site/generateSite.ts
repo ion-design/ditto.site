@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { writeText, readJSON, fileExists } from "../util/fsx.js";
 import { generateCss, RESET_CSS } from "../generate/css.js";
+import { generatePreviewHtml } from "../generate/preview.js";
 import { generateInteractionCss } from "../generate/interactionCss.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, interactionRejectedSet } from "../generate/interactive.js";
 import { buildLottieSpec, lottieHasContent, lottieWireJsx, dittoLottieImportPath, DITTO_LOTTIE_TSX } from "../generate/lottie.js";
@@ -454,6 +455,22 @@ export function generateSiteApp(opts: {
     const globals = globalsCss(entry, unionFontCss(routes), palette.css);
     writeText(join(appDir, "src", isVite ? "globals.css" : join("app", "globals.css")), isVite ? viteGlobalsCss(globals) : globals);
   }
+  // Static preview of the ENTRY page only (the product moment — the first page shown
+  // within seconds of generate, before the Next build + deploy completes). Runtime-free
+  // single HTML file over the entry IR, sharing the same css.ts rule collectors +
+  // propsList/resolveTag decisions as the app. Assets relative to public/.
+  const previewTokensCss = tw
+    ? palette.css + "\n" + tokensToCss(entry.tokens, true) + (interner.defs.size ? "\n" + colorDefsCssOf(interner) : "")
+    : palette.css + "\n" + tokensToCss(entry.tokens, true);
+  writeText(join(appDir, "preview.html"), generatePreviewHtml({
+    ir: entry.ir,
+    assetMap: buildAssetMap(entry.assetGraph),
+    fontGraph: { entries: entry.fontGraph.entries, css: unionFontCss(routes) },
+    tokensCss: previewTokensCss,
+    sourceUrl: entry.ir.doc.sourceUrl,
+    colorVar: palette.varForColor,
+  }));
+
   emitGeneratedDocs(appDir, {
     sourceUrl: entry.ir.doc.sourceUrl,
     routes: seoRoutes,
