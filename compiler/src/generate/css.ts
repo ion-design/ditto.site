@@ -1952,6 +1952,7 @@ function fixedWidthButtonLike(node: IRNode, viewports: number[]): boolean {
   if (node.tag !== "a" && node.tag !== "button") return false;
   const widths: number[] = [];
   let sampled = 0;
+  let contentFit = true;
   for (const vp of viewports) {
     const cs = node.computedByVp[vp];
     const bb = node.bboxByVp[vp];
@@ -1962,7 +1963,21 @@ function fixedWidthButtonLike(node: IRNode, viewports: number[]): boolean {
     if (pf(cs.borderTopLeftRadius) < 12 && pf(cs.borderTopRightRadius) < 12) return false;
     if (bb.width < 120 || bb.height < 28) return false;
     widths.push(bb.width);
+    // Content-fit evidence: the sizing probe proved `width:auto` reproduces this box AND it paints
+    // exactly at its own max-content width, with genuinely wrappable text inside (wMin < wMax).
+    const sz = node.sizingByVp?.[vp];
+    if (!(sz?.wAuto === true && sz.wMax != null && sz.wMin != null && sz.wMin < sz.wMax - 2 &&
+          Math.abs(bb.width - sz.wMax) <= Math.max(1.5, 0.01 * sz.wMax))) contentFit = false;
   }
+  // A constant width alone is weak evidence of an AUTHORED fixed width: a content-sized chip whose
+  // label never changes paints the same width at every viewport it's shown at. When the probe proved
+  // width:auto reproduces the box at its max-content at EVERY sample, the width is content-derived —
+  // don't lock it. Baking that px invites the emitters' quantization (snapLen's 0.1px rounding,
+  // snapBase's ≤0.25px spacing-scale snap) to land fractionally BELOW the intrinsic single-line
+  // width, wrapping the label onto a second line; the probe verdict (sizingVerdict → width:auto)
+  // reproduces the box intrinsically at every width instead. Authored intent (sourceFixedWidth /
+  // sourceFixedSize, checked by the caller) still locks.
+  if (sampled >= 1 && contentFit) return false;
   return sampled >= 2 && widths.length >= 2 && Math.max(...widths) - Math.min(...widths) <= 2;
 }
 
@@ -3120,7 +3135,10 @@ function centeredAtVp(node: IRNode, parentNode: IRNode, vp: number): boolean {
  *  column resolving fractionally narrower) tips it onto a second line. Such a node earns an explicit
  *  `white-space:nowrap` (see declsForViewport) to stay one line as it did in the capture.
  *  Conservative by construction — every guard must hold at every painted viewport:
- *   • text leaf (direct text, no element children), whitespace not already preserved (`pre*`);
+ *   • text leaf (direct text; element children only if REPLACED — an icon <svg>/<img> beside the
+ *     label, the icon+text chip shape. A replaced box can't wrap and its constant width is already
+ *     inside the probe's wMin/wMax, so the math below is unchanged; any other element child may
+ *     carry its own text and bails), whitespace not already preserved (`pre*`);
  *   • single line: box height ≈ one line box (line-height + vertical padding/border), so a genuinely
  *     wrapping paragraph (≥2 line boxes tall) is excluded;
  *   • wrap-vulnerable: max-content (unwrapped) width ≥ available container width − 2 and ≤ it + 1 —
@@ -3130,7 +3148,7 @@ function centeredAtVp(node: IRNode, parentNode: IRNode, vp: number): boolean {
  *  Relies on the sizing probe's wMin/wMax (present only for in-flow probed leaves); absent ⇒ no emit. */
 function nowrapWrapVulnerable(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
   if (!parentNode) return false;
-  if (hasElementChild(node)) return false;
+  if (node.children.some((c) => !isTextChild(c) && !REPLACED.has(c.tag))) return false;
   if (!node.children.some((c) => isTextChild(c) && c.text.trim() !== "")) return false;
   if (REPLACED.has(node.tag) || node.tag === "canvas" || node.tag.includes("-")) return false;
   let painted = 0;

@@ -566,6 +566,78 @@ describe("generateCss wrap-vulnerable single-line text", () => {
   });
 });
 
+// BUG C, icon+text chip variant — the label sits beside a replaced icon (<svg>), so the vulnerable
+// node is NOT a pure text leaf and the leaf-only guard skipped it. The chip's button ancestor bakes
+// a quantized px width that can land fractionally below the intrinsic single-line width, wrapping
+// the label ("Recreate a / screenshot"). The inner [icon, text] row must still earn nowrap: the icon
+// can't wrap, its constant width is already inside the probe's wMin/wMax, and only the text is at risk.
+describe("generateCss wrap-vulnerable icon+text chip", () => {
+  // Captured shape: pill button 193.44×32 (px 12 + 1px border per side) → inner row 167.44×20
+  // (icon 15 + gap 8 + text), line-height 20, wMin 94.88 < wMax 167.44 == avail == bbox.width.
+  function chipRow(iconTag: string) {
+    const szAt = (): RawSizing => ({ wAuto: true, wFill: true, hAuto: true, hFill: true, wMin: 94.88, wMax: 167.44 });
+    const iconPer = (): XPerVp => ({ cs: { display: "inline-block" }, bbox: { x: 13, y: 8.5, width: 15, height: 15 } });
+    const icon = xNode("n2", iconTag, { 375: iconPer(), 768: iconPer(), 1280: iconPer() });
+    const rowPer = (): XPerVp => ({ cs: { display: "flex", lineHeight: "20px" }, bbox: { x: 13, y: 6, width: 167.44, height: 20 }, sizing: szAt() });
+    const row = xNode("n1", "div", { 375: rowPer(), 768: rowPer(), 1280: rowPer() }, [icon, { text: "Recreate a screenshot" }]);
+    const btnPer = (): XPerVp => ({
+      cs: { display: "flex", cursor: "pointer", paddingLeft: "12px", paddingRight: "12px", borderLeftWidth: "1px", borderRightWidth: "1px", borderTopLeftRadius: "9999px", borderTopRightRadius: "9999px", lineHeight: "20px" },
+      bbox: { x: 0, y: 0, width: 193.44, height: 32 },
+    });
+    const btn = xNode("n0", "button", { 375: btnPer(), 768: btnPer(), 1280: btnPer() }, [row]);
+    return btn;
+  }
+
+  it("emits white-space:nowrap for a single-line [icon, text] row flush against its pill's content edge", () => {
+    const css = generateCss(xIr(chipRow("svg")), new Map());
+    assert.ok(baseRule(css, "n1").includes("white-space:nowrap"), `icon+text chip row should get nowrap, got: ${baseRule(css, "n1")}`);
+  });
+
+  it("does NOT emit nowrap when the sibling is a non-replaced element (it may carry its own text)", () => {
+    const css = generateCss(xIr(chipRow("span")), new Map());
+    assert.ok(!baseRule(css, "n1").includes("white-space:nowrap"), `non-replaced sibling must keep the leaf-only bail, got: ${baseRule(css, "n1")}`);
+  });
+});
+
+// A pill <button> whose captured width is CONSTANT across viewports (the label never changes) looks
+// authored-fixed to the button-width heuristic — but the sizing probe proved `width:auto` reproduces
+// the box AND it paints exactly at its own max-content width at every sample: the width is content,
+// not authored. Baking it invites the emitters' quantization (0.1px rounding / spacing-scale snap) to
+// land fractionally below the intrinsic single-line width and wrap the label; the width must be
+// dropped so the clone re-derives it intrinsically at every band.
+describe("generateCss content-fit button width (probe-proven auto beats the constant-width lock)", () => {
+  function pillBody(sizing?: () => RawSizing) {
+    const per = (): XPerVp => ({
+      cs: { display: "flex", cursor: "pointer", width: "144.188px", borderTopLeftRadius: "9999px", borderTopRightRadius: "9999px", lineHeight: "20px" },
+      bbox: { x: 0, y: 0, width: 144.19, height: 32 },
+      ...(sizing ? { sizing: sizing() } : {}),
+    });
+    const btn = xNode("n1", "button", { 375: per(), 768: per(), 1280: per() }, [{ text: "Clone LinkedIn" }]);
+    return xNode("n0", "body", {
+      375: { cs: { display: "flex" }, bbox: { x: 0, y: 0, width: 375, height: 32 } },
+      768: { cs: { display: "flex" }, bbox: { x: 0, y: 0, width: 768, height: 32 } },
+      1280: { cs: { display: "flex" }, bbox: { x: 0, y: 0, width: 1280, height: 32 } },
+    }, [btn]);
+  }
+
+  it("drops the width when the probe proves auto AND the button paints at its max-content everywhere", () => {
+    const sz = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false, wMin: 103.14, wMax: 144.19 });
+    const css = generateCss(xIr(pillBody(sz)), new Map());
+    assert.ok(!allRulesX(css, "n1").includes("width:144"), `content-fit pill width must be dropped, got: ${allRulesX(css, "n1")}`);
+  });
+
+  it("still bakes the width without probe evidence (no sizing data)", () => {
+    const css = generateCss(xIr(pillBody()), new Map());
+    assert.ok(allRulesX(css, "n1").includes("width:144"), `unproven button width must stay locked, got: ${allRulesX(css, "n1")}`);
+  });
+
+  it("still bakes the width when the probe proves it load-bearing (wAuto:false)", () => {
+    const sz = (): RawSizing => ({ wAuto: false, wFill: false, hAuto: true, hFill: false, wMin: 103.14, wMax: 144.19 });
+    const css = generateCss(xIr(pillBody(sz)), new Map());
+    assert.ok(allRulesX(css, "n1").includes("width:144"), `load-bearing button width must stay locked, got: ${allRulesX(css, "n1")}`);
+  });
+});
+
 // Cross-band transform identity — a node with a NON-identity transform at one band must emit the
 // explicit identity `transform:none` at the bands where the source is untransformed, so the
 // transform can't cascade across bands and freeze at a width the source left untransformed.
