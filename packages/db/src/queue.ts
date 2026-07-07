@@ -31,13 +31,23 @@ export async function enqueueClone(boss: PgBoss, jobId: string): Promise<string 
 }
 
 /** Register the worker handler. Normalizes pg-boss v9 (single job) vs v10 (array)
- *  callback shapes so the consumer just gets a jobId. */
-export async function workClone(boss: PgBoss, handler: (jobId: string) => Promise<void>): Promise<string> {
-  return boss.work(CLONE_QUEUE, async (job: unknown) => {
-    const arr = Array.isArray(job) ? job : [job];
-    for (const j of arr) {
-      const data = (j as { data?: ClonePayload }).data;
-      if (data?.jobId) await handler(data.jobId);
-    }
-  });
+ *  callback shapes so the consumer just gets a jobId.
+ *
+ *  `concurrency` registers that many independent pollers on the queue, so up to
+ *  N jobs run at once in this process with no head-of-line blocking (each poller
+ *  fetches its next job as soon as its current one finishes). */
+export async function workClone(boss: PgBoss, handler: (jobId: string) => Promise<void>, concurrency = 1): Promise<string[]> {
+  const pollers: string[] = [];
+  for (let i = 0; i < Math.max(1, concurrency); i++) {
+    pollers.push(
+      await boss.work(CLONE_QUEUE, async (job: unknown) => {
+        const arr = Array.isArray(job) ? job : [job];
+        for (const j of arr) {
+          const data = (j as { data?: ClonePayload }).data;
+          if (data?.jobId) await handler(data.jobId);
+        }
+      }),
+    );
+  }
+  return pollers;
 }

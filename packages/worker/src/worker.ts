@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { runCloneJob } from "@cloner/core";
 import { createDb, createBoss, workClone } from "@cloner/db";
 import { artifactStoreFromEnv } from "@cloner/storage";
@@ -16,13 +17,32 @@ async function main(): Promise<void> {
     store,
     runJob: runCloneJob,
     cacheTtlMs: env.cacheStaleAfterMs,
-    harnessProvider: makeHarnessProvider(env.harnessDir),
     captureCacheDir: env.captureCacheDir,
     tier: env.tier,
   };
 
-  await workClone(boss, (jobId) => processCloneJob(deps, jobId));
-  console.log(JSON.stringify({ event: "worker_started", artifactsDir: env.artifactsDir, harnessDir: env.harnessDir, cacheStaleAfterMs: env.cacheStaleAfterMs }));
+  // One harness per concurrency slot: verify builds must not share a harness dir
+  // (concurrent framework builds collide). With concurrency 1 this is the plain
+  // harnessDir, preserving existing layouts. At most `concurrency` jobs run at
+  // once (one per poller), so a free slot always exists at checkout.
+  const harnesses = Array.from({ length: env.concurrency }, (_, i) =>
+    makeHarnessProvider(env.concurrency > 1 ? join(env.harnessDir, `slot-${i}`) : env.harnessDir),
+  );
+  const freeSlots = harnesses.map((_, i) => i);
+
+  await workClone(
+    boss,
+    async (jobId) => {
+      const slot = freeSlots.pop() ?? 0;
+      try {
+        await processCloneJob({ ...deps, harnessProvider: harnesses[slot]! }, jobId);
+      } finally {
+        freeSlots.push(slot);
+      }
+    },
+    env.concurrency,
+  );
+  console.log(JSON.stringify({ event: "worker_started", concurrency: env.concurrency, artifactsDir: env.artifactsDir, harnessDir: env.harnessDir, cacheStaleAfterMs: env.cacheStaleAfterMs }));
 }
 
 main().catch((e) => {

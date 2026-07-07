@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "./client.js";
 import { jobs, clones, cache, apiKeys, signupTokens, jobEvents, type Job, type NewJob, type Clone, type NewClone, type CacheRow, type ApiKey, type SignupToken } from "./schema.js";
 
@@ -38,6 +38,19 @@ export async function markFailed(db: Db, id: string, error: string): Promise<voi
 
 export async function listJobs(db: Db, limit = 50): Promise<Job[]> {
   return db.select().from(jobs).orderBy(desc(jobs.createdAt)).limit(limit);
+}
+
+/** The newest still-active (queued/running) job for a cache key, if any — the
+ *  in-flight dedup lookup: identical submits attach to it instead of enqueueing
+ *  a duplicate capture. */
+export async function findActiveJobByCacheKey(db: Db, key: string): Promise<Job | undefined> {
+  const [row] = await db
+    .select()
+    .from(jobs)
+    .where(and(eq(jobs.cacheKey, key), inArray(jobs.status, ["queued", "running"])))
+    .orderBy(desc(jobs.createdAt))
+    .limit(1);
+  return row;
 }
 
 export async function deleteJob(db: Db, id: string): Promise<boolean> {
