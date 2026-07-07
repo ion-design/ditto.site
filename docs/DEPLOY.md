@@ -12,14 +12,20 @@ Postgres and S3-compatible storage. The recommended OSS-friendly stack:
 ## 1. Database (Neon)
 
 1. Create a Neon project; copy the pooled connection string.
-2. Apply migrations (from CI/CD or locally):
+2. Migrations run **automatically before every Railway deploy**: the repo's
+   `railway.json` sets `npm run db:migrate` as the pre-deploy command, which
+   Railway executes (with the service's env, so `DATABASE_URL` is present)
+   before starting the new deployment. Re-running is a no-op for anything
+   already applied, and concurrent runs (api + worker deploying off the same
+   push) serialize on a Postgres advisory lock. A failed migration fails the
+   deploy — the old version keeps serving.
+
+   To apply migrations manually (first-time setup, or outside Railway):
    ```bash
    DATABASE_URL='postgres://...neon.../ditto_site?sslmode=require' npm run db:migrate
    ```
-   Run this on every deploy that changes `packages/db/migrations`. Drizzle tracks
-   applied migrations in the database, so re-running is a no-op for anything
-   already applied. (Alternatively, apply a single migration by piping its SQL
-   through `psql`/the Neon CLI — but prefer `db:migrate`, which also records the
+   (Alternatively, apply a single migration by piping its SQL through
+   `psql`/the Neon CLI — but prefer `db:migrate`, which also records the
    journal entry so future runs stay consistent.)
 
    Current migrations: `0000` core tables, `0001` signup tokens,

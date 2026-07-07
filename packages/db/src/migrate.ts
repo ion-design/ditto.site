@@ -6,12 +6,26 @@ import { createDb } from "./client.js";
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const MIGRATIONS_DIR = join(HERE, "..", "migrations");
 
-/** Apply all pending Drizzle migrations to the target database. */
+/** App-wide advisory lock id for migrations. Concurrent `db:migrate` runs (e.g.
+ *  api + worker pre-deploy firing off the same push) serialize on it instead of
+ *  racing Drizzle's journal writes. */
+const MIGRATE_LOCK_ID = 0xd1770;
+
+/** Apply all pending Drizzle migrations to the target database. Safe to run
+ *  concurrently: callers serialize on a Postgres advisory lock, and re-running
+ *  applied migrations is a journal no-op. */
 export async function runMigrations(connectionString: string, migrationsFolder = MIGRATIONS_DIR): Promise<void> {
   const { db, pool } = createDb(connectionString);
+  const client = await pool.connect();
   try {
-    await migrate(db, { migrationsFolder });
+    await client.query("SELECT pg_advisory_lock($1)", [MIGRATE_LOCK_ID]);
+    try {
+      await migrate(db, { migrationsFolder });
+    } finally {
+      await client.query("SELECT pg_advisory_unlock($1)", [MIGRATE_LOCK_ID]);
+    }
   } finally {
+    client.release();
     await pool.end();
   }
 }
