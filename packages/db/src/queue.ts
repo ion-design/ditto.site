@@ -3,11 +3,23 @@ import PgBoss from "pg-boss";
 export const CLONE_QUEUE = "clone-jobs";
 export type ClonePayload = { jobId: string };
 
+function logQueueEvent(event: string, fields: Record<string, unknown>, level: "warn" | "error" = "error"): void {
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(),
+    level,
+    service: "db",
+    event,
+    ...fields,
+  }));
+}
+
 /** Start a pg-boss instance on the same Postgres (no Redis). pg-boss manages its
  *  own schema/tables and gives us retries, heartbeats, and visibility timeouts. */
 export async function createBoss(connectionString: string): Promise<PgBoss> {
   const boss = new PgBoss({ connectionString });
-  boss.on("error", (e) => console.error(JSON.stringify({ event: "pgboss_error", error: String(e).slice(0, 300) })));
+  boss.on("error", (e) => logQueueEvent("pgboss_error", {
+    error: e instanceof Error ? { name: e.name, message: e.message.slice(0, 300) } : { message: String(e).slice(0, 300) },
+  }));
   await boss.start();
   // pg-boss v10 requires queues to be created before send/work (idempotent).
   const anyBoss = boss as unknown as { createQueue?: (name: string) => Promise<void> };

@@ -1,5 +1,5 @@
 import { serve } from "@hono/node-server";
-import { runCloneJob } from "@cloner/core";
+import { createJsonLogger, errorFields, runCloneJob } from "@cloner/core";
 import { createDb, createBoss, repo, type Db } from "@cloner/db";
 import { artifactStoreFromEnv } from "@cloner/storage";
 import { createApp } from "./app.js";
@@ -27,6 +27,7 @@ function buildAuth(env: ApiEnv, db?: Db): AuthConfig | undefined {
 
 async function main(): Promise<void> {
   const env = loadEnv();
+  const log = createJsonLogger("api");
   let backend: Backend;
   let db: Db | undefined;
 
@@ -35,13 +36,13 @@ async function main(): Promise<void> {
     db = h.db;
     const boss = await createBoss(env.databaseUrl);
     const store = artifactStoreFromEnv();
-    backend = new DbBackend({ db, boss, store });
-    console.log(JSON.stringify({ event: "api_mode", mode: "db+queue" }));
+    backend = new DbBackend({ db, boss, store, log });
+    log("api_configured", { mode: "db+queue" });
   } else {
     const store = new InMemoryStore(env.cloneTtlMs);
     store.startSweeper();
-    backend = new InMemoryBackend({ store, runJob: runCloneJob, captureCacheDir: env.captureCacheDir || undefined });
-    console.log(JSON.stringify({ event: "api_mode", mode: "in-memory" }));
+    backend = new InMemoryBackend({ store, runJob: runCloneJob, captureCacheDir: env.captureCacheDir || undefined, log });
+    log("api_configured", { mode: "in-memory", cloneTtlMs: env.cloneTtlMs });
   }
 
   const auth = buildAuth(env, db);
@@ -84,24 +85,22 @@ async function main(): Promise<void> {
           }
         : undefined,
     assertUrl: env.ssrfEnabled ? async (url) => void (await assertPublicUrl(url, { allowLoopback: env.ssrfAllowLoopback })) : undefined,
+    log,
   });
 
   serve({ fetch: app.fetch, port: env.port }, (info) => {
-    console.log(
-      JSON.stringify({
-        event: "api_listening",
-        port: info.port,
-        auth: !!auth,
-        signup: env.signupEnabled && !!db,
-        emailSignup: !!emailSignup,
-        rateLimitPerMinute: env.rateLimitPerMinute || null,
-        ssrf: env.ssrfEnabled,
-      }),
-    );
+    log("api_listening", {
+      port: info.port,
+      auth: !!auth,
+      signup: env.signupEnabled && !!db,
+      emailSignup: !!emailSignup,
+      rateLimitPerMinute: env.rateLimitPerMinute || null,
+      ssrf: env.ssrfEnabled,
+    });
   });
 }
 
 main().catch((e) => {
-  console.error(e);
+  createJsonLogger("api")("api_start_failed", { error: errorFields(e) }, "error");
   process.exit(1);
 });

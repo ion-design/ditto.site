@@ -6,6 +6,15 @@ export { runCloneJob, verifyCloneJobResult } from "./runCloneJob.js";
 export { collectFileMap, fileMapStats } from "./collectFileMap.js";
 export { cacheKey, normalizeUrl, canonicalOptions } from "./cacheKey.js";
 export {
+  createJsonLogger,
+  errorFields,
+  summarizeCloneOptions,
+  summarizeFileMap,
+  type LogFields,
+  type LogLevel,
+  type ServiceLogger,
+} from "./observability.js";
+export {
   normalizeCloneRequestOptions,
   resolveCloneMode,
   resolveCloneOptions,

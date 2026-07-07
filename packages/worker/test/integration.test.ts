@@ -94,6 +94,8 @@ describe("M2: async job lifecycle (Postgres queue + DB + worker)", { skip: hasTe
     assert.equal(done.status, "succeeded");
     assert.equal(done.capture.nodeCount, 7);
     assert.equal(done.fileCount, 3);
+    const events = await (await app.request(`/v1/clones/${jobId}/events`)).json();
+    assert.ok(events.events.some((e: { event?: string }) => e.event === "clone_created"));
 
     // Full result + per-file streaming.
     const result = await (await app.request(`/v1/clones/${jobId}/result`)).json();

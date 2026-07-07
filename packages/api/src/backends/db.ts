@@ -1,4 +1,4 @@
-import { cacheKey, COMPILER_VERSION, resolveCloneMode, type CloneOptions, type RouteInfo } from "@cloner/core";
+import { cacheKey, COMPILER_VERSION, resolveCloneMode, summarizeCloneOptions, type CloneOptions, type RouteInfo, type ServiceLogger } from "@cloner/core";
 import { repo, enqueueClone, type Db, type PgBoss } from "@cloner/db";
 import { makeTarGz, makeZip, sha256hex, type ArtifactStore, type StoredFile } from "@cloner/storage";
 import type { Backend, BundleFormat, CloneBundle, FileFacet, JobView, JobStatus, ResultOutcome, SubmitOutcome } from "../backend.js";
@@ -11,7 +11,7 @@ export type StoredEnvelope = { files: StoredFile[]; routes?: RouteInfo[]; bundle
 /** Async, DB+queue backend (M2): submit enqueues a job and returns 202; the worker
  *  processes it and writes the result. Reads come from Postgres + the ArtifactStore. */
 export class DbBackend implements Backend {
-  constructor(private deps: { db: Db; boss: PgBoss; store: ArtifactStore }) {}
+  constructor(private deps: { db: Db; boss: PgBoss; store: ArtifactStore; log?: ServiceLogger }) {}
 
   async submit(url: string, options: CloneOptions | undefined): Promise<SubmitOutcome> {
     const key = cacheKey(url, options, COMPILER_VERSION);
@@ -22,13 +22,17 @@ export class DbBackend implements Backend {
       if (hit?.jobId) {
         const r = await this.result(hit.jobId);
         if (r && r.ready) {
+          this.deps.log?.("clone_cache_hit", { jobId: hit.jobId, url, kind, options: summarizeCloneOptions(options) });
           return { jobId: hit.jobId, status: "cached", httpStatus: 200, result: { ...r.result, status: "cached" } };
         }
       }
+    } else {
+      this.deps.log?.("clone_cache_bypassed", { url, kind, options: summarizeCloneOptions(options) });
     }
 
     const job = await repo.createJob(this.deps.db, { kind, url, options: options ?? {}, status: "queued", cacheKey: key });
-    await enqueueClone(this.deps.boss, job.id);
+    const queueJobId = await enqueueClone(this.deps.boss, job.id);
+    this.deps.log?.("clone_queued", { jobId: job.id, queueJobId, backend: "db", url, kind, options: summarizeCloneOptions(options) });
     return { jobId: job.id, status: "queued", httpStatus: 202 };
   }
 
@@ -140,6 +144,7 @@ export class DbBackend implements Backend {
     const bytes = format === "zip" ? makeZip(entries) : makeTarGz(entries);
     // S3 store: upload + presign so the client downloads directly; local: served by the API.
     const url = this.deps.store.uploadBundle ? await this.deps.store.uploadBundle(jobId, format, bytes) : undefined;
+    this.deps.log?.("clone_bundle_created", { jobId, format, bytes: bytes.length, delivery: url ? "redirect" : "api" });
     return { bytes, sha256: sha256hex(bytes), format, url };
   }
 

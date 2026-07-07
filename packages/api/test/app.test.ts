@@ -96,6 +96,10 @@ test("POST /v1/clones enqueues then completes; binaries by reference; streaming 
     const result = await app.request(`/v1/clones/${queued.jobId}/result`);
     assert.equal(result.status, 200);
 
+    // Lifecycle events include the service-level creation milestone.
+    const events = await (await app.request(`/v1/clones/${queued.jobId}/events`)).json();
+    assert.ok(events.events.some((e: { event?: string }) => e.event === "clone_created"));
+
     // List.
     const list = await (await app.request("/v1/clones")).json();
     assert.equal(list.clones.length, 1);

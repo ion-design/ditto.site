@@ -5,7 +5,7 @@ import { z } from "zod";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { normalizeCloneRequestOptions } from "@cloner/core";
+import { errorFields, normalizeCloneRequestOptions, summarizeCloneOptions, type ServiceLogger } from "@cloner/core";
 import type { Backend } from "./backend.js";
 import { createMcpServer } from "./mcp.js";
 import { apiKeyAuth, hashApiKey, rateLimit, type AuthConfig } from "./auth.js";
@@ -83,6 +83,8 @@ export type AppDeps = {
   signupCorsOrigins?: string[];
   /** SSRF guard run on submit (omit = no check — set in production). Throws to reject. */
   assertUrl?: (url: string) => Promise<void>;
+  /** Structured service logger. Omit in tests to keep stdout quiet. */
+  log?: ServiceLogger;
 };
 
 /** Build the Hono app over a Backend. The in-memory backend (M1) runs clones inline
@@ -218,10 +220,12 @@ export function createApp(deps: AppDeps): Hono {
     const body = await c.req.json().catch(() => null);
     const parsed = CloneRequest.safeParse(body);
     if (!parsed.success) {
+      deps.log?.("clone_request_rejected", { reason: "invalid_body", issues: parsed.error.issues.length }, "warn");
       return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
     }
     const { url, options } = parsed.data;
     if (!/^https?:\/\//i.test(url)) {
+      deps.log?.("clone_request_rejected", { reason: "unsupported_protocol" }, "warn");
       return c.json({ error: "url must be http(s)" }, 400);
     }
     // SSRF guard (production): block private/link-local/metadata targets.
@@ -229,6 +233,7 @@ export function createApp(deps: AppDeps): Hono {
       try {
         await deps.assertUrl(url);
       } catch (e) {
+        deps.log?.("clone_request_rejected", { reason: "url_not_allowed", url, error: errorFields(e) }, "warn");
         return c.json({ error: "url not allowed", reason: String((e as Error).message ?? e) }, 400);
       }
     }
@@ -239,11 +244,22 @@ export function createApp(deps: AppDeps): Hono {
 
     try {
       const out = await backend.submit(url, opts);
+      deps.log?.("clone_request_accepted", {
+        jobId: out.jobId,
+        url,
+        status: out.status,
+        httpStatus: out.httpStatus,
+        options: summarizeCloneOptions(opts),
+      });
       if (out.status === "queued") return c.json({ jobId: out.jobId, status: "queued" }, out.httpStatus);
       return c.json(out.result, 200);
     } catch (e) {
       const msg = String(e);
-      if (msg.startsWith("BUSY:")) return c.json({ error: msg.slice(5).trim() }, 429);
+      if (msg.startsWith("BUSY:")) {
+        deps.log?.("clone_request_rejected", { reason: "busy", url, options: summarizeCloneOptions(opts) }, "warn");
+        return c.json({ error: msg.slice(5).trim() }, 429);
+      }
+      deps.log?.("clone_request_failed", { url, options: summarizeCloneOptions(opts), error: errorFields(e) }, "error");
       return c.json({ status: "failed", error: msg.slice(0, 500) }, 500);
     }
   });
