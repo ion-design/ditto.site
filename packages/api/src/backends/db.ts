@@ -25,6 +25,13 @@ export class DbBackend implements Backend {
           return { jobId: hit.jobId, status: "cached", httpStatus: 200, result: { ...r.result, status: "cached" } };
         }
       }
+      // In-flight dedup: an identical clone is already queued/running — attach the
+      // caller to that job instead of enqueueing a duplicate capture. (Best-effort:
+      // no unique constraint, so a same-instant race can still double-submit.)
+      const active = await repo.findActiveJobByCacheKey(this.deps.db, key);
+      if (active) {
+        return { jobId: active.id, status: "queued", httpStatus: 202 };
+      }
     }
 
     const job = await repo.createJob(this.deps.db, { kind, url, options: options ?? {}, status: "queued", cacheKey: key });
