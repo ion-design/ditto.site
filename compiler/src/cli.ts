@@ -668,6 +668,6 @@ async function main(): Promise<void> {
   await finish(res);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
