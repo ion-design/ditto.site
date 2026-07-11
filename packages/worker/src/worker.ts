@@ -39,6 +39,26 @@ async function main(): Promise<void> {
   const MAX_CONSECUTIVE_LAUNCH_FAILURES = 3;
   let launchFailures = 0;
 
+  // Self-healing: the render pipeline leaks heap across jobs (~3.9GB over 20h
+  // at concurrency 1), and V8 eventually aborts with "Reached heap limit"
+  // MID-job — losing that job to expiry and, if the platform's restart retries
+  // are exhausted, killing the worker for good. Recycle proactively instead:
+  // once heap crosses the threshold after a job, stop fetching new jobs, let
+  // in-flight handlers finish and ack (a bare process.exit here would requeue
+  // jobs that already succeeded — pg-boss marks completion only after the
+  // handler resolves), then exit nonzero for a fresh container.
+  const HEAP_RECYCLE_BYTES = 2.5 * 1024 * 1024 * 1024;
+  let recycling = false;
+  const recycleIfBloated = () => {
+    const { heapUsed, rss } = process.memoryUsage();
+    if (recycling || heapUsed < HEAP_RECYCLE_BYTES) return;
+    recycling = true;
+    console.error(JSON.stringify({ event: "worker_unhealthy", reason: "heap above recycle threshold — draining, then exiting for a fresh container", heapUsedMb: Math.round(heapUsed / 1e6), rssMb: Math.round(rss / 1e6) }));
+    boss.once("stopped", () => process.exit(1));
+    setTimeout(() => process.exit(1), 60_000); // fallback if graceful stop hangs
+    void boss.stop({ graceful: true, wait: false, timeout: 55_000 }).catch(() => process.exit(1));
+  };
+
   await workClone(
     boss,
     async (jobId) => {
@@ -59,6 +79,7 @@ async function main(): Promise<void> {
         throw e;
       } finally {
         freeSlots.push(slot);
+        recycleIfBloated();
       }
     },
     env.concurrency,
