@@ -668,6 +668,11 @@ async function main(): Promise<void> {
   await finish(res);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Robust "run as main" check: compare decoded absolute paths, not raw
+// file:// strings. `file://${argv[1]}` breaks when the path contains a space
+// (import.meta.url encodes it as %20) — e.g. ".../WEB DEV/DITTO/..." — which
+// silently skips main() and exits 0. fileURLToPath decodes; resolve() also
+// covers a relative argv[1].
+if (fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
