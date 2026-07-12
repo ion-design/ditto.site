@@ -2,7 +2,7 @@
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { captureSite, REQUIRED_VIEWPORTS, SAMPLE_VIEWPORTS, type CaptureResult } from "./capture/capture.js";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { generateAll } from "./generate/pipeline.js";
 import { refineSizing } from "./generate/refineSizing.js";
 import { writeJSON, writeText, ensureDir, readJSON, fileExists } from "./util/fsx.js";
@@ -668,6 +668,6 @@ async function main(): Promise<void> {
   await finish(res);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
