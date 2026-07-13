@@ -27,7 +27,7 @@
   "dependencies": {
     "drizzle-orm": "^0.45.2",
     "pg": "^8.13.1",
-    "pg-boss": "^10.1.5"
+    "pg-boss": "^12.26.0"
   },
   "devDependencies": {
     "@cloner/test-utils": "*",
