@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { canonicalOptions, verifyCloneJobResult, type CloneJobResult, type CloneOptions, type RunCloneJobInput } from "@cloner/core";
 import { repo, type Db } from "@cloner/db";
 import type { ArtifactStore } from "@cloner/storage";
+import { classifyCloneJobRetry } from "./retryPolicy.js";
 
 export type RunJob = (input: RunCloneJobInput) => Promise<CloneJobResult>;
 
@@ -88,6 +89,11 @@ export async function processCloneJob(deps: ProcessDeps, jobId: string): Promise
     }
   } catch (e) {
     await repo.markFailed(db, jobId, String(e));
+    const retry = classifyCloneJobRetry(e);
+    if (!retry.retry) {
+      await repo.appendJobEvent(db, jobId, { event: "retry_suppressed", reason: retry.reason }).catch(() => {});
+      return;
+    }
     throw e;
   } finally {
     rmSync(base, { recursive: true, force: true });
