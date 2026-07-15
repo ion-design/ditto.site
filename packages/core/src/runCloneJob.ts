@@ -15,7 +15,7 @@ import {
   type CloneResult as CompilerCloneResult,
   type CloneSiteResult,
 } from "clone-static";
-import { collectFileMap } from "./collectFileMap.js";
+import { collectDeliveryFileMap } from "./collectFileMap.js";
 import type { CaptureSanity, CloneJobResult, CloneOptions, RouteInfo, RunCloneJobInput } from "./types.js";
 import { normalizeCloneRequestOptions, resolveCloneOptions } from "./options.js";
 
@@ -161,7 +161,12 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
       verifyMs = done.verifyMs;
     }
 
-    const files = collectFileMap(runDir);
+    // Delivery cleanup + collect. Runs the same exportApp pass as the CLI --out
+    // path against a COPY (<runDir>/delivery/app) and collects that: service
+    // deliveries ship without raw data-cid probe attributes, while generated/app
+    // stays raw for the asyncVerify path, which re-reads this run dir after
+    // persist (see collectDeliveryFileMap).
+    const files = collectDeliveryFileMap(runDir);
 
     return {
       url: input.url,

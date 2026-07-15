@@ -3,7 +3,7 @@
  * The api / worker / mcp layers depend on this, never on compiler internals.
  */
 export { runCloneJob, verifyCloneJobResult } from "./runCloneJob.js";
-export { collectFileMap, fileMapStats } from "./collectFileMap.js";
+export { collectFileMap, collectDeliveryFileMap, fileMapStats } from "./collectFileMap.js";
 export { cacheKey, normalizeUrl, canonicalOptions } from "./cacheKey.js";
 export {
   normalizeCloneRequestOptions,

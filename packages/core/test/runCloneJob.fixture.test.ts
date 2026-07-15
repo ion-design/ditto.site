@@ -56,6 +56,16 @@ describe("runCloneJob (served fixture)", { skip: CHROMIUM ? false : "no Chromium
       assert.ok((res.files[k]!.content ?? "").length > 0, `${k} has content`);
     }
 
+    // Service deliveries run the same delivery-cleanup pass as the CLI --out
+    // export: no validation-only data-cid probe attrs, no `_cids.ts`, and never
+    // an empty data-ditto-id={} expression (the historical RSC crash class).
+    assert.equal(res.files["src/app/_cids.ts"], undefined, "_cids.ts is not shipped");
+    for (const [path, f] of Object.entries(res.files)) {
+      if (f.kind !== "text" || path.startsWith("public/")) continue;
+      assert.ok(!(f.content ?? "").includes(" data-cid="), `${path}: no raw data-cid probe attrs`);
+      assert.ok(!(f.content ?? "").includes("data-ditto-id={}"), `${path}: no empty data-ditto-id expression`);
+    }
+
     // Capture sanity: a real fixture is not degenerate / bot-walled.
     assert.ok(res.capture.nodeCount > 0, "nodeCount > 0");
     assert.equal(res.capture.blocked, false);
