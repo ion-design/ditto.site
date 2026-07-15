@@ -109,6 +109,7 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
         maxRoutes: options.maxRoutes,
         maxCollectionInstances: options.maxCollection,
         captureConcurrency: options.captureConcurrency,
+        crawlConcurrency: options.crawlConcurrency,
         validationConcurrency: options.validationConcurrency,
         viewportConcurrency: options.viewportConcurrency,
         screenshots: captureValidationArtifacts,

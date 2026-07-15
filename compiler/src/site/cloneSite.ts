@@ -41,6 +41,7 @@ export type CloneSiteOptions = {
   reflow?: boolean; // Reflow trade: flow all heights (ON by default, matching single-page; --no-reflow to disable)
   screenshots?: boolean; // capture per-viewport full-page screenshots (validation-only; default tied to `validate`)
   captureConcurrency?: number; // routes captured in parallel (default 3; isolated browser each). 1 = sequential
+  crawlConcurrency?: number; // discovery pages crawled in parallel (default 3; shared context). 1 = sequential
   validationConcurrency?: number; // validation routes rendered/graded in parallel (default 2)
   viewportConcurrency?: number; // clone viewports rendered in parallel during validation (default 2)
   outDir?: string; // clean <outDir>/<siteName>/{app,.clone} layout; reuses a prior single-page capture as the entry route
@@ -105,7 +106,7 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
 
   // 1. Crawl + select.
   log({ event: "crawl_start", url: opts.url });
-  const crawl = await crawlSite({ url: opts.url, maxDepth: opts.maxDepth, log });
+  const crawl = await crawlSite({ url: opts.url, maxDepth: opts.maxDepth, crawlConcurrency: opts.crawlConcurrency, log });
   let plan = selectRoutes({ entryPath: crawl.entryPath, paths: crawl.paths, maxRoutes: opts.maxRoutes, maxCollectionInstances: opts.maxCollectionInstances });
   writeJSON(join(runDir, "crawl.json"), {
     entryUrl: crawl.entryUrl, origin: crawl.origin, entryPath: crawl.entryPath,
@@ -342,6 +343,7 @@ async function main(): Promise<void> {
   const maxCollection = args.find((a) => a.startsWith("--max-collection="))?.split("=")[1];
   const maxDepth = args.find((a) => a.startsWith("--depth="))?.split("=")[1];
   const concurrency = args.find((a) => a.startsWith("--concurrency="))?.split("=")[1];
+  const crawlConcurrency = args.find((a) => a.startsWith("--crawl-concurrency="))?.split("=")[1];
   const validationConcurrency = args.find((a) => a.startsWith("--validate-concurrency=") || a.startsWith("--validation-concurrency="))?.split("=")[1];
   const viewportConcurrency = args.find((a) => a.startsWith("--viewport-concurrency="))?.split("=")[1];
   const runsArg = args.find((a) => a.startsWith("--runs="))?.split("=")[1];
@@ -399,6 +401,7 @@ async function main(): Promise<void> {
     maxCollectionInstances: maxCollection ? parseInt(maxCollection, 10) : undefined,
     maxDepth: maxDepth ? parseInt(maxDepth, 10) : undefined,
     captureConcurrency: concurrency ? parseInt(concurrency, 10) : undefined,
+    crawlConcurrency: crawlConcurrency ? parseInt(crawlConcurrency, 10) : undefined,
     validationConcurrency: validationConcurrency ? parseInt(validationConcurrency, 10) : undefined,
     viewportConcurrency: viewportConcurrency ? parseInt(viewportConcurrency, 10) : undefined,
     validate,
