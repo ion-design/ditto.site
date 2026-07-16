@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
 import { join, extname, basename, relative, sep } from "node:path";
+import { exportApp } from "clone-static";
 import type { CollectedFile, FileMap } from "./types.js";
 
 /** Extensions whose bytes are returned inline as UTF-8 text (the code a consumer
@@ -30,12 +31,13 @@ function* walk(dir: string): Generator<string> {
 
 const toPosix = (p: string): string => (sep === "/" ? p : p.split(sep).join("/"));
 
-/** Collect the generated app (`<runDir>/generated/app/`) into a file map keyed
- *  by app-relative POSIX path. Text files inline their content; binaries carry a
- *  local path + sha256 for the storage layer to upload and presign. Keys are sorted
- *  so the map is deterministic for the same generated app (golden-file friendly). */
-export function collectFileMap(runDir: string): FileMap {
-  const appDir = join(runDir, "generated", "app");
+/** Collect the generated app (`<runDir>/generated/app/`, or an explicit `appDir`
+ *  override) into a file map keyed by app-relative POSIX path. Text files inline
+ *  their content; binaries carry a local path + sha256 for the storage layer to
+ *  upload and presign. Keys are sorted so the map is deterministic for the same
+ *  generated app (golden-file friendly). */
+export function collectFileMap(runDir: string, appDirOverride?: string): FileMap {
+  const appDir = appDirOverride ?? join(runDir, "generated", "app");
   if (!existsSync(appDir)) {
     throw new Error(`collectFileMap: no generated app at ${appDir}`);
   }
@@ -55,6 +57,29 @@ export function collectFileMap(runDir: string): FileMap {
   const map: FileMap = {};
   for (const f of files) map[f.path] = f;
   return map;
+}
+
+/** Collect the DELIVERY file map: publish a cleaned copy of the generated app
+ *  through the same `exportApp` pass the CLI `--out` path runs (strips the
+ *  validation-only `data-cid` probe attributes, rewrites runtime/CSS refs to
+ *  semantic `data-ditto-id` anchors, converts `_cids.ts` to `ditto-meta.ts`),
+ *  then collect that copy — so service deliveries are byte-identical to CLI
+ *  exports of the same run.
+ *
+ *  `generated/app` deliberately stays RAW: async verification re-reads the run
+ *  dir AFTER the file map is persisted — validateRun/validateSite regenerate
+ *  into `generated/` and the render/manifest gates align clone↔source through
+ *  the `data-cid` probes — so the cleaned copy lives in `<runDir>/delivery/app`
+ *  instead of mutating the run dir. The pass itself is also idempotent, so an
+ *  already-cleaned app dir can never be double-cleaned into a broken state. */
+export function collectDeliveryFileMap(runDir: string): FileMap {
+  const generatedApp = join(runDir, "generated", "app");
+  if (!existsSync(generatedApp)) {
+    throw new Error(`collectDeliveryFileMap: no generated app at ${generatedApp}`);
+  }
+  const deliveryApp = join(runDir, "delivery", "app");
+  exportApp(generatedApp, deliveryApp);
+  return collectFileMap(runDir, deliveryApp);
 }
 
 /** Total bytes + file count for a quick overview (the cheap metadata an MCP

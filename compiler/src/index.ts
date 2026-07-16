@@ -12,6 +12,9 @@
 export { runClone, siteIdFromUrl, latestSourceDir } from "./cli.js";
 export type { CloneOptions, CloneResult } from "./cli.js";
 
+// ---- Delivery cleanup (shared by the CLI --out export and the service file map) ----
+export { exportApp, stripDeliveryDataCids } from "./export/deliveryClean.js";
+
 // ---- Multi-page / whole-site clone ----
 export { runCloneSite, regenerateSite } from "./site/cloneSite.js";
 export type { CloneSiteOptions, CloneSiteResult } from "./site/cloneSite.js";
