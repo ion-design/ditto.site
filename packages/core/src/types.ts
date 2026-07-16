@@ -35,6 +35,7 @@ export type CloneOptions = {
   maxRoutes?: number;
   maxCollection?: number;
   captureConcurrency?: number;
+  crawlConcurrency?: number;
   validationConcurrency?: number;
   viewportConcurrency?: number;
   /** Service-level: bypass the cache on read AND write (does not affect output). */

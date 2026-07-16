@@ -7,6 +7,7 @@
  */
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { toRoutePath, segmentsOf } from "./url.js";
+import { runCrawlPool, type CrawlQueueItem, type VisitOutcome } from "./crawlPool.js";
 
 const DESKTOP_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -27,6 +28,8 @@ export type CrawlOptions = {
   maxDiscoverPages?: number; // cap on lightweight navigations (default 30)
   maxSitemapUrls?: number; // cap on sitemap <loc> entries consumed (default 2000)
   respectRobots?: boolean; // default true
+  crawlConcurrency?: number; // discovery pages loaded in parallel from ONE context (default 3); 1 = serial
+  settleMs?: number; // post-domcontentloaded settle wait per page (default 1200)
   log?: (e: Record<string, unknown>) => void;
 };
 
@@ -138,6 +141,8 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlResult> {
   const maxDiscoverPages = opts.maxDiscoverPages ?? 30;
   const maxSitemapUrls = opts.maxSitemapUrls ?? 2000;
   const respectRobots = opts.respectRobots ?? true;
+  const crawlConcurrency = Math.max(1, opts.crawlConcurrency ?? 3);
+  const settleMs = opts.settleMs ?? 1200;
 
   const base = opts.url;
   const origin = new URL(base).origin;
@@ -173,40 +178,58 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlResult> {
       addSource(p, "sitemap");
     }
 
-    // BFS from entry (lightweight navigations)
+    // BFS from entry (lightweight navigations), bounded-parallel: up to
+    // crawlConcurrency pages from this ONE context, scheduled by the deterministic
+    // wave pool (see crawlPool.ts). Each worker lane keeps a reusable page;
+    // a crashed/closed page is recreated on the lane's next visit.
     depthByPath[entryPath] = 0;
     addSource(entryPath, "entry");
-    const queue: Array<{ path: string; depth: number }> = [{ path: entryPath, depth: 0 }];
-    const visited = new Set<string>();
-    let navs = 0;
-    const page = await ctx.newPage();
-    page.setDefaultTimeout(20000);
-    while (queue.length && navs < maxDiscoverPages) {
-      queue.sort((a, b) => a.depth - b.depth || a.path.localeCompare(b.path));
-      const { path, depth } = queue.shift()!;
-      if (visited.has(path)) continue;
-      visited.add(path);
-      if (depth > maxDepth) continue;
-      const url = origin + (path === "/" ? "/" : path);
-      let ok = true;
+    const lanePages: Array<Page | null> = Array.from({ length: crawlConcurrency }, () => null);
+    const lanePage = async (slot: number): Promise<Page> => {
+      const existing = lanePages[slot];
+      if (existing && !existing.isClosed()) return existing;
+      const p = await ctx.newPage();
+      p.setDefaultTimeout(20000);
+      lanePages[slot] = p;
+      return p;
+    };
+    const visit = async (item: CrawlQueueItem, slot: number): Promise<VisitOutcome> => {
+      const url = origin + (item.path === "/" ? "/" : item.path);
       try {
+        const page = await lanePage(slot);
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-        await page.waitForTimeout(1200);
-      } catch { ok = false; }
-      navs++;
-      if (!ok) { log({ event: "discover_nav_fail", path }); continue; }
-      const links = await harvestLinks(page, base);
-      log({ event: "discovered", path, depth, links: links.length, navs });
-      for (const l of links) {
-        if (!allow(l)) continue;
-        addSource(l, "link");
-        if (!(l in depthByPath) || depthByPath[l]! > depth + 1) depthByPath[l] = depth + 1;
-        // Record every discovered path (template induction needs them all), but only
-        // *navigate into* likely hub/listing pages — descending into every content
-        // leaf (blog post, doc article) is wasteful and rarely reveals new structure.
-        if (!visited.has(l) && depth + 1 <= maxDepth && !looksLikeLeaf(l)) queue.push({ path: l, depth: depth + 1 });
+        await page.waitForTimeout(settleMs);
+        return { ok: true, links: await harvestLinks(page, base) };
+      } catch {
+        // Failed URL is skipped. Drop the lane's page so the next visit recreates it.
+        const broken = lanePages[slot];
+        lanePages[slot] = null;
+        if (broken) await broken.close().catch(() => {});
+        return { ok: false, links: [] };
       }
-    }
+    };
+    let navs = 0;
+    await runCrawlPool({
+      seeds: [{ path: entryPath, depth: 0 }],
+      visit,
+      concurrency: crawlConcurrency,
+      maxDepth,
+      maxVisits: maxDiscoverPages,
+      // Record every discovered path (template induction needs them all), but only
+      // *navigate into* likely hub/listing pages — descending into every content
+      // leaf (blog post, doc article) is wasteful and rarely reveals new structure.
+      canEnqueue: (p) => allow(p) && !looksLikeLeaf(p),
+      onLink: (l, d) => {
+        if (!allow(l)) return;
+        addSource(l, "link");
+        if (!(l in depthByPath) || depthByPath[l]! > d) depthByPath[l] = d;
+      },
+      onVisit: (item, out) => {
+        navs++;
+        if (!out.ok) log({ event: "discover_nav_fail", path: item.path });
+        else log({ event: "discovered", path: item.path, depth: item.depth, links: out.links.length, navs });
+      },
+    });
     await ctx.close();
   } finally {
     await browser.close();

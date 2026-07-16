@@ -618,6 +618,7 @@ async function main(): Promise<void> {
     const maxCollection = firstFlagValue(args, ["--dev-max-collection", "--max-collection"]);
     const maxDepth = firstFlagValue(args, ["--dev-depth", "--depth"]);
     const concurrency = firstFlagValue(args, ["--dev-concurrency", "--concurrency"]);
+    const crawlConcurrency = firstFlagValue(args, ["--dev-crawl-concurrency", "--crawl-concurrency"]);
     const validationConcurrency = firstFlagValue(args, ["--dev-validate-concurrency", "--validate-concurrency", "--validation-concurrency"]);
     const viewportConcurrency = firstFlagValue(args, ["--dev-viewport-concurrency", "--viewport-concurrency"]);
     const tier = firstFlagValue(args, ["--dev-tier", "--tier"]);
@@ -629,6 +630,7 @@ async function main(): Promise<void> {
       maxCollectionInstances: maxCollection ? parseInt(maxCollection, 10) : undefined,
       maxDepth: maxDepth ? parseInt(maxDepth, 10) : undefined,
       captureConcurrency: concurrency ? parseInt(concurrency, 10) : undefined,
+      crawlConcurrency: crawlConcurrency ? parseInt(crawlConcurrency, 10) : undefined,
       validationConcurrency: validationConcurrency ? parseInt(validationConcurrency, 10) : undefined,
       viewportConcurrency: viewportConcurrency ? parseInt(viewportConcurrency, 10) : undefined,
       validate,

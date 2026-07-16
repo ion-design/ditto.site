@@ -13,6 +13,7 @@ const optionsShape = {
   maxRoutes: z.number().int().positive().optional(),
   maxCollection: z.number().int().positive().optional(),
   captureConcurrency: z.number().int().positive().optional(),
+  crawlConcurrency: z.number().int().positive().optional(),
   validationConcurrency: z.number().int().positive().optional(),
   viewportConcurrency: z.number().int().positive().optional(),
   multiPage: z.boolean().optional(),
