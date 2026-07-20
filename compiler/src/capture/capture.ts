@@ -16,7 +16,7 @@ import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.
 import { sha1_12, round } from "../util/canonical.js";
 import { isZipArchive, extractDotLottieJson } from "./dotlottie.js";
 import { buildDeterministicEnvShim, captureEpochMs, DEFAULT_PRNG_SEED } from "../util/envShim.js";
-import { isBotWall, classifyNavFailure } from "../util/captureFailure.js";
+import { CaptureRejectedError, diagnoseBotWall, classifyNavFailure } from "../util/captureFailure.js";
 
 export const REQUIRED_VIEWPORTS = [375, 768, 1280, 1920] as const;
 // The dense width set captured for SIZE INFERENCE: a node sampled at 9 widths reveals its sizing
@@ -1331,6 +1331,7 @@ export async function captureSite(opts: {
     // structured error instead of tying up the pipeline. Attempt 0 waits for `load`;
     // later attempts fall back to `domcontentloaded` (a heavy page may never fire `load`).
     const NAV_BUDGET_MS = 90_000;
+    let navigationStatus: number | undefined;
     const navigateLoaded = async (pg: import("playwright").Page): Promise<void> => {
       log({ event: "goto", url: opts.url });
       const navStart = Date.now();
@@ -1340,10 +1341,11 @@ export async function captureSite(opts: {
         const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
         if (remaining < 5_000) break; // not enough budget left for a meaningful attempt
         try {
-          await pg.goto(opts.url, {
+          const response = await pg.goto(opts.url, {
             waitUntil: attempt === 0 ? "load" : "domcontentloaded",
             timeout: Math.min(attempt === 0 ? 45_000 : 20_000, remaining),
           });
+          navigationStatus = response?.status();
           navigated = true;
         } catch (e) {
           navErr = e;
@@ -1373,22 +1375,31 @@ export async function captureSite(opts: {
       await navigateLoaded(page); // second failure propagates (no further retry)
     }
 
-    // Item 3b: bot/auth-wall fast-fail. A wall page would otherwise burn the full
-    // multi-viewport capture and only get flagged by the pollution gate afterward.
-    // Uses the SAME signatures + node-count threshold as the gate (util/captureFailure.ts)
-    // so the abort and the grade agree; the pollution gate stays the shipped-capture
-    // authority, this only saves the wasted work of capturing an obvious wall.
+    // Bot/auth-wall fast-fail. Collect bounded document signals only: no raw HTML
+    // enters the error or logs. The same pure diagnosis is used by gatePollution.
     const wallProbe = await page
       .evaluate(() => ({
-        text: (document.body?.innerText ?? "").slice(0, 20_000),
-        nodes: document.querySelectorAll("*").length,
+        title: document.title,
+        bodyText: (document.body?.innerText ?? "").slice(0, 20_000),
+        finalUrl: location.href,
+        nodeCount: document.querySelectorAll("*").length,
+        identifiers: [
+          ...Array.from(document.querySelectorAll("[id], [name], [class]"))
+            .flatMap((el) => [el.id, el.getAttribute("name") ?? "", el.getAttribute("class") ?? ""])
+            .filter((value) => /cf[-_]chl|_cf_chl_opt|challenge-form|turnstile/i.test(value)),
+          ...(("_cf_chl_opt" in globalThis) ? ["_cf_chl_opt"] : []),
+        ].slice(0, 250),
+        resourceUrls: [
+          ...Array.from(document.scripts, (script) => script.src),
+          ...Array.from(document.forms, (form) => form.action),
+          ...Array.from(document.querySelectorAll("iframe"), (frame) => (frame as HTMLIFrameElement).src),
+          ...performance.getEntriesByType("resource").map((entry) => entry.name)
+            .filter((url) => /cdn-cgi\/challenge-platform|cf[-_]chl|turnstile/i.test(url)),
+        ].filter(Boolean).slice(0, 250),
       }))
       .catch(() => null);
-    if (isBotWall(wallProbe)) {
-      throw new Error(
-        `auth/bot wall detected at ${opts.url} (${wallProbe!.nodes} nodes, wall text matched): capture aborted early`,
-      );
-    }
+    const wallDiagnosis = diagnoseBotWall(wallProbe ? { ...wallProbe, responseStatus: navigationStatus } : null);
+    if (wallDiagnosis.isWall) throw new CaptureRejectedError(wallDiagnosis);
 
     // Stage 2: lazy-loader promotion. WP Rocket/lazysizes keep a 0-size placeholder in
     // `src` with the real URL in data attrs; autoScroll outruns their IntersectionObserver

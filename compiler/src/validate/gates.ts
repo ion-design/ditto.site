@@ -7,7 +7,7 @@ import type { AssetGraph } from "../infer/assets.js";
 import type { FontGraph } from "../infer/fonts.js";
 import type { Section } from "../infer/sections.js";
 import type { CaptureResult } from "../capture/capture.js";
-import { WALL_RE } from "../util/captureFailure.js";
+import { diagnoseBotWall, isWallText } from "../util/captureFailure.js";
 
 export type GateResult = {
   gate: string;
@@ -118,8 +118,8 @@ export function countVisibleInCaptureHiddenInClone(
 // page: an egress/bot wall, a near-empty shell, or a cookie/consent modal that was
 // never dismissed (the clone then reproduces the modal, so the perceptual gate is
 // fooled too). This gate flags those captures so a "perfect" score can't hide them.
-// WALL_RE lives in util/captureFailure.ts — shared with the capture-side fast-fail so
-// the abort and the grade can never drift on what counts as a wall.
+// The structured verdict lives in util/captureFailure.ts and is shared with the
+// capture-side fast-fail so structural and text signal definitions cannot drift.
 
 export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[]): GateResult {
   const issues: string[] = [];
@@ -128,8 +128,15 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   // Collect all visible source text once.
   let textChars = 0;
   const textParts: string[] = [];
+  const identifiers: string[] = [];
+  const resourceUrls: string[] = [];
   const walk = (node: IRNode): void => {
     const anyVisible = Object.values(node.visibleByVp).some(Boolean);
+    if (node.srcClass) identifiers.push(node.srcClass);
+    for (const [name, value] of Object.entries(node.attrs)) {
+      if (name === "id" || name === "name" || /cf[-_]chl|_cf_chl_opt|challenge-form|turnstile/i.test(value)) identifiers.push(value);
+      if (name === "src" || name === "href") resourceUrls.push(value);
+    }
     for (const c of node.children) {
       if (isTextChild(c)) { if (anyVisible) { const t = normText(c.text); if (t) { textParts.push(t); textChars += t.length; } } }
       else walk(c);
@@ -137,7 +144,16 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   };
   walk(ir.root);
   const allText = textParts.join(" ");
-  const wall = WALL_RE.test(allText);
+  resourceUrls.push(...(capture.assets ?? []).map((asset) => asset.url));
+  const wallDiagnosis = diagnoseBotWall({
+    title: ir.doc.title,
+    bodyText: allText,
+    finalUrl: ir.doc.sourceUrl,
+    nodeCount,
+    identifiers,
+    resourceUrls,
+  });
+  const wallTextDetected = isWallText(`${ir.doc.title} ${allText}`);
 
   // Overlay remaining after dismissal (max across viewports), and shortest page.
   // `blocking` = a full-viewport overlay that STILL scroll-locks the page (a modal
@@ -175,7 +191,7 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
   // ~3 nodes / ~24 chars; the most minimal legitimate page in the suite
   // (michaelcole.me) is 26 nodes / 640 chars. Thresholds sit safely between.
   if (nodeCount < 12) issues.push(`degenerate DOM: only ${nodeCount} nodes`);
-  if (wall && nodeCount < 220) issues.push("bot/egress wall text on a small page");
+  if (wallDiagnosis.isWall) issues.push(`${wallDiagnosis.provider} anti-bot challenge detected`);
   if (textChars < 60 && nodeCount < 50) issues.push(`near-empty page: ${textChars} visible text chars, ${nodeCount} nodes`);
   if (blocking) issues.push("a full-viewport modal still scroll-locks the page after dismissal");
   if (scrollLockedContradiction) issues.push(`scroll-locked capture: scrollHeight pinned to ~1 viewport at every width while IR content spans ${round2(maxContentRatio)} viewports`);
@@ -184,7 +200,13 @@ export function gatePollution(ir: IR, capture: CaptureResult, viewports: number[
     gate: "pollution",
     pass: issues.length === 0,
     metrics: {
-      nodeCount, visibleTextChars: textChars, wallTextDetected: wall,
+      nodeCount, visibleTextChars: textChars, wallTextDetected,
+      challengeDetected: wallDiagnosis.isWall,
+      challengeProvider: wallDiagnosis.provider,
+      challengeSignals: wallDiagnosis.matchedSignals,
+      challengeTitle: wallDiagnosis.title,
+      challengeFinalUrl: wallDiagnosis.finalUrl,
+      challengeDiagnosis: wallDiagnosis,
       overlaysRemaining, blocking, minScrollHeightRatio: round2(minHeightRatio),
       maxScrollHeightRatio: round2(maxHeightRatio), maxContentExtentRatio: round2(maxContentRatio),
       dismissedCount: capture.dismissal?.dismissed.length ?? 0,

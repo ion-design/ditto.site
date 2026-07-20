@@ -1,11 +1,11 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type PgBoss from "pg-boss";
-import { collectFileMap, COMPILER_VERSION, type CloneJobResult } from "@cloner/core";
-import { createDb, createBoss, workClone, runMigrations, type Db } from "@cloner/db";
+import { collectFileMap, COMPILER_VERSION, CaptureRejectedError, type CloneJobResult } from "@cloner/core";
+import { createDb, createBoss, workClone, runMigrations, repo, type Db } from "@cloner/db";
 import { LocalArtifactStore } from "@cloner/storage";
 import { createApp, DbBackend } from "@cloner/api";
 import { acquireTestPostgres, hasTestPostgres, type EphemeralPg } from "@cloner/test-utils";
@@ -119,5 +119,38 @@ describe("M2: async job lifecycle (Postgres queue + DB + worker)", { skip: hasTe
     });
     assert.equal(submit3.status, 202);
     assert.notEqual((await submit3.json()).jobId, jobId);
+  });
+
+  it("persists no artifact, clone, bundle, or result-cache row for a challenge rejection", async () => {
+    const cacheKey = `challenge-${Date.now()}`;
+    const job = await repo.createJob(db, {
+      kind: "clone",
+      url: "https://ridge.com/",
+      options: { verify: false },
+      status: "queued",
+      cacheKey,
+    });
+    const rejectChallenge = async (): Promise<CloneJobResult> => {
+      throw new CaptureRejectedError({
+        isWall: true,
+        provider: "cloudflare",
+        matchedSignals: ["cloudflare.challenge-platform-url", "text.incorrect-device-time"],
+        title: "Just a moment...",
+        finalUrl: "https://ridge.com/",
+        nodeCount: 347,
+        responseStatus: 403,
+      });
+    };
+
+    await assert.rejects(
+      processCloneJob({ db, store, runJob: rejectChallenge, cacheTtlMs: 60_000 }, job.id),
+      /ANTI_BOT_CHALLENGE/,
+    );
+    const failed = await repo.getJob(db, job.id);
+    assert.equal(failed?.status, "failed");
+    assert.match(failed?.error ?? "", /ANTI_BOT_CHALLENGE/);
+    assert.equal(await repo.getClone(db, job.id), undefined, "no successful clone/file map row");
+    assert.equal(await repo.cacheGetFresh(db, cacheKey, COMPILER_VERSION), undefined, "no result-cache row");
+    assert.equal(existsSync(join(blobs, job.id)), false, "no artifact or bundle directory");
   });
 });

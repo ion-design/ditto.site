@@ -3,12 +3,58 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { letterSpacingEquivalent, normHref, countVisibleInCaptureHiddenInClone, gate2Assets } from "../src/validate/gates.js";
+import { letterSpacingEquivalent, normHref, countVisibleInCaptureHiddenInClone, gate2Assets, gatePollution } from "../src/validate/gates.js";
 import { servedAssetExists } from "../src/validate/validate.js";
 import type { AssetGraph } from "../src/infer/assets.js";
 import type { FontGraph } from "../src/infer/fonts.js";
 import type { IR, IRNode } from "../src/normalize/ir.js";
 import type { PageSnapshot } from "../src/capture/walker.js";
+import type { CaptureResult } from "../src/capture/capture.js";
+
+describe("gatePollution shared challenge verdict", () => {
+  const make = (opts: { title: string; text: string; nodes: number; srcClass?: string; assets?: string[] }): { ir: IR; capture: CaptureResult } => {
+    const root = {
+      id: "n0", tag: "body", attrs: {}, ...(opts.srcClass ? { srcClass: opts.srcClass } : {}),
+      visibleByVp: { 1280: true }, bboxByVp: { 1280: { x: 0, y: 0, width: 1280, height: 800 } },
+      computedByVp: { 1280: {} }, children: [{ text: opts.text }],
+    } as unknown as IRNode;
+    const ir = {
+      doc: {
+        sourceUrl: "https://ridge.com/", title: opts.title, viewports: [1280], sampleViewports: [1280],
+        canonicalViewport: 1280, nodeCount: opts.nodes,
+        perViewport: { 1280: { scrollHeight: 800, scrollWidth: 1280, htmlBg: "", bodyBg: "", bodyColor: "", bodyFont: "" } },
+      },
+      root,
+    } as unknown as IR;
+    const capture = {
+      sourceUrl: "https://ridge.com/", capturedAt: "2026-01-01T00:00:00.000Z", viewports: [1280],
+      perViewport: [{ viewport: 1280, height: 800, scrollHeight: 800, nodeCount: opts.nodes, truncated: false }],
+      assets: (opts.assets ?? []).map((url) => ({ url, type: "other", contentType: null, status: 200, storedAs: null, bytes: 0, via: [] })),
+      fontFaces: [], cssTexts: [],
+    } as CaptureResult;
+    return { ir, capture };
+  };
+
+  it("flags a high-node cf-chl capture using the shared structured diagnosis", () => {
+    const { ir, capture } = make({
+      title: "Just a moment...", text: "Incorrect device time", nodes: 450, srcClass: "cf-chl-widget",
+    });
+    const result = gatePollution(ir, capture, [1280]);
+    assert.equal(result.pass, false);
+    assert.equal(result.metrics.challengeDetected, true);
+    assert.ok((result.metrics.challengeSignals as string[]).includes("cloudflare.cf-chl-identifier"));
+  });
+
+  it("does not flag large ordinary documentation that mentions CAPTCHA", () => {
+    const { ir, capture } = make({
+      title: "Security documentation", text: "How Cloudflare and CAPTCHA accessibility work for our customers.", nodes: 1200,
+      assets: ["https://challenges.cloudflare.com/turnstile/v0/api.js"],
+    });
+    const result = gatePollution(ir, capture, [1280]);
+    assert.equal(result.metrics.challengeDetected, false);
+    assert.ok(!result.issues.some((issue) => issue.includes("anti-bot challenge")));
+  });
+});
 
 // FIX 5 — the link gate must not fail a javascript: source href against the clone's sanitized value.
 // Generation emits an inert `#` for a `javascript:*` href (React blocks the literal), so normHref

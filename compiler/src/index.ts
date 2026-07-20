@@ -31,6 +31,13 @@ export { gatePollution } from "./validate/gates.js";
 export type { GateResult } from "./validate/gates.js";
 export { buildIR } from "./normalize/ir.js";
 export type { IR } from "./normalize/ir.js";
+export {
+  CAPTURE_REJECTED_CODE,
+  CaptureRejectedError,
+  diagnoseBotWall,
+  isCaptureRejectedError,
+} from "./util/captureFailure.js";
+export type { WallDiagnosis, WallProbe, WallProvider } from "./util/captureFailure.js";
 
 // ---- Pattern knowledge (frozen catalog; deterministic hints; pin asserted on load) ----
 export { resolvePatternHints, loadPatternIndex, assertPinnedCatalog, matchCatalogNode } from "./knowledge/patternIndex.js";
