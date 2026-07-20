@@ -1,10 +1,11 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runClone } from "clone-static";
 import { runCloneJob } from "../src/runCloneJob.js";
+import { CAPTURE_REJECTED_CODE } from "clone-static";
 import { collectFileMap } from "../src/collectFileMap.js";
 import { serveDir, FIXTURES_DIR, hasChromium } from "@cloner/test-utils";
 
@@ -63,6 +64,36 @@ describe("runCloneJob (served fixture)", { skip: CHROMIUM ? false : "no Chromium
     // temp dir is cleaned up by default.
     const { existsSync } = await import("node:fs");
     assert.equal(existsSync(res.runDir), false, "temp run dir removed");
+  });
+
+  it("rejects the Ridge/Cloudflare fixture before generation even when verify is false", async () => {
+    const url = server.url + "/ridge-cloudflare-challenge.html";
+    const runsDir = mkdtempSync(join(tmpdir(), "challenge-run-"));
+    const captureCacheDir = mkdtempSync(join(tmpdir(), "challenge-cache-"));
+    try {
+      await assert.rejects(
+        runCloneJob({
+          url,
+          runsDir,
+          captureCacheDir,
+          options: { verify: false, interactions: false, components: false, motion: false },
+        }),
+        (error: unknown) => {
+          const rejected = error as { code?: string; diagnosis?: { nodeCount?: number; matchedSignals?: string[] } };
+          assert.equal(rejected.code, CAPTURE_REJECTED_CODE);
+          assert.ok((rejected.diagnosis?.nodeCount ?? 0) > 220, "strong Cloudflare structure bypasses the legacy node ceiling");
+          assert.ok(rejected.diagnosis?.matchedSignals?.includes("cloudflare.challenge-platform-url"));
+          assert.match(String(error), /cloudflare challenge detected/i);
+          return true;
+        },
+      );
+      const runFiles = readdirSync(runsDir, { recursive: true }).map(String);
+      assert.ok(!runFiles.some((file) => /(?:^|\/)generated(?:\/|$)/.test(file)), "normalization/generation never started");
+      assert.deepEqual(readdirSync(captureCacheDir), [], "rejected capture was never persisted to the entry cache");
+    } finally {
+      rmSync(runsDir, { recursive: true, force: true });
+      rmSync(captureCacheDir, { recursive: true, force: true });
+    }
   });
 
   it("can generate a Vite React app instead of Next", async () => {

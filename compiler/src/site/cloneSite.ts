@@ -21,6 +21,7 @@ import { structurallySimilar } from "./signature.js";
 import { generateSiteApp, routeToSegment, routeKey, type RouteArtifact } from "./generateSite.js";
 import { detectSharedChrome, chromeSignatureId } from "./sharedLayout.js";
 import { validateSite, type SiteReport } from "./validateSite.js";
+import { gatePollution } from "../validate/gates.js";
 import { siteIdFromUrl, namedOutDirs, exportApp, writeLatestPointer } from "../cli.js";
 import { writeJSON, readJSON, ensureDir, fileExists, writeText } from "../util/fsx.js";
 import { seoInventoryToMarkdown } from "../generate/seo.js";
@@ -141,6 +142,10 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
         return b;
       } catch (e) {
         log({ event: "route_capture_failed", path: routePath, error: String(e).slice(0, 200) });
+        // The entry/root route is mandatory. Secondary routes preserve the existing
+        // skip-on-capture-failure contract, but a site without its homepage cannot
+        // be generated as a successful clone.
+        if (routePath === crawl.entryPath) throw e;
         return null;
       } finally {
         pendingCaptures.delete(pendingKey);
@@ -154,19 +159,38 @@ export async function runCloneSite(opts: CloneSiteOptions): Promise<CloneSiteRes
   // capture loop skips it (built.has) — page 1 is never re-captured.
   if (reuseEntrySource) {
     const entrySrc = join(runDir, "routes", routeKey(crawl.entryPath), "source");
-    if (resolve(entrySrc) !== resolve(reuseEntrySource)) { rmSync(entrySrc, { recursive: true, force: true }); cpSync(reuseEntrySource, entrySrc, { recursive: true }); }
     try {
-      const capture = readJSON<CaptureResult>(join(entrySrc, "capture", "capture-result.json"));
-      const ir = buildIR(entrySrc, capture.viewports);
-      const assetGraph = buildAssetGraph(capture);
-      const fontGraph = buildFontGraph(capture.fontFaces, assetGraph, origin + crawl.entryPath);
-      built.set(crawl.entryPath, { capture, ir, assetGraph, fontGraph, tokens: extractTokens(ir), sourceDir: entrySrc });
-      log({ event: "route_reused", path: crawl.entryPath, nodes: ir.doc.nodeCount });
+      // Validate the frozen source in place before it can be copied into this run or
+      // reach inference/generation. This protects direct CLI reuse as well as core's
+      // persistent single→multi cache path.
+      const capture = readJSON<CaptureResult>(join(reuseEntrySource, "capture", "capture-result.json"));
+      const ir = buildIR(reuseEntrySource, capture.viewports);
+      const pollution = gatePollution(ir, capture, capture.viewports);
+      if (!pollution.pass) {
+        const diagnosis = pollution.metrics.challengeDiagnosis as { isWall?: boolean; provider?: string; matchedSignals?: string[] } | undefined;
+        log({
+          event: "route_reuse_rejected",
+          path: crawl.entryPath,
+          reason: diagnosis?.isWall ? "anti_bot_challenge" : "polluted_capture",
+          ...(diagnosis?.provider ? { provider: diagnosis.provider } : {}),
+          ...(diagnosis?.matchedSignals ? { signals: diagnosis.matchedSignals } : {}),
+        });
+      } else {
+        if (resolve(entrySrc) !== resolve(reuseEntrySource)) {
+          rmSync(entrySrc, { recursive: true, force: true });
+          cpSync(reuseEntrySource, entrySrc, { recursive: true });
+        }
+        const assetGraph = buildAssetGraph(capture);
+        const fontGraph = buildFontGraph(capture.fontFaces, assetGraph, origin + crawl.entryPath);
+        built.set(crawl.entryPath, { capture, ir, assetGraph, fontGraph, tokens: extractTokens(ir), sourceDir: entrySrc });
+        log({ event: "route_reused", path: crawl.entryPath, nodes: ir.doc.nodeCount });
+      }
     } catch (e) { log({ event: "route_reuse_failed", error: String(e).slice(0, 200) }); }
   }
 
   // 2. Capture all selected routes (full), bounded-parallel (isolated browser per route).
   await mapLimit(plan.selected, captureConcurrency, (r) => captureRoute(r.path, [...REQUIRED_VIEWPORTS]));
+  if (!built.has(crawl.entryPath)) throw new Error(`mandatory entry route was not captured: ${crawl.entryPath}`);
 
   // 3. Structural confirmation: capture one sibling per collection (light, 1 vp),
   //    compare to the representative; explode collections that aren't real templates.

@@ -8,10 +8,12 @@ import {
   validateSite,
   buildIR,
   gatePollution,
+  CaptureRejectedError,
   readJSON,
   siteIdFromUrl,
   COMPILER_VERSION,
   type CaptureResult,
+  type WallDiagnosis,
   type CloneResult as CompilerCloneResult,
   type CloneSiteResult,
 } from "clone-static";
@@ -19,19 +21,32 @@ import { collectFileMap } from "./collectFileMap.js";
 import type { CaptureSanity, CloneJobResult, CloneOptions, RouteInfo, RunCloneJobInput } from "./types.js";
 import { normalizeCloneRequestOptions, resolveCloneOptions } from "./options.js";
 
-/** Compute the cheap capture-sanity audit (no build): node count + whether the
- *  pollution gate flags the capture as degenerate, and whether bot/egress-wall text
- *  was seen. Falls back to safe defaults if the source artifacts are missing. */
-function captureSanity(sourceDir: string, viewports: number[]): CaptureSanity {
+type CaptureAudit = {
+  sanity: CaptureSanity;
+  diagnosis?: WallDiagnosis;
+  readable: boolean;
+};
+
+/** Compute the cheap shared capture-sanity audit (no build). */
+function captureSanity(sourceDir: string, viewports: number[]): CaptureAudit {
   try {
     const capture = readJSON<CaptureResult>(join(sourceDir, "capture", "capture-result.json"));
     const vps = capture.viewports?.length ? capture.viewports : viewports;
     const ir = buildIR(sourceDir, vps);
     const p = gatePollution(ir, capture, vps);
-    return { nodeCount: ir.doc.nodeCount, pollution: !p.pass, blocked: !!p.metrics.wallTextDetected };
+    const diagnosis = p.metrics.challengeDiagnosis as WallDiagnosis | undefined;
+    return {
+      sanity: { nodeCount: ir.doc.nodeCount, pollution: !p.pass, blocked: diagnosis?.isWall === true },
+      diagnosis,
+      readable: true,
+    };
   } catch {
-    return { nodeCount: 0, pollution: true, blocked: false };
+    return { sanity: { nodeCount: 0, pollution: true, blocked: false }, readable: false };
   }
+}
+
+function assertCaptureAccepted(audit: CaptureAudit): void {
+  if (audit.diagnosis?.isWall) throw new CaptureRejectedError(audit.diagnosis);
 }
 
 /** Persistent entry-capture cache path for a URL. Key = the compiler's full host+path
@@ -95,7 +110,25 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
 
     if (kind === "clone_site") {
       // Reuse a prior single-page capture for the entry route when the cache holds a fresh one.
-      const reuseEntrySource = cacheEntry && freshCapture(cacheEntry, input.captureCacheTtlMs) ? cacheEntry : undefined;
+      let reuseEntrySource: string | undefined;
+      if (cacheEntry && freshCapture(cacheEntry, input.captureCacheTtlMs)) {
+        const cached = captureSanity(cacheEntry, options.viewports ?? [375, 768, 1280, 1920]);
+        if (cached.readable && !cached.sanity.pollution) {
+          reuseEntrySource = cacheEntry;
+        } else {
+          rmSync(cacheEntry, { recursive: true, force: true });
+          log({
+            event: "entry_capture_cache_rejected",
+            reason: cached.sanity.blocked ? "anti_bot_challenge" : "polluted_or_invalid",
+            ...(cached.diagnosis ? {
+              provider: cached.diagnosis.provider,
+              signals: cached.diagnosis.matchedSignals,
+              finalUrl: cached.diagnosis.finalUrl,
+              nodeCount: cached.diagnosis.nodeCount,
+            } : {}),
+          });
+        }
+      }
       captureReused = !!reuseEntrySource;
       const res: CloneSiteResult = await runCloneSite({
         url: input.url,
@@ -126,11 +159,13 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
         }
       }
       const entry = res.routes.find((r) => r.routePath === res.plan.entry) ?? res.routes[0];
-      sanity = entry
+      const entryAudit = entry
         ? captureSanity(entry.sourceDir, entry.ir.doc.viewports)
-        : { nodeCount: 0, pollution: true, blocked: false };
+        : { sanity: { nodeCount: 0, pollution: true, blocked: false }, readable: false };
+      assertCaptureAccepted(entryAudit);
+      sanity = entryAudit.sanity;
       // Refresh the cache with the entry capture (seeds it for a cold multi-page run).
-      if (cacheEntry && entry) persistCapture(entry.sourceDir, cacheEntry);
+      if (cacheEntry && entry && entryAudit.readable && !entryAudit.sanity.pollution) persistCapture(entry.sourceDir, cacheEntry);
     } else {
       const res: CompilerCloneResult = await runClone({
         url: input.url,
@@ -145,9 +180,11 @@ export async function runCloneJob(input: RunCloneJobInput): Promise<CloneJobResu
         log,
       });
       runDir = res.runDir;
-      sanity = captureSanity(res.sourceDir, options.viewports ?? [375, 768, 1280, 1920]);
+      const audit = captureSanity(res.sourceDir, options.viewports ?? [375, 768, 1280, 1920]);
+      assertCaptureAccepted(audit);
+      sanity = audit.sanity;
       // Stash this page's capture so a later multi-page job can expand on it (speed path).
-      if (cacheEntry) persistCapture(res.sourceDir, cacheEntry);
+      if (cacheEntry && audit.readable && !audit.sanity.pollution) persistCapture(res.sourceDir, cacheEntry);
     }
     const captureMs = Date.now() - t0;
 

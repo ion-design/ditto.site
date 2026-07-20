@@ -1,13 +1,22 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   WALL_RE,
   isWallText,
   isBotWall,
+  diagnoseBotWall,
   WALL_MAX_NODES,
+  CaptureRejectedError,
+  CAPTURE_REJECTED_CODE,
   classifyNavFailure,
   isRetryableNavFailure,
+  type WallProbe,
 } from "../src/util/captureFailure.js";
+
+const RIDGE_CLOUDFLARE = JSON.parse(
+  readFileSync(new URL("../fixtures/ridge-cloudflare-challenge.json", import.meta.url), "utf8"),
+) as WallProbe;
 
 // ---------------------------------------------------------------------------
 // Item 3: capture-side fast-fail predicates (pure — no browser).
@@ -25,6 +34,9 @@ describe("captureFailure: wall-text detection", () => {
       "Attention Required! | Cloudflare",
       "Please complete the CAPTCHA",
       "DDoS protection by Cloudflare",
+      "Your connection needs to be verified before you can proceed",
+      "Incorrect device time",
+      "Performing security verification",
     ]) {
       assert.ok(isWallText(t), `expected wall text to match: ${t}`);
     }
@@ -67,6 +79,58 @@ describe("captureFailure: isBotWall (matches the pollution gate's small+wall rul
   it("is null-safe", () => {
     assert.equal(isBotWall(null), false);
     assert.equal(isBotWall(undefined), false);
+  });
+});
+
+describe("captureFailure: structured challenge diagnosis", () => {
+  it("rejects the captured Ridge/Cloudflare incorrect-device-time fixture", () => {
+    const diagnosis = diagnoseBotWall(RIDGE_CLOUDFLARE);
+    assert.equal(diagnosis.isWall, true);
+    assert.equal(diagnosis.provider, "cloudflare");
+    assert.equal(diagnosis.nodeCount, 347, "fixture intentionally exceeds the legacy 220-node ceiling");
+    assert.ok(diagnosis.matchedSignals.includes("text.incorrect-device-time"));
+    assert.ok(diagnosis.matchedSignals.includes("cloudflare.challenge-platform-url"));
+  });
+
+  it("uses a challenge-style title with supporting body text even on a large DOM", () => {
+    const diagnosis = diagnoseBotWall({
+      title: "Just a moment...",
+      bodyText: "Enable JavaScript and cookies to continue.",
+      finalUrl: "https://example.com/",
+      nodeCount: 900,
+    });
+    assert.equal(diagnosis.isWall, true);
+    assert.ok(diagnosis.matchedSignals.includes("title.challenge"));
+  });
+
+  it("treats Cloudflare challenge-platform and cf-chl identifiers as strong signals", () => {
+    for (const probe of [
+      { nodeCount: 5000, resourceUrls: ["https://example.com/cdn-cgi/challenge-platform/x"] },
+      { nodeCount: 5000, identifiers: ["cf-chl-widget-abc"] },
+      { nodeCount: 5000, identifiers: ["challenge-form"] },
+      { nodeCount: 5000, identifiers: ["_cf_chl_opt"] },
+    ] satisfies WallProbe[]) {
+      assert.equal(diagnoseBotWall(probe).isWall, true, JSON.stringify(probe));
+    }
+  });
+
+  it("does not reject an ordinary page that merely mentions Cloudflare or CAPTCHA", () => {
+    const diagnosis = diagnoseBotWall({
+      title: "How our security works",
+      bodyText: "Our documentation explains Cloudflare, CAPTCHA accessibility, and bot protection.",
+      finalUrl: "https://docs.example.com/security",
+      nodeCount: 1800,
+      resourceUrls: ["https://challenges.cloudflare.com/turnstile/v0/api.js"],
+      identifiers: ["newsletter-turnstile"],
+    });
+    assert.equal(diagnosis.isWall, false);
+  });
+
+  it("creates a typed, stable, HTML-free rejection", () => {
+    const error = new CaptureRejectedError(diagnoseBotWall(RIDGE_CLOUDFLARE));
+    assert.equal(error.code, CAPTURE_REJECTED_CODE);
+    assert.match(error.message, /ANTI_BOT_CHALLENGE/);
+    assert.doesNotMatch(error.message, /<html/i);
   });
 });
 

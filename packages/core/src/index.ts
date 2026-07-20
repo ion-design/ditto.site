@@ -11,7 +11,8 @@ export {
   resolveCloneOptions,
   resolveCloneStyling,
 } from "./options.js";
-export { COMPILER_VERSION } from "clone-static";
+export { CAPTURE_REJECTED_CODE, CaptureRejectedError, COMPILER_VERSION } from "clone-static";
+export type { WallDiagnosis } from "clone-static";
 export type {
   CloneMode,
   CloneOptions,

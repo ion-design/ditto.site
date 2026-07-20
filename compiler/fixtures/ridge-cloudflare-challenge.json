@@ -1,0 +1,15 @@
+{
+  "title": "Just a moment...",
+  "bodyText": "Your connection needs to be verified before you can proceed. Performing security verification. Incorrect device time. Enable JavaScript and cookies to continue.",
+  "finalUrl": "https://ridge.com/",
+  "nodeCount": 347,
+  "identifiers": [
+    "challenge-form",
+    "cf-chl-widget-4h8k2",
+    "_cf_chl_opt"
+  ],
+  "resourceUrls": [
+    "https://ridge.com/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"
+  ],
+  "responseStatus": 403
+}
