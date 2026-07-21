@@ -26,6 +26,7 @@ import { writeJSON, readJSON, ensureDir, fileExists, writeText } from "../util/f
 import { seoInventoryToMarkdown } from "../generate/seo.js";
 import type { AppFramework } from "../generate/app.js";
 import { existsSync, readdirSync, rmSync, cpSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 export type CloneSiteOptions = {
   url: string;
@@ -416,6 +417,6 @@ async function main(): Promise<void> {
   console.log(JSON.stringify({ event: "done", runDir: res.runDir, app: res.appDir }));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
