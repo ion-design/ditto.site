@@ -548,6 +548,24 @@ const SVG_ATTR_RENAME: Record<string, string> = {
   "paint-order": "paintOrder", "vector-effect": "vectorEffect", "marker-start": "markerStart", "marker-mid": "markerMid",
   "marker-end": "markerEnd", "mask-type": "maskType", "stroke-linejoin ": "strokeLinejoin",
 };
+// Captured SVG arrives as browser-serialized markup, so text and attribute values are
+// HTML-ESCAPED (a literal U+00A0 in the DOM serializes to `&nbsp;`). JSX string literals
+// do not decode entities — emitting `{"A&nbsp;B"}` paints the six characters `&nbsp;`
+// on screen. Decode once, on the way in, so the JSX carries the real characters.
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+};
+export function decodeHtmlEntities(s: string): string {
+  if (!s.includes("&")) return s;
+  return s.replace(/&(#[xX][0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (whole, body: string) => {
+    if (body.startsWith("#")) {
+      const cp = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : whole;
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
+  });
+}
+
 /** A CSS inline-style string → a React style-object literal (`fill:red;stroke-width:2` →
  *  `{ fill: "red", strokeWidth: "2" }`). */
 function svgStyleToObject(style: string): string {
@@ -559,26 +577,53 @@ function svgStyleToObject(style: string): string {
   }).filter(Boolean);
   return `{ ${props.join(", ")} }`;
 }
-/** Convert one element's raw attribute string to JSX attributes (React-cased). */
-function svgConvertAttrs(attrStr: string): string {
+/** SVG elements whose href/xlink:href points at an EXTERNAL resource we may have
+ *  downloaded, rather than at an in-document fragment (`<use href="#id">`). */
+const SVG_HREF_ASSET_TAGS = new Set(["image", "feimage"]);
+
+/** Render an attribute value. A JSX attribute written `k="…"` is a *JSX* string, which
+ *  has no backslash escapes — so a value containing a double quote (common once entities
+ *  are decoded: `font-family="&quot;Some Font&quot;"` → `"Some Font"`) cannot be emitted
+ *  that way; `k={"…"}` is a JS expression and escapes normally. Plain form is kept when
+ *  it is safe, so ordinary attributes render unchanged. */
+function jsxAttrValue(val: string): string {
+  const json = JSON.stringify(val);
+  return /["\\]/.test(val) ? `{${json}}` : json;
+}
+
+/** Convert one element's raw attribute string to JSX attributes (React-cased).
+ *  `tag` + the asset map let an `<image>`'s href be rewritten to its materialized
+ *  local copy, the same way `src`/`poster` are on ordinary elements. */
+function svgConvertAttrs(attrStr: string, tag = "", assetMap?: Map<string, string>, sourceUrl?: string): string {
   const re = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)')/g;
+  const hrefIsAsset = SVG_HREF_ASSET_TAGS.has(tag.toLowerCase());
   let m: RegExpExecArray | null; let out = "";
   while ((m = re.exec(attrStr)) !== null) {
-    const raw = m[1]!; const val = m[3] ?? m[4] ?? "";
-    if (raw === "class") { out += ` className=${JSON.stringify(val)}`; continue; }
+    const raw = m[1]!;
+    let val = decodeHtmlEntities(m[3] ?? m[4] ?? "");
+    if (raw === "class") { out += ` className=${jsxAttrValue(val)}`; continue; }
     if (raw === "style") { out += ` style={${svgStyleToObject(val)}}`; continue; }
     const lower = raw.toLowerCase();
+    // `<image xlink:href>` / `<image href>` is an asset reference. Left alone it ships
+    // the SOURCE origin's path, which 404s in the generated app — the same failure
+    // ASSET_ATTRS exists to prevent for `src`/`poster` (rubric Gate 2). Fragment and
+    // data: refs are self-contained and pass through untouched.
+    if (hrefIsAsset && (lower === "href" || lower === "xlink:href") && val && !val.startsWith("#") && !val.startsWith("data:")) {
+      const local = assetMap?.get(resolveUrl(val, sourceUrl ?? ""));
+      // Nothing materialized → transparent GIF rather than a remote/404 reference.
+      val = local ?? TRANSPARENT_GIF;
+    }
     const key = SVG_ATTR_RENAME[raw] ?? SVG_ATTR_RENAME[lower] ??
       (raw.startsWith("data-") || raw.startsWith("aria-") ? raw : raw.includes(":") ? null : raw);
     if (!key || !/^[a-zA-Z_$][\w$-]*$/.test(key)) continue;
-    out += ` ${key}=${JSON.stringify(val)}`;
+    out += ` ${key}=${jsxAttrValue(val)}`;
   }
   return out;
 }
 /** Parse a browser-serialized SVG inner fragment into JSX child elements (so an icon ships as
  *  real `<path d=… />` markup, not a `dangerouslySetInnerHTML` blob). Input is well-formed
  *  (DOM-serialized): lowercase tags, quoted attrs. Returns "" when there's nothing to render. */
-function svgInnerToJsx(inner: string, pad: string): string {
+export function svgInnerToJsx(inner: string, pad: string, assetMap?: Map<string, string>, sourceUrl?: string): string {
   const trimmed = inner.trim();
   if (!trimmed) return "";
   const tokens = trimmed.match(/<\/[a-zA-Z][^>]*>|<[a-zA-Z][^>]*?\/>|<[a-zA-Z][^>]*>|[^<]+/g) || [];
@@ -592,12 +637,14 @@ function svgInnerToJsx(inner: string, pad: string): string {
       lines.push(`${ind()}</${tag}>`);
     } else if (/\/>$/.test(t)) {
       const m = /^<([a-zA-Z][\w:-]*)([\s\S]*?)\/>$/.exec(t);
-      if (m) lines.push(`${ind()}<${m[1]}${svgConvertAttrs(m[2]!)} />`);
+      if (m) lines.push(`${ind()}<${m[1]}${svgConvertAttrs(m[2]!, m[1]!, assetMap, sourceUrl)} />`);
     } else if (/^</.test(t)) {
       const m = /^<([a-zA-Z][\w:-]*)([\s\S]*)>$/.exec(t);
-      if (m) { lines.push(`${ind()}<${m[1]}${svgConvertAttrs(m[2]!)}>`); depth++; }
+      if (m) { lines.push(`${ind()}<${m[1]}${svgConvertAttrs(m[2]!, m[1]!, assetMap, sourceUrl)}>`); depth++; }
     } else {
-      const txt = t.trim();
+      // Serialized markup is entity-escaped; a JSX string literal is not, so decode
+      // before stringifying or `&nbsp;` renders as six literal characters.
+      const txt = decodeHtmlEntities(t).trim();
       if (txt) lines.push(`${ind()}{${JSON.stringify(txt)}}`);
     }
   }
@@ -668,14 +715,14 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
         name = n === 1 ? base : `${base}${n}`;
         reg.byKey.set(key, name);
         reg.order.push(name);
-        const body = svgInnerToJsx(innerSrc, "      ");
+        const body = svgInnerToJsx(innerSrc, "      ", assetMap, sourceUrl);
         const el = body ? `<svg${restAttrs} data-cid={cid}>\n${body}\n    </svg>` : `<svg${restAttrs} data-cid={cid} />`;
         reg.defs.set(name, `export default function ${name}({ cid }: { cid?: string }) {\n  return (\n    ${el}\n  );\n}\n`);
       }
       return `${pad}<${name} cid={${JSON.stringify(node.id)}} />`;
     }
     const restAttrs = renderAttrs(propsList(node, assetMap, sourceUrl, ctx).filter(noHtml));
-    const body = svgInnerToJsx(innerSrc, pad + "  ");
+    const body = svgInnerToJsx(innerSrc, pad + "  ", assetMap, sourceUrl);
     return body ? `${pad}<svg${restAttrs}>\n${body}\n${pad}</svg>` : `${pad}<svg${restAttrs} />`;
   }
   if (VOID_TAGS.has(tag)) {
@@ -1229,7 +1276,7 @@ function emitVariantSkeleton(componentName: string, instances: IRNode[], variant
   const cpad = "  ".repeat(indent + 1);
 
   if (repr.rawHTML && tag === "svg") {
-    const toJsx = (n: IRNode): string => svgInnerToJsx(svgInnerForNode(n, ctx), cpad);
+    const toJsx = (n: IRNode): string => svgInnerToJsx(svgInnerForNode(n, ctx), cpad, assetMap, sourceUrl);
     const inners = instances.map(toJsx);
     const attrs = renderAttrs(fieldedProps(instances, dataRows, styleRows, cids, gen, styleGen, assetMap, sourceUrl, ctx));
     if (!inners.some((s) => s.trim())) return `${pad}<svg${attrs} />`;
@@ -1627,7 +1674,7 @@ function emitSkeleton(instances: IRNode[], insideInteractive: boolean, indent: n
     // SVG inner content renders as a REAL JSX child (not a dangerouslySetInnerHTML __html blob).
     // When it's identical across instances, bake it; when it varies, it's a ReactNode field in the
     // content array (which then ships as content.tsx). Mirrors renderNode's standalone-SVG path.
-    const toJsx = (n: IRNode): string => svgInnerToJsx(svgInnerForNode(n, ctx), cpad);
+    const toJsx = (n: IRNode): string => svgInnerToJsx(svgInnerForNode(n, ctx), cpad, assetMap, sourceUrl);
     const inners = instances.map(toJsx);
     if (!inners.some((s) => s.trim())) return `${pad}<svg${attrs} />`;
     if (inners.every((s) => s === inners[0])) return `${pad}<svg${attrs}>\n${inners[0]}\n${pad}</svg>`;
