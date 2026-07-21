@@ -13,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { IR, IRNode, IRChild } from "../normalize/ir.js";
 
 export type PatternMatchSpec = {
@@ -199,7 +199,7 @@ export function resolvePatternHints(ir: IR): PatternHints {
 }
 
 // `--write-lock` maintenance entry: refresh the pin after a deliberate catalog edit.
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href && process.argv.includes("--write-lock")) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv.includes("--write-lock")) {
   const idx = loadPatternIndex();
   writeFileSync(LOCK_PATH, idx.hash + "\n");
   console.log("pinned pattern catalog:", idx.hash);

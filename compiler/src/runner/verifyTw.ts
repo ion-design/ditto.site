@@ -15,6 +15,7 @@ import { validateRun } from "../validate/validate.js";
 import { scoreApp } from "./qualityScore.js";
 import { readJSON, writeJSON } from "../util/fsx.js";
 import type { CaptureResult } from "../capture/capture.js";
+import { pathToFileURL } from "node:url";
 
 async function one(runDir: string, mode: "tailwind" | "css", tier: string) {
   const sourceDir = join(runDir, "source");
@@ -72,6 +73,6 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

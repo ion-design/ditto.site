@@ -2,7 +2,7 @@ import { chromium, type Page } from "playwright";
 import { PNG } from "pngjs";
 import { writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildApp, serveStatic } from "../validate/render.js";
 import { readJSON, ensureDir } from "../util/fsx.js";
 
@@ -191,6 +191,6 @@ async function main(): Promise<void> {
   await componentMap(runDir, args.includes("--clone-only"));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

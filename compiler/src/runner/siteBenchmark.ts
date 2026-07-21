@@ -9,7 +9,7 @@
  *   npm run bench-site -- --only=site-brew,site-overreacted
  */
 import { join, resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { runCloneSite, regenerateSite } from "../site/cloneSite.js";
@@ -140,6 +140,6 @@ function summaryMd(summary: Record<string, unknown>, outcomes: SiteOutcome[]): s
   return lines.join("\n") + "\n";
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

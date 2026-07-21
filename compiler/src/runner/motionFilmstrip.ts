@@ -1,7 +1,7 @@
 import { chromium } from "playwright";
 import { PNG } from "pngjs";
 import { join, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { writeFileSync, mkdirSync, readdirSync, renameSync, rmSync, existsSync } from "node:fs";
 import { buildApp, serveStatic } from "../validate/render.js";
 import { readJSON } from "../util/fsx.js";
@@ -122,6 +122,6 @@ async function main(): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
