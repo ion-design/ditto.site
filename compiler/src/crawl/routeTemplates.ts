@@ -263,10 +263,11 @@ export function applyConfirmation(
   }
   if (exploded.length === 0) return { ...plan, collections: confirmed };
 
-  // Rebuild selected: drop representatives/listings of exploded collections, add
-  // exploded instances as pages, keep everything else, re-cap.
+  // Rebuild selected: drop representatives of exploded collections, add exploded
+  // instances as pages, keep everything else (incl. the listing itself — it's a
+  // real page, not one of the collapsed instances), re-cap.
   const explodedTemplates = new Set(plan.collections.filter((c) => verdicts.get(c.template) === false).map((c) => c.template));
-  const keep = plan.selected.filter((r) => !(explodedTemplates.has(r.template) && r.role !== "entry"));
+  const keep = plan.selected.filter((r) => !(explodedTemplates.has(r.template) && r.role !== "entry" && r.role !== "listing"));
   const seen = new Set(keep.map((r) => r.path));
   for (const p of [...new Set(exploded)].sort()) {
     if (seen.has(p)) continue;
