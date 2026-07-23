@@ -8,6 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](.nvmrc)
 
+[English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 ditto.site turns a public URL into a self-contained TypeScript app. It captures
 what the browser actually rendered, then emits a deterministic Next.js App
 Router project by default, or Vite React when requested.
