@@ -28,7 +28,7 @@
     "@cloner/core": "*",
     "@cloner/db": "*",
     "@cloner/storage": "*",
-    "@hono/node-server": "^1.13.7",
+    "@hono/node-server": "^2.0.10",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "hono": "^4.6.14",
     "zod": "^3.24.1"
