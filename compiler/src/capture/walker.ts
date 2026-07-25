@@ -114,6 +114,7 @@ export type PageSnapshot = {
     bodyBg: string;
     bodyColor: string;
     bodyFont: string;
+    bodyTextRendering: string;
     metaViewport: string;
     nodeCount: number;
     truncated: boolean;
@@ -930,6 +931,11 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       bodyBg: bodyCs.backgroundColor,
       bodyColor: bodyCs.color,
       bodyFont: bodyCs.fontFamily,
+      // text-rendering isn't inherited-by-default in the general computed-style capture (it's a
+      // body/html-level reset, not a per-node authored value worth baking onto every node) but DOES
+      // change kerning/ligature shaping in the browser — a site that sets `optimizeLegibility` reads
+      // as very slightly different letter-spacing/shaping than the clone's default `auto` if dropped.
+      bodyTextRendering: bodyCs.textRendering,
       metaViewport: (document.querySelector('meta[name="viewport"]') as HTMLMetaElement | null)?.content || "",
       nodeCount,
       truncated,

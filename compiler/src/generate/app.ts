@@ -2372,6 +2372,15 @@ export function htmlBgRule(htmlBg: string | null): string {
   return htmlBg !== null ? `html { background: ${htmlBg}; }\n` : "";
 }
 
+/** `body { text-rendering: … }` when the source set a non-default value (commonly
+ *  `optimizeLegibility`, to turn on kerning/ligatures for display type) — dropping it renders
+ *  with the browser's default heuristic instead, a small but real letter-spacing/shaping
+ *  difference on every inheriting element (which is all of them). Empty string when default. */
+export function bodyTextRenderingRule(value: string | undefined): string {
+  const v = (value ?? "").trim();
+  return v && v !== "auto" ? `body { text-rendering: ${v}; }\n` : "";
+}
+
 function generateGlobalsCss(ir: IR, fontGraph: FontGraph, tokensCss: string): string {
   const cw = ir.doc.canonicalViewport;
   const pv = ir.doc.perViewport[cw];
@@ -2393,7 +2402,8 @@ ${fontGraph.css}
 ${tokensCss}
 
 /* page base */
-${htmlBgRule(htmlBg)}body { font-family: ${SYSTEM_FALLBACK}; }${clip}
+${htmlBgRule(htmlBg)}body { font-family: ${SYSTEM_FALLBACK}; }
+${bodyTextRenderingRule(pv?.bodyTextRendering)}${clip}
 `;
 }
 
@@ -2808,7 +2818,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
     const globals = tailwindGlobalsCss({
       reset: RESET_CSS, fontCss: fontGraph.css, tokensCss: tokensCss + (tw.colorDefsCss ? "\n" + tw.colorDefsCss : ""),
       htmlBg, bodyFont: SYSTEM_FALLBACK, clip, colorTokens: tw.colorTokens, viewports: ir.doc.viewports,
-      canonical: ir.doc.canonicalViewport,
+      canonical: ir.doc.canonicalViewport, bodyTextRendering: pv?.bodyTextRendering,
     });
     writeText(join(rootDir, "globals.css"), framework === "vite" ? viteGlobalsCss(globals) : globals);
   } else {

@@ -81,7 +81,7 @@ export type IRDoc = {
   viewports: number[];            // band/gate widths (the standard responsive breakpoints)
   sampleViewports: number[];      // ALL captured widths — the dense set for size inference
   canonicalViewport: number;
-  perViewport: Record<number, { scrollHeight: number; scrollWidth: number; htmlBg: string; bodyBg: string; bodyColor: string; bodyFont: string }>;
+  perViewport: Record<number, { scrollHeight: number; scrollWidth: number; htmlBg: string; bodyBg: string; bodyColor: string; bodyFont: string; bodyTextRendering: string }>;
   nodeCount: number;
   // Stage 5 (motion): raw @keyframes blocks from the canonical capture's accessible
   // stylesheets (deduped + sorted for determinism). Carried so the generator can
@@ -848,6 +848,7 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       bodyBg: d.bodyBg,
       bodyColor: d.bodyColor,
       bodyFont: d.bodyFont,
+      bodyTextRendering: d.bodyTextRendering,
     };
   }
 

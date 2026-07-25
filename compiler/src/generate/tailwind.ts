@@ -1481,7 +1481,7 @@ export function buildTailwind(ir: IR, assetMap: Map<string, string>, colorVar?: 
  *  so utilities override them. */
 export function tailwindGlobalsCss(opts: {
   reset: string; fontCss: string; tokensCss: string; htmlBg: string | null; bodyFont: string;
-  clip: string; colorTokens: string[]; viewports: number[]; canonical: number;
+  clip: string; colorTokens: string[]; viewports: number[]; canonical: number; bodyTextRendering?: string;
 }): string {
   const screens = [
     ...[...opts.viewports].sort((a, b) => a - b).map((v) => `  --breakpoint-vp${v}: ${v}px;`),
@@ -1508,7 +1508,19 @@ ${opts.tokensCss}
 ${opts.reset}
 /* fonts */
 ${opts.fontCss}
-${opts.htmlBg !== null ? `html { background: ${opts.htmlBg}; }\n` : ""}body { font-family: ${opts.bodyFont}; }${opts.clip}
+${opts.htmlBg !== null ? `html { background: ${opts.htmlBg}; }\n` : ""}body { font-family: ${opts.bodyFont}; }
+${bodyTextRenderingRule(opts.bodyTextRendering)}${opts.clip}
 }
 `;
+}
+
+/** `body { text-rendering: … }` when the source set a non-default value (commonly
+ *  `optimizeLegibility`, to turn on kerning/ligatures for display type) — dropping it renders
+ *  with the browser's default heuristic instead, a small but real letter-spacing/shaping
+ *  difference on every inheriting element (which is all of them). Empty string when default.
+ *  Duplicated from generate/app.ts's copy (same logic, different humanize-mode code path) rather
+ *  than shared, to avoid a tailwind.ts ⇄ app.ts import cycle over two lines of pure string logic. */
+function bodyTextRenderingRule(value: string | undefined): string {
+  const v = (value ?? "").trim();
+  return v && v !== "auto" ? `body { text-rendering: ${v}; }\n` : "";
 }
