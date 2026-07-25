@@ -481,6 +481,7 @@ function readPreserveCaps(sourceDir: string): Set<string> {
       if (pat.kind === "tabs") for (const t of pat.tabs) set.add(t.panelCap);
       else if (pat.kind === "accordion") for (const i of pat.items) set.add(i.regionCap);
       else if (pat.kind === "carousel") set.add(pat.trackCap); // keep the whole slide track
+      else if (pat.kind === "scroll") { /* nothing hidden — the header is visible at rest */ }
       else for (const i of pat.items) set.add(i.panelCap); // disclosure: keep hidden overlay panels
     }
   } catch { /* malformed — preserve nothing */ }

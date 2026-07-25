@@ -60,6 +60,10 @@ function statesFor(p: PatternSpec): { rootCap: string; states: State[] } {
       { label: "next-2", caps: s2 },
     ] };
   }
+  if (p.kind === "scroll") {
+    // No click-based state to film (it's driven by scroll position, not a trigger); just the base.
+    return { rootCap: p.rootCap, states: [{ label: "base", caps: [] }] };
+  }
   // disclosure: show a menu opening and (if present) a modal opening
   const menu = p.items.find((i) => !i.isDialog);
   const dialog = p.items.find((i) => i.isDialog);

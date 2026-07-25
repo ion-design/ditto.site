@@ -15,11 +15,13 @@ import type { InteractionCapture, CapStyle, RelBox } from "../capture/interactio
 type RTTab = { trigger: string; panel: string; triggerOn: CapStyle; triggerOff: CapStyle; panelShown: CapStyle; panelHidden: CapStyle; descendants?: Record<string, CapStyle> };
 type RTAcc = { trigger: string; region: string; expanded: boolean; triggerOn: CapStyle; triggerOff: CapStyle; regionShown: CapStyle; regionHidden: CapStyle };
 type RTDisc = { trigger: string; panel: string; isDialog: boolean; hoverOpen: boolean; backdropClose: boolean; closes: string[]; triggerOn: CapStyle; triggerOff: CapStyle; panelShown: CapStyle; panelHidden: CapStyle; shownBox: RelBox | null; descendants?: Record<string, CapStyle> };
+type RTScroll = { root: string; threshold: number; rest: CapStyle; scrolled: CapStyle; descendants?: Record<string, { rest: CapStyle; scrolled: CapStyle }> };
 export type RuntimeSpec =
   | { kind: "tabs"; active: number; tabs: RTTab[] }
   | { kind: "accordion"; items: RTAcc[] }
   | { kind: "carousel"; track: string; next: string | null; prev: string | null; bullets: string[]; base: number; transforms: string[]; bulletOn: CapStyle; bulletOff: CapStyle }
-  | { kind: "disclosure"; items: RTDisc[] };
+  | { kind: "disclosure"; items: RTDisc[] }
+  | { kind: "scroll"; scroll: RTScroll };
 export type AccordionRuntimeSpec = Extract<RuntimeSpec, { kind: "accordion" }>;
 
 export const INTERACTION_REJECTION_VERSION = 2;
@@ -64,6 +66,7 @@ export function specKey(s: RuntimeSpec): string {
   if (s.kind === "tabs") return "t:" + s.tabs[0]?.trigger;
   if (s.kind === "accordion") return "a:" + s.items[0]?.trigger;
   if (s.kind === "carousel") return "c:" + s.track;
+  if (s.kind === "scroll") return "s:" + s.scroll.root;
   return "d:" + s.items[0]?.trigger;
 }
 
@@ -119,6 +122,15 @@ export function buildRuntimeSpecs(ir: IR, interaction: InteractionCapture | unde
         items.push({ trigger, panel, isDialog: it.isDialog, hoverOpen: it.hoverOpen, backdropClose: it.backdropClose, closes, triggerOn: it.triggerOn, triggerOff: it.triggerOff, panelShown: it.panelShown, panelHidden: it.panelHidden, shownBox: it.shownBox, descendants: mapDesc(it.descendants) });
       }
       if (items.length) specs.push({ kind: "disclosure", items });
+    } else if (p.kind === "scroll") {
+      const root = map.get(p.rootCap);
+      if (!ok(root)) continue;
+      const descendants: Record<string, { rest: CapStyle; scrolled: CapStyle }> = {};
+      for (const cap of Object.keys(p.descendants ?? {})) {
+        const cid = map.get(cap);
+        if (ok(cid)) descendants[cid] = p.descendants![cap]!;
+      }
+      specs.push({ kind: "scroll", scroll: { root, threshold: p.thresholdPx, rest: p.restStyle, scrolled: p.scrolledStyle, descendants: Object.keys(descendants).length ? descendants : undefined } });
     }
   }
   // Drop patterns the interaction gate proved don't reproduce in the clone (they're
@@ -210,11 +222,13 @@ type CapStyle = Record<string, string>;
 type RTTab = { trigger: string; panel: string; triggerOn: CapStyle; triggerOff: CapStyle; panelShown: CapStyle; panelHidden: CapStyle; descendants?: Record<string, CapStyle> };
 type RTAcc = { trigger: string; region: string; expanded: boolean; triggerOn: CapStyle; triggerOff: CapStyle; regionShown: CapStyle; regionHidden: CapStyle };
 type RTDisc = { trigger: string; panel: string; isDialog: boolean; hoverOpen: boolean; backdropClose: boolean; closes: string[]; triggerOn: CapStyle; triggerOff: CapStyle; panelShown: CapStyle; panelHidden: CapStyle; shownBox?: unknown; descendants?: Record<string, CapStyle> };
+type RTScroll = { root: string; threshold: number; rest: CapStyle; scrolled: CapStyle; descendants?: Record<string, { rest: CapStyle; scrolled: CapStyle }> };
 export type Spec =
   | { kind: "tabs"; active: number; tabs: RTTab[] }
   | { kind: "accordion"; items: RTAcc[] }
   | { kind: "carousel"; track: string; next: string | null; prev: string | null; bullets: string[]; base: number; transforms: string[]; bulletOn: CapStyle; bulletOff: CapStyle }
-  | { kind: "disclosure"; items: RTDisc[] };
+  | { kind: "disclosure"; items: RTDisc[] }
+  | { kind: "scroll"; scroll: RTScroll };
 
 const kebab = (p: string) => p.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
 const byCid = (cid: string): HTMLElement | null => document.querySelector('[data-cid="' + cid + '"]');
@@ -296,6 +310,29 @@ export default function DittoWire({ spec }: { spec: Spec }) {
       prevEl?.addEventListener("click", (e) => { e.preventDefault(); go(index - 1); }, { signal });
       spec.bullets.forEach((b, bi) => byCid(b)?.addEventListener("click", (e) => { e.preventDefault(); go(bi); }, { signal }));
       // No initial go() — the static base state is already correct.
+    } else if (spec.kind === "scroll") {
+      // A fixed/sticky header (or similar) that restyles once scrolled past the captured
+      // threshold — e.g. shrinks and gains a solid background once the hero photo behind it
+      // scrolls away. Toggles between the two captured states; never applied on mount (the
+      // static base already reproduces scroll-0 exactly), and rAF-throttled so it costs
+      // nothing on ordinary scroll.
+      const root = byCid(spec.scroll.root);
+      let applied = false;
+      const apply = (on: boolean) => {
+        if (on === applied) return;
+        applied = on;
+        applyStyle(root, on ? spec.scroll.scrolled : spec.scroll.rest);
+        const d = spec.scroll.descendants;
+        if (d) for (const cid in d) applyStyle(byCid(cid), on ? d[cid].scrolled : d[cid].rest);
+      };
+      let ticking = false;
+      const onScroll = () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(() => { apply(window.scrollY > spec.scroll.threshold); ticking = false; });
+      };
+      window.addEventListener("scroll", onScroll, { passive: true, signal });
+      // No initial apply() — the static base state (rest, scroll 0) is already correct.
     } else {
       // Disclosure: dropdown / mega-menu / modal — a trigger reveals a hidden overlay.
       spec.items.forEach((it) => {

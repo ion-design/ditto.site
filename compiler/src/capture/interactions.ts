@@ -1,4 +1,6 @@
 import type { Page } from "playwright";
+import { captureScrollMorph, type ScrollSpec } from "./scrollMorph.js";
+export type { ScrollSpec } from "./scrollMorph.js";
 
 /**
  * Interaction capture driver (Stage 4). Runs AFTER the settled base snapshot, only
@@ -106,7 +108,7 @@ export type DisclosureSpec = {
     descendants?: Record<string, CapStyle>; // cap → open-state overrides for gated content
   }>;
 };
-export type PatternSpec = TabsSpec | AccordionSpec | CarouselSpec | DisclosureSpec;
+export type PatternSpec = TabsSpec | AccordionSpec | CarouselSpec | DisclosureSpec | ScrollSpec;
 
 export type InteractionCapture = {
   hover: Record<string, StyleDelta>; // capId → changed props on :hover (self)
@@ -499,8 +501,11 @@ export async function captureInteractions(page: Page, opts?: { maxCandidates?: n
   // M2: recognize + drive discrete patterns (tabs / accordion).
   const patterns = await drivePatterns(page, log);
   const menus = await captureMenus(page, log);
+  // M6: scroll-morph (a fixed/sticky header that restyles once scrolled) — runs last since it
+  // moves the scroll position; restores scroll 0 itself before returning.
+  const scrollSpecs = await captureScrollMorph(page, log).catch(() => [] as ScrollSpec[]);
 
-  return { hover, focus, hoverDesc: Object.keys(hoverDesc).length ? hoverDesc : undefined, candidates: candidates.length, patterns, menus: menus.length ? menus : undefined };
+  return { hover, focus, hoverDesc: Object.keys(hoverDesc).length ? hoverDesc : undefined, candidates: candidates.length, patterns: [...patterns, ...scrollSpecs], menus: menus.length ? menus : undefined };
 }
 
 // ---- M2: tabs + accordion ----
@@ -1001,6 +1006,7 @@ function usedCapSet(patterns: PatternSpec[]): Set<string> {
     if (p.kind === "tabs") for (const t of p.tabs) { s.add(t.triggerCap); s.add(t.panelCap); }
     else if (p.kind === "accordion") for (const i of p.items) { s.add(i.triggerCap); s.add(i.regionCap); }
     else if (p.kind === "carousel") { s.add(p.rootCap); s.add(p.trackCap); if (p.nextCap) s.add(p.nextCap); if (p.prevCap) s.add(p.prevCap); for (const b of p.bulletCaps) s.add(b); }
+    else if (p.kind === "scroll") { s.add(p.rootCap); for (const d of Object.keys(p.descendants ?? {})) s.add(d); }
     else for (const i of p.items) { s.add(i.triggerCap); s.add(i.panelCap); for (const c of i.closeCaps) s.add(c); }
   }
   return s;

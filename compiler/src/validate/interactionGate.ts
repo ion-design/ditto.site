@@ -56,7 +56,7 @@ export async function driveInteractionGate(opts: {
   const check = (ok: boolean, msg: string): void => { assertions++; if (ok) passed++; else issues.push(msg); };
 
   const browser = await chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
-  let tabsOk = 0, accOk = 0, carOk = 0, discOk = 0, focusOk = 0, focusCheckedActual = 0, menusOk = 0;
+  let tabsOk = 0, accOk = 0, carOk = 0, discOk = 0, scrollOk = 0, focusOk = 0, focusCheckedActual = 0, menusOk = 0;
   const rejected: string[] = []; // specKeys of patterns that didn't reproduce → prune to static
   try {
     const ctx = await browser.newContext({ viewport: { width: vp, height: vh }, deviceScaleFactor: 1 });
@@ -166,6 +166,32 @@ export async function driveInteractionGate(opts: {
           }
         }
         if (ok) carOk++; else rejected.push(specKey(spec));
+      } else if (spec.kind === "scroll") {
+        // Scroll-morph: scroll past the captured threshold, confirm the root and its
+        // descendants land on the "scrolled" style; scroll back to 0, confirm they
+        // return to "rest" (the static base render, so this half is really just a
+        // safety check that nothing got stuck applied).
+        let ok = true;
+        const s = spec.scroll;
+        await page.evaluate((y) => window.scrollTo(0, y), s.threshold + 20);
+        await page.waitForTimeout(250);
+        const matches = async (cid: string, want: Record<string, string>): Promise<boolean> => {
+          const keys = Object.keys(want);
+          if (!keys.length) return true;
+          const got = await styleOf(cid, keys);
+          return !!got && keys.every((k) => (/color|fill/i.test(k) ? colorClose(got[k] ?? "", want[k]!) : got[k] === want[k]));
+        };
+        const rootMatch = await matches(s.root, s.scrolled);
+        if (!rootMatch) ok = false;
+        check(rootMatch, `scroll: root reached scrolled state`);
+        for (const cid of Object.keys(s.descendants ?? {})) {
+          const dm = await matches(cid, s.descendants![cid]!.scrolled);
+          if (!dm) ok = false;
+          check(dm, `scroll: descendant ${cid} reached scrolled state`);
+        }
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.waitForTimeout(250);
+        if (ok) scrollOk++; else rejected.push(specKey(spec));
       } else {
         // Disclosure: opening the trigger must reveal the panel (display flip), and
         // a close control must hide it again.
@@ -259,12 +285,13 @@ export async function driveInteractionGate(opts: {
   const accTotal = specs.filter((s) => s.kind === "accordion").length;
   const carTotal = specs.filter((s) => s.kind === "carousel").length;
   const discTotal = specs.filter((s) => s.kind === "disclosure").length;
+  const scrollTotal = specs.filter((s) => s.kind === "scroll").length;
   // Accuracy contract: every recognized pattern is either reproduced-and-verified
   // (kept) or doesn't reproduce and gets pruned to static (rejected). Both are
   // accurate — the clone never ships a broken interaction. So the gate passes when
   // every pattern is cleanly classified and the driver didn't crash; the metrics
   // report how many reproduced vs were pruned.
-  const reproduced = tabsOk + accOk + carOk + discOk;
+  const reproduced = tabsOk + accOk + carOk + discOk + scrollOk;
   const passPct = assertions ? passed / assertions : 1;
   const droveOk = !issues.some((i) => i.startsWith("interaction drive error"));
   const pass = droveOk && reproduced + rejected.length === specs.length;
@@ -274,6 +301,7 @@ export async function driveInteractionGate(opts: {
     metrics: {
       patterns: specs.length, reproduced, pruned: rejected.length,
       tabs: `${tabsOk}/${tabsTotal}`, accordions: `${accOk}/${accTotal}`, carousels: `${carOk}/${carTotal}`, disclosures: `${discOk}/${discTotal}`,
+      scroll: `${scrollOk}/${scrollTotal}`,
       patternAssertions: assertions, patternPassPct: Math.round(passPct * 1000) / 1000,
       focusChecked: focusCheckedActual, focusOk, rejected,
       menus: `${menusOk}/${menuDrives.length}`,
