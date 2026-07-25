@@ -360,6 +360,9 @@ function rewriteComponentMetaAttrs(text: string, componentsWithAnchors: Set<stri
 function rewriteSvgDittoIdProps(text: string, anchorOf: (cid: string) => string | null, count: (hasAnchor: boolean) => void): string {
   let next = text
     .replace(/\(\{ cid \}: \{ cid\?: string \}\)/g, "({ dittoId }: { dittoId?: string })")
+    // Icons hoisted with a per-instance className prop (see the SVG dedup key in
+    // generate/app.ts) keep the same 2-param shape here; only `cid` renames to `dittoId`.
+    .replace(/\(\{ cid, className \}: \{ cid\?: string; className\?: string \}\)/g, "({ dittoId, className }: { dittoId?: string; className?: string })")
     .replace(/\sdata-(?:cid|clone-id|ditto-id)=\{cid\}/g, " data-ditto-id={dittoId}");
   next = next.replace(/\scid=\{\s*"([^"]+)"\s*\}/g, (_full, cid: string) => {
     const anchor = anchorOf(cid);
@@ -386,6 +389,7 @@ function pruneUnusedSvgDittoIds(files: string[]): void {
     const text = readFileSync(f, "utf8");
     const next = text
       .replace(/export default function ([A-Za-z_$][\w$]*)\(\{ dittoId \}: \{ dittoId\?: string \}\)/g, "export default function $1()")
+      .replace(/export default function ([A-Za-z_$][\w$]*)\(\{ dittoId, className \}: \{ dittoId\?: string; className\?: string \}\)/g, "export default function $1({ className }: { className?: string })")
       .replace(/\sdata-ditto-id=\{dittoId\}/g, "");
     if (next !== text) writeFileSync(f, next);
   }

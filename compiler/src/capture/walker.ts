@@ -193,6 +193,7 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     "color", "fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing",
     "textAlign", "textTransform",
     "backgroundColor", "backgroundImage", "backgroundSize", "backgroundPosition", "backgroundRepeat",
+    "backgroundClip", "webkitBackgroundClip", "webkitTextFillColor",
     "boxShadow", "opacity", "transform", "transformOrigin", "translate", "rotate", "scale", "filter",
     "overflow", "objectFit",
   ];

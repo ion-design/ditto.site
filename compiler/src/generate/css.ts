@@ -3300,7 +3300,7 @@ function isRestingInteractiveFillPseudo(node: IRNode, styleByVp: Record<number, 
 // line-height from its host that getComputedStyle reports but that paint nothing — baking them is
 // pure noise (and a pile of sub-pixel decimals). Drop them when content is empty; keep when there's
 // an actual glyph/counter/attr to render.
-const PSEUDO_TEXT_ONLY = new Set(["color", "fontSize", "fontWeight", "lineHeight", "letterSpacing", "textAlign", "whiteSpace"]);
+const PSEUDO_TEXT_ONLY = new Set(["color", "fontSize", "fontWeight", "lineHeight", "letterSpacing", "textAlign", "whiteSpace", "backgroundClip", "webkitBackgroundClip", "webkitTextFillColor"]);
 function pseudoDecls(style: StyleMap, assetMap: Map<string, string>): Map<string, string> {
   const decls = new Map<string, string>();
   const content = style.content;
@@ -3318,6 +3318,12 @@ function pseudoDecls(style: StyleMap, assetMap: Map<string, string>): Map<string
     ["lineHeight", "normal"], ["letterSpacing", "normal"], ["textAlign", "start"],
     ["backgroundColor", ["rgba(0, 0, 0, 0)", "transparent"]], ["backgroundImage", "none"],
     ["backgroundSize", "auto"], ["backgroundPosition", ["0% 0%", "0px 0px"]], ["backgroundRepeat", "repeat"],
+    // background-clip:text + a transparent text fill is the standard "gradient/pattern painted
+    // through glyph shapes" technique (e.g. a star-rating row: `content:"★★★★★"` + a gradient
+    // background clipped to the star glyphs) — without these the gradient paints the pseudo's
+    // whole box instead of just the text, i.e. a solid bar instead of partially-colored stars.
+    ["backgroundClip", "border-box"], ["webkitBackgroundClip", "border-box"],
+    ["webkitTextFillColor", "__never__"],
     ["boxShadow", "none"], ["opacity", "1"], ["transform", "none"], ["transformOrigin", "__skip__"],
     ["filter", "none"], ["overflow", "visible"], ["objectFit", "fill"], ["borderTopLeftRadius", "0px"],
     ["flexShrink", "1"], ["flexGrow", "0"], ["flexBasis", "auto"], ["alignSelf", "auto"], ["order", "0"],

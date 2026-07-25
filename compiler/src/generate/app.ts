@@ -658,8 +658,17 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
     // so section files aren't walls of path data. Skeleton SVGs stay inline (already deduped).
     if (ctx?.svgs) {
       const reg = ctx.svgs;
-      const restAttrs = renderAttrs(propsList(node, assetMap, sourceUrl, ctx).filter((p) => p[0] !== '"data-cid"' && noHtml(p)));
-      const key = restAttrs + "\0" + innerSrc; // dedup on attrs AND content
+      const allProps = propsList(node, assetMap, sourceUrl, ctx).filter((p) => p[0] !== '"data-cid"' && noHtml(p));
+      // className is per-instance PRESENTATION (sizing/visibility/hover classes vary by call
+      // site), not part of the icon's identity — split it out so pixel-identical artwork used
+      // at different sizes/positions still collapses into one shared component instead of one
+      // per distinct className (previously keyed attrs+content together, so e.g. the same
+      // chevron reused at 5 call sites emitted 5 near-duplicate components).
+      const classIdx = allProps.findIndex((p) => p[0] === "className" || p[0] === "class");
+      const classSrc = classIdx >= 0 ? allProps[classIdx]![1] : undefined;
+      const structuralProps = classIdx >= 0 ? allProps.filter((_, i) => i !== classIdx) : allProps;
+      const restAttrs = renderAttrs(structuralProps);
+      const key = restAttrs + "\0" + innerSrc; // dedup on structural attrs AND content only
       let name = reg.byKey.get(key);
       if (!name) {
         const base = ctx.primitives?.get(node.id) === "image" ? "Illustration" : "Icon";
@@ -669,10 +678,11 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
         reg.byKey.set(key, name);
         reg.order.push(name);
         const body = svgInnerToJsx(innerSrc, "      ");
-        const el = body ? `<svg${restAttrs} data-cid={cid}>\n${body}\n    </svg>` : `<svg${restAttrs} data-cid={cid} />`;
-        reg.defs.set(name, `export default function ${name}({ cid }: { cid?: string }) {\n  return (\n    ${el}\n  );\n}\n`);
+        const el = body ? `<svg${restAttrs} className={className} data-cid={cid}>\n${body}\n    </svg>` : `<svg${restAttrs} className={className} data-cid={cid} />`;
+        reg.defs.set(name, `export default function ${name}({ cid, className }: { cid?: string; className?: string }) {\n  return (\n    ${el}\n  );\n}\n`);
       }
-      return `${pad}<${name} cid={${JSON.stringify(node.id)}} />`;
+      const classAttr = classSrc !== undefined ? ` className={${classSrc}}` : "";
+      return `${pad}<${name} cid={${JSON.stringify(node.id)}}${classAttr} />`;
     }
     const restAttrs = renderAttrs(propsList(node, assetMap, sourceUrl, ctx).filter(noHtml));
     const body = svgInnerToJsx(innerSrc, pad + "  ");
@@ -1257,7 +1267,7 @@ function emitVariantSkeleton(componentName: string, instances: IRNode[], variant
     if (ELEMENT_ONLY_PARENTS.has(tag) && buf.every((t) => t.trim() === "")) return;
     if (!buf.some((t) => t.length > 0)) return;
     if (buf.every((t) => t === buf[0])) {
-      childParts.push(`${cpad}${jsxText(buf[0]!)}`);
+      childParts.push(`${cpad}${jsxText(normalizeTextValue(buf[0]!))}`);
       return;
     }
     const existing = textFieldForValues(dataRows, buf);
@@ -1266,7 +1276,9 @@ function emitVariantSkeleton(componentName: string, instances: IRNode[], variant
       return;
     }
     const f = gen.field(textHint(tag, ancestors));
-    instances.forEach((_, i) => dataRows[i]!.set(f, escapeText(buf[i]!)));
+    // textFieldForValues (above) compares stored values against normalizeTextValue(...),
+    // so storage must already be normalized or reuse-detection silently never matches.
+    instances.forEach((_, i) => dataRows[i]!.set(f, escapeText(normalizeTextValue(buf[i]!))));
     childParts.push(`${cpad}{d.${f}}`);
   };
 
@@ -1646,10 +1658,10 @@ function emitSkeleton(instances: IRNode[], insideInteractive: boolean, indent: n
     const buf = runText; runText = null;
     if (ELEMENT_ONLY_PARENTS.has(tag) && buf.every((t) => t.trim() === "")) return;
     if (!buf.some((t) => t.length > 0)) return;
-    if (buf.every((t) => t === buf[0])) childParts.push(`${cpad}${jsxText(buf[0]!)}`);
+    if (buf.every((t) => t === buf[0])) childParts.push(`${cpad}${jsxText(normalizeTextValue(buf[0]!))}`);
     else {
       const f = gen.field(textHint(tag, ancestors));
-      instances.forEach((_, i) => dataRows[i]!.set(f, escapeText(buf[i]!)));
+      instances.forEach((_, i) => dataRows[i]!.set(f, escapeText(normalizeTextValue(buf[i]!))));
       childParts.push(`${cpad}{d.${f}}`);
     }
   };
