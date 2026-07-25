@@ -1638,7 +1638,21 @@ function fillsToCapWidth(node: IRNode, parentNode: IRNode | undefined, viewports
  *  overflow, so flex-shrink never fires and `width:N%` is the stable used width). No horizontal
  *  margins (those make the width load-bearing). */
 function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): Record<number, string> | null {
-  if (!parentNode || REPLACED.has(node.tag) || node.tag.includes("-")) return null;
+  if (!parentNode || node.tag.includes("-")) return null;
+  // A replaced element (img/video/…) normally sizes to its intrinsic dimensions under auto/%, which
+  // is why this is excluded elsewhere (planWidth) — but when it carries a LOCKED aspect-ratio at
+  // every sampled viewport, its height is provably height:auto-from-width (never intrinsic fallback),
+  // so a stable width:N% is exactly as safe here as for a block box: a fluid image tile in a
+  // multi-column row (e.g. two photos captured only at 1280px/1920px bands) otherwise freezes at
+  // baked per-band px and wraps to its own row at any window width the capture didn't sample.
+  if (REPLACED.has(node.tag)) {
+    const lockedAspect = viewports.every((vp) => {
+      const cs = node.computedByVp[vp];
+      if (!cs || !node.visibleByVp[vp] || (cs.display || "") === "none") return true;
+      return !!cs.aspectRatio && cs.aspectRatio !== "auto";
+    });
+    if (!lockedAspect) return null;
+  }
   type S = { vp: number; ratio: number; container: number; w: number; flexRow: boolean; wMin?: number; wMax?: number };
   const samples: S[] = [];
   for (const vp of viewports) {
@@ -1681,9 +1695,16 @@ function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewport
   // A flex-ROW item only holds `width:N%` if shrink never fires — i.e. the row's in-flow items + gaps
   // don't overflow the container at any sampled width (slack ≥ 0). Otherwise the used width is a
   // shrink result, not the authored %, and `width:N%` would diverge between the captured widths.
+  // A WRAPPING flex row (flex-wrap:wrap) lays its children out over several LINES, each independently
+  // as wide as the container — summing every sibling against the one container width (as a non-wrapping
+  // row must) would flag a false overflow for, e.g., a full-width hero image followed by a wrapped pair
+  // of half-width tiles below it. Scope the sum to only the children sharing THIS node's line (same
+  // bbox top, within rounding), so a wrapped multi-line row is judged one line at a time.
   for (const s of samples) {
     if (!s.flexRow) continue;
     const pcs = parentNode.computedByVp[s.vp]!; const pb = parentNode.bboxByVp[s.vp]!;
+    const wraps = (pcs.flexWrap || "nowrap") !== "nowrap";
+    const nodeTop = node.bboxByVp[s.vp]?.y;
     const gap = pf(pcs.columnGap && pcs.columnGap !== "normal" ? pcs.columnGap : pcs.gap);
     let sum = 0, vis = 0;
     for (const c of parentNode.children) {
@@ -1692,6 +1713,7 @@ function fluidPercentByVp(node: IRNode, parentNode: IRNode | undefined, viewport
       if (!ccs || !cb || !c.visibleByVp[s.vp] || (ccs.display || "") === "none") continue;
       const cp = ccs.position || "static";
       if (cp === "absolute" || cp === "fixed") continue;
+      if (wraps && nodeTop !== undefined && Math.abs(cb.y - nodeTop) > 1.5) continue; // a different line
       sum += cb.width + pf(ccs.marginLeft) + pf(ccs.marginRight); vis++;
     }
     if (vis > 0 && sum + gap * (vis - 1) > s.container + 1.5) return null;   // row overflows ⇒ shrink fired ⇒ keep baked
@@ -2780,13 +2802,32 @@ function declsForViewport(
   const textHeightIsContentDerived = flowsText && (!(lineH > 0) || Math.abs(rows - Math.round(rows)) < 0.15);
   const plannedHeight = geometry.heightByVp?.[vp];
   const plannedAspect = geometry.aspectByVp?.[vp];
-  const dropHeight = plannedAspect !== undefined || (isTextLeaf && inFlow && ov === "visible" && textHeightIsContentDerived) || flowHeight;
+  // A replaced element (img/video/…) whose WIDTH was resolved fluid (percent/fill/auto — see
+  // widthPlan above) but that still falls through to this generic "bake the captured height
+  // verbatim" branch: with a locked aspect-ratio (already emitted separately, see `aspectRatio` in
+  // the generic replay list below) and no explicit height, the height derives from the now-fluid
+  // width instead of freezing per-band — else a fluid-width tile stays the right SIZE only at the
+  // captured breakpoints and visibly stretches/squashes in between (width scales, height doesn't).
+  const widthIsFluidAtVp =
+    widthPlan.kind === "percentVp" ? widthPlan.pctByVp[vp] !== undefined
+    : widthPlan.kind === "percent" || widthPlan.kind === "fill" || widthPlan.kind === "fillcap" || widthPlan.kind === "auto";
+  const aspectLocked = !!cs.aspectRatio && cs.aspectRatio !== "auto";
+  const replacedFluidAspect = REPLACED.has(tag) && widthIsFluidAtVp && aspectLocked;
+  const dropHeight = plannedAspect !== undefined || replacedFluidAspect || (isTextLeaf && inFlow && ov === "visible" && textHeightIsContentDerived) || flowHeight;
   if (plannedHeight) {
     out.set("height", plannedHeight);
   } else if (heightFill) {
     out.set("height", "100%"); // fills its (definite) parent — overrides the baked px / the flow drop
   } else if (cs.height && cs.height !== "auto" && !isTableWithCaption && !rootUnclamp && !dropHeight && (!isInlineOnly || REPLACED.has(tag)) && (noCollapse || isLeaf || explicitHeight)) {
     out.set("height", cs.height);
+  } else if (replacedFluidAspect) {
+    // An <img>/<video>'s HTML width/height CONTENT ATTRIBUTES act as a low-priority presentational
+    // hint (effectively `height:232px` from `height="232"`) that wins over having no CSS height
+    // declaration at all — merely omitting one here (the other branches' fallthrough) would leave
+    // the attribute pinning the height, aspect-ratio never engages, and the box stays the old fixed
+    // height while the width scales. An explicit `height:auto` outranks the attribute and lets
+    // aspect-ratio compute the height from the now-fluid width.
+    out.set("height", "auto");
   }
   const plannedMinHeight = geometry.minHeightByVp?.[vp];
   if (cs.minHeight && cs.minHeight !== "0px" && cs.minHeight !== "auto") {
