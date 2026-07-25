@@ -65,8 +65,11 @@ export type RawNode = {
   rawHTML?: string; // set for inline <svg>
   // Computed paint of an inline <svg> root (fill/stroke/color). A raw `fill="none"` attribute may
   // still resolve to a real paint via site CSS (`fill: currentColor`); these resolved values let
-  // codegen recover a paint the extraction stripped. Set only for svg roots.
-  svgPaint?: { fill: string; stroke: string; color: string };
+  // codegen recover a paint the extraction stripped. Set only for svg roots. `pathFill` additionally
+  // samples an actual descendant shape's computed fill: CSS commonly paints the PATHS directly
+  // (`svg path { fill: #fff }`) rather than the svg root, which the root-only fill/color pair above
+  // can't see (fill isn't inherited upward) — pathFill is the ground truth for what's really painted.
+  svgPaint?: { fill: string; stroke: string; color: string; pathFill?: string };
   children: RawChild[];
 };
 
@@ -507,7 +510,15 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       // an inherited `color`) overrides it. Extraction strips that CSS, so the raw attribute alone is
       // misleading — codegen consults these resolved values to decide whether the root truly paints.
       try {
-        node.svgPaint = { fill: cs.fill, stroke: cs.stroke, color: cs.color };
+        // A representative descendant shape's own computed fill — ground truth for what's
+        // actually painted when CSS targets the paths directly rather than the svg root (the
+        // root-only fill/color pair above then can't see it: fill doesn't inherit upward).
+        let pathFill: string | undefined;
+        try {
+          const shape = el.querySelector("path, circle, rect, polygon, ellipse, line, polyline");
+          if (shape) pathFill = window.getComputedStyle(shape).fill;
+        } catch { /* ignore */ }
+        node.svgPaint = { fill: cs.fill, stroke: cs.stroke, color: cs.color, ...(pathFill ? { pathFill } : {}) };
       } catch { /* getComputedStyle already read above; guard against exotic UAs */ }
       return node;
     }

@@ -49,6 +49,15 @@ async function readProps(page: Page, cap: string, props: readonly string[]): Pro
     const cs = getComputedStyle(el);
     const o: Record<string, string> = {};
     for (const p of props) { const v = (cs as unknown as Record<string, string>)[p]; if (v != null) o[p] = v; }
+    // An inline <svg>'s own "fill" is typically just the UA-default black (paths are captured as
+    // raw markup, never individually tagged, so they can't be read directly) — but its actual
+    // painted color, and the one that scroll-linked CSS commonly re-colors, lives on a descendant
+    // path. Read that instead: `fill` inherits DOWNWARD, so applying the delta to the svg root
+    // (which is what data-cid targets at runtime) reproduces the same visible color.
+    if (props.includes("fill") && el.tagName.toLowerCase() === "svg") {
+      const shape = el.querySelector("path, circle, rect, polygon, ellipse, line, polyline");
+      if (shape) o.fill = getComputedStyle(shape).fill;
+    }
     return o;
   }, { cap, props: props as unknown as string[] });
 }

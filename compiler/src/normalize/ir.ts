@@ -30,7 +30,9 @@ export type IRNode = {
   rawHTML?: string; // inline svg
   // Computed paint of an inline <svg> root (fill/stroke/color), carried from capture. Lets codegen
   // recover a paint that a raw `fill="none"` attribute hides but site CSS actually supplied.
-  svgPaint?: { fill: string; stroke: string; color: string };
+  // `pathFill` is a descendant shape's own computed fill — ground truth when CSS paints the paths
+  // directly rather than the root (fill doesn't inherit upward, so the root-only trio can't see it).
+  svgPaint?: { fill: string; stroke: string; color: string; pathFill?: string };
   visibleByVp: Record<number, boolean>;
   bboxByVp: Record<number, BBox>;
   computedByVp: Record<number, StyleMap>;

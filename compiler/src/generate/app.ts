@@ -510,7 +510,7 @@ export function isRealPaint(value: string | null | undefined): boolean {
  */
 export function resolveSvgRootFill(
   rawFill: string | null | undefined,
-  computed?: { fill?: string; color?: string } | null,
+  computed?: { fill?: string; color?: string; pathFill?: string } | null,
 ): { mode: "keep" | "fallback" | "emit"; value?: string; emitColor?: string } {
   const raw = (rawFill ?? "").trim();
   if (raw && raw.toLowerCase() !== "none") return { mode: "keep" };
@@ -526,6 +526,20 @@ export function resolveSvgRootFill(
       return { mode: "emit", value: cf!.trim() };
     }
     return { mode: "keep" }; // genuinely unfilled — leave fill="none"
+  }
+  // No fill attribute at all on the root (not even "none"): the plain currentColor fallback below
+  // assumes a `fill: currentColor` rule on the SVG ROOT — right when the color really does track
+  // the element's inherited `color`, wrong when the site's CSS instead paints the descendant PATHS
+  // directly (`svg path { fill: #fff }`), which the root's own computed fill/color can never see
+  // (fill doesn't inherit upward). `computed.pathFill` samples an actual path directly — when it's a
+  // real paint the root's color wouldn't explain, trust it: `fill` inherits DOWNWARD, so setting it
+  // on the root reproduces the identical visible color without touching the paths themselves.
+  const pathFill = computed?.pathFill?.trim();
+  if (pathFill && isRealPaint(pathFill)) {
+    const rootColor = (computed?.color ?? "").trim();
+    if (!(rootColor && pathFill.toLowerCase() === rootColor.toLowerCase())) {
+      return { mode: "emit", value: pathFill };
+    }
   }
   return { mode: "fallback" };
 }

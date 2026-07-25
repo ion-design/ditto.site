@@ -57,4 +57,30 @@ describe("resolveSvgRootFill", () => {
     assert.equal(r.value, "rgb(0, 128, 0)");
     assert.equal(r.emitColor, undefined);
   });
+
+  describe("pathFill recovery (no fill attribute at all — CSS paints the descendant paths, not the root)", () => {
+    it("trusts pathFill over the root's own (unrelated) computed fill/color", () => {
+      // The travelopia wordmark case: root computed fill is black (SVG's own initial value —
+      // nothing paints the root itself), root color is an unrelated inherited link color (blue),
+      // but a `svg path { fill: #fff }`-style rule makes the actual glyphs paint white.
+      const r = resolveSvgRootFill(undefined, { fill: "rgb(0, 0, 0)", color: "rgb(0, 114, 162)", pathFill: "rgb(255, 255, 255)" });
+      assert.equal(r.mode, "emit");
+      assert.equal(r.value, "rgb(255, 255, 255)");
+      assert.equal(r.emitColor, undefined);
+    });
+
+    it("still falls back when pathFill is not a real paint", () => {
+      const r = resolveSvgRootFill(undefined, { fill: "rgb(0, 0, 0)", color: "rgb(0, 114, 162)", pathFill: "none" });
+      assert.deepEqual(r, { mode: "fallback" });
+    });
+
+    it("still falls back when pathFill merely restates the root's own color (no new information)", () => {
+      const r = resolveSvgRootFill(undefined, { fill: "rgb(0, 0, 0)", color: "rgb(255, 255, 255)", pathFill: "rgb(255, 255, 255)" });
+      assert.deepEqual(r, { mode: "fallback" });
+    });
+
+    it("still falls back when no pathFill was captured at all (unchanged prior behavior)", () => {
+      assert.deepEqual(resolveSvgRootFill(undefined, { fill: "rgb(255,255,255)", color: "rgb(255,255,255)" }), { mode: "fallback" });
+    });
+  });
 });
