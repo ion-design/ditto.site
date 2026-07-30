@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ditto Website Cloner Desktop</title>
+  <!-- Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Retro Pixel Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+
+
+</head>
+<body class="sea-bg min-h-screen text-slate-900 body-font p-6 flex flex-col justify-between relative">
+
+  <!-- Header -->
+  <header class="w-full h-16 bg-white opacity-90 backdrop-blur-sm pixel-border flex items-center justify-between p-4 mb-4 z-10">
+    <div class="flex items-center space-x-3">
+      <span id="dittoIcon" class="text-3xl select-none">(°~°)</span>
+      <h1 class="pixel-font text-xl text-gray-800">DITTO CLONER</h1>
+    </div>
+    <div class="flex items-center space-x-3 text-xs pixel-font">
+      <!-- New Cheat Sheet Modal Trigger -->
+      <button onclick="toggleCheatSheetModal()" class="button-8bit py-1 px-3 text-[10px] bg-[#38bdf8] text-white">📜 COMMANDS CHEAT SHEET</button>
+      <button onclick="toggleKeyRequestModal()" class="button-8bit py-1 px-3 text-[10px] bg-[#e79f32]">GET KEY</button>
+    </div>
+  </header>
+
+  <!-- Main Grid -->
+  <main class="flex-grow flex space-x-6 w-full max-w-[1400px] mx-auto z-10">
+
+    <!-- Left Controls Box -->
+    <div class="w-1/2 bg-white/95 p-6 pixel-border flex flex-col justify-between space-y-4 shadow-2xl">
+      <h2 class="pixel-font text-lg text-slate-800">1. CONFIGURATION</h2>
+
+      <!-- Request Key Modal / Inline Toggle -->
+      <div id="keyRequestBox" class="hidden p-3 bg-amber-100 border-2 border-amber-400 rounded">
+        <label class="block text-xs pixel-font mb-1">Request API Key by Email:</label>
+        <div class="flex space-x-2">
+          <input id="userEmail" type="email" placeholder="email@domain.com" class="flex-grow p-1 border-2 border-black font-mono text-sm">
+          <button onclick="requestKey()" class="button-8bit py-1 px-2 text-[10px] bg-amber-400">REQUEST</button>
+        </div>
+      </div>
+
+      <!-- API Key Field -->
+      <div>
+        <label class="block text-xs pixel-font mb-1">Ditto API Key:</label>
+        <input id="apiKey" type="password" placeholder="Paste your Bearer token" class="w-full p-2 border-4 border-black font-mono bg-slate-50 focus:bg-white text-base">
+      </div>
+
+      <!-- Target URL Field -->
+      <div>
+        <label class="block text-xs pixel-font mb-1">Target Website URL:</label>
+        <input id="targetUrl" type="url" placeholder="https://example.com" class="w-full p-2 border-4 border-black font-mono bg-slate-50 focus:bg-white text-base">
+      </div>
+
+      <!-- Folder Name -->
+      <div>
+        <label class="block text-xs pixel-font mb-1">Output Folder Name:</label>
+        <input id="folderName" type="text" value="cloned-site" class="w-full p-2 border-4 border-black font-mono bg-slate-50 focus:bg-white text-base">
+      </div>
+
+      <!-- Mode & Framework Selectors -->
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs pixel-font mb-1">Mode:</label>
+          <div class="flex space-x-1">
+            <button id="modeMulti" onclick="setMode('multi')" class="option-btn active flex-1">MULTI</button>
+            <button id="modeSingle" onclick="setMode('single')" class="option-btn flex-1">SINGLE</button>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs pixel-font mb-1">Framework:</label>
+          <div class="flex space-x-1">
+            <button id="fwNext" onclick="setFramework('next')" class="option-btn active flex-1">NEXT.JS</button>
+            <button id="fwVite" onclick="setFramework('vite')" class="option-btn flex-1">VITE</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Start Button -->
+      <button id="startBtn" onclick="startCloning()" class="button-8bit w-full py-4 text-base bg-[#f7a61d]">
+        🚀 START CLONING
+      </button>
+    </div>
+
+    <!-- Right Terminal Output Box -->
+    <div class="w-1/2 flex flex-col">
+      <div class="pixel-border bg-[#0d1117]/95 p-4 flex-grow flex flex-col font-mono shadow-2xl">
+        <div class="flex items-center justify-between border-b-2 border-slate-700 pb-2 mb-2 text-xs text-slate-400 pixel-font">
+          <span>DITTO_CLI_STREAM.LOG</span>
+          <span id="statusBadge" class="text-amber-400">IDLE</span>
+        </div>
+        
+        <!-- Log Scroll Console -->
+        <div id="terminal" class="flex-grow overflow-y-auto space-y-1 text-emerald-400 text-sm p-2 bg-black/60 rounded border border-slate-800 h-[450px]">
+          <p class="text-slate-500">// Terminal output initialized. Ready for job...</p>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ================================================================= -->
+  <!-- BEGINNER COMMANDS CHEAT SHEET MODAL -->
+  <!-- ================================================================= -->
+  <div id="cheatSheetModal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-6">
+    <div class="bg-[#1e293b] text-slate-100 max-w-3xl w-full pixel-border p-6 flex flex-col space-y-4 max-h-[85vh] overflow-y-auto font-mono">
+      <div class="flex justify-between items-center border-b border-slate-700 pb-2">
+        <h3 class="pixel-font text-yellow-400 text-sm">📜 BEGINNER COMMANDS CHEAT SHEET</h3>
+        <button onclick="toggleCheatSheetModal()" class="text-rose-400 font-bold text-xl hover:text-rose-300">❌ [ESC]</button>
+      </div>
+
+      <p class="text-sm text-slate-300">Here are the raw underlying <span class="text-amber-300">cURL</span> and <span class="text-amber-300">Terminal</span> commands executed by this app:</p>
+
+      <!-- 1. Request Key -->
+      <div class="bg-black/50 p-3 rounded border border-slate-700 space-y-1">
+        <span class="pixel-font text-xs text-emerald-400">1. Request API Key (cURL)</span>
+        <pre class="bg-slate-900 p-2 rounded text-xs text-slate-300 overflow-x-auto selection:bg-amber-500">curl -X POST "https://api.ditto.site/v1/signup/request" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"your-email@domain.com"}'</pre>
+      </div>
+
+      <!-- 2. Create Clone Job -->
+      <div class="bg-black/50 p-3 rounded border border-slate-700 space-y-1">
+        <span class="pixel-font text-xs text-emerald-400">2. Submit Clone Job (cURL)</span>
+        <pre class="bg-slate-900 p-2 rounded text-xs text-slate-300 overflow-x-auto selection:bg-amber-500">curl -X POST "https://api.ditto.site/v1/clones" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "options": { "mode": "multi", "framework": "next", "styling": "tailwind" }
+  }'</pre>
+      </div>
+
+      <!-- 3. Check Clone Status -->
+      <div class="bg-black/50 p-3 rounded border border-slate-700 space-y-1">
+        <span class="pixel-font text-xs text-emerald-400">3. Check Clone Job Status (cURL)</span>
+        <pre class="bg-slate-900 p-2 rounded text-xs text-slate-300 overflow-x-auto selection:bg-amber-500">curl -H "Authorization: Bearer YOUR_API_KEY" \
+  "https://api.ditto.site/v1/clones/YOUR_JOB_ID"</pre>
+      </div>
+
+      <!-- 4. Download & Extract Archive -->
+      <div class="bg-black/50 p-3 rounded border border-slate-700 space-y-1">
+        <span class="pixel-font text-xs text-emerald-400">4. Download & Extract Bundle (Bash)</span>
+        <pre class="bg-slate-900 p-2 rounded text-xs text-slate-300 overflow-x-auto selection:bg-amber-500">curl -L -H "Authorization: Bearer YOUR_API_KEY" \
+  "https://api.ditto.site/v1/clones/YOUR_JOB_ID/bundle?format=tgz" \
+  | tar -xzf - -C ./cloned-site</pre>
+      </div>
+
+      <!-- 5. Run Downloaded Site Locally -->
+      <div class="bg-black/50 p-3 rounded border border-slate-700 space-y-1">
+        <span class="pixel-font text-xs text-emerald-400">5. Run Cloned Site Locally (Terminal)</span>
+        <pre class="bg-slate-900 p-2 rounded text-xs text-slate-300 overflow-x-auto selection:bg-amber-500">cd cloned-site
+npm install
+npm run dev</pre>
+      </div>
+
+      <button onclick="toggleCheatSheetModal()" class="button-8bit self-end bg-slate-700 text-white py-1 px-4 text-xs mt-2">CLOSE</button>
+    </div>
+  </div>
+
+  <!-- JS Logic -->
+  <script>
+    let selectedMode = 'multi';
+    let selectedFramework = 'next';
+
+    function setMode(mode) {
+      selectedMode = mode;
+      document.getElementById('modeMulti').classList.toggle('active', mode === 'multi');
+      document.getElementById('modeSingle').classList.toggle('active', mode === 'single');
+    }
+
+    function setFramework(fw) {
+      selectedFramework = fw;
+      document.getElementById('fwNext').classList.toggle('active', fw === 'next');
+      document.getElementById('fwVite').classList.toggle('active', fw === 'vite');
+    }
+
+    function toggleKeyRequestModal() {
+      const box = document.getElementById('keyRequestBox');
+      box.classList.toggle('hidden');
+    }
+
+    function toggleCheatSheetModal() {
+      const modal = document.getElementById('cheatSheetModal');
+      modal.classList.toggle('hidden');
+    }
+
+    async function requestKey() {
+      const email = document.getElementById('userEmail').value;
+      if (!email) return alert('Please enter your email.');
+      
+      appendLog(`📩 Requesting API key for ${email}...`);
+      const res = await window.pywebview.api.request_api_key(email);
+      if (res.success) {
+        appendLog(`✅ ${res.message}`);
+        toggleKeyRequestModal();
+      } else {
+        appendLog(`❌ Request failed: ${res.error}`);
+      }
+    }
+
+    async function startCloning() {
+      const apiKey = document.getElementById('apiKey').value.trim();
+      const targetUrl = document.getElementById('targetUrl').value.trim();
+      const folder = document.getElementById('folderName').value.trim() || 'cloned-site';
+
+      if (!apiKey) return alert('API Key is required!');
+      if (!targetUrl) return alert('Target Website URL is required!');
+
+      // Reset Terminal UI
+      document.getElementById('terminal').innerHTML = '';
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('statusBadge').innerText = 'RUNNING...';
+      document.getElementById('dittoIcon').innerText = '(>~<)'; // Working face
+
+      appendLog("==========================================");
+      appendLog("       Ditto Website Cloner Desktop       ");
+      appendLog("==========================================");
+
+      await window.pywebview.api.start_clone_job(apiKey, targetUrl, folder, selectedMode, selectedFramework);
+    }
+
+    function appendLog(message) {
+      const terminal = document.getElementById('terminal');
+      
+      if (message === "PROCESS_SUCCESS") {
+        document.getElementById('statusBadge').innerText = 'FINISHED';
+        document.getElementById('statusBadge').className = 'text-emerald-400';
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('dittoIcon').innerText = '(°~°)';
+        return;
+      }
+      
+      if (message === "PROCESS_FAILED") {
+        document.getElementById('statusBadge').innerText = 'FAILED';
+        document.getElementById('statusBadge').className = 'text-rose-500';
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('dittoIcon').innerText = '(x_x)';
+        return;
+      }
+
+      const p = document.createElement('p');
+      p.innerText = message;
+      terminal.appendChild(p);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+# Get Api Key
+curl -sS -X POST "https://api.ditto.site/v1/signup/request" \
+  -H "content-type: application/json" \
+  -d '{"email":"you@example.com"}'
+
+
+# Set Up the Api Key
+export DITTO_API_KEY="API_KEY"
+
+
+# Submit Clone Request (POST)
+JOB_ID=$(curl -sS -X POST "https://api.ditto.site/v1/clones" \
+  -H "Authorization: Bearer $DITTO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://www.ditto.site/",
+    "options": {
+      "mode": "multi",
+      "framework": "vite",
+      "styling": "tailwind"
+    }
+  }' | grep -o '"jobId":"[^"]*' | cut -d'"' -f4)
+
+echo "Captured Job ID: $JOB_ID"
+
+
+
+# Poll Job Status - Success is good
+curl -sS -H "Authorization: Bearer $DITTO_API_KEY" \
+  "https://api.ditto.site/v1/clones/$JOB_ID"
+
+
+
+# Download and unpack once status shows
+mkdir -p tools-site
+curl -L -H "Authorization: Bearer $DITTO_API_KEY" \
+  "https://api.ditto.site/v1/clones/$JOB_ID/bundle?format=tgz" \
+  | tar -xzf - -C tools-site/
