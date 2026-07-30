@@ -4,8 +4,8 @@ import { join, extname, normalize, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
-export { startEphemeralPostgres, canRunEphemeralPostgres, type EphemeralPg } from "./postgres.js";
-import { startEphemeralPostgres, canRunEphemeralPostgres, type EphemeralPg } from "./postgres.js";
+export { startEphemeralPostgres, canRunEphemeralPostgres, type EphemeralPg } from "./postgres";
+import { startEphemeralPostgres, canRunEphemeralPostgres, type EphemeralPg } from "./postgres";
 
 /** A Postgres available to tests: TEST_DATABASE_URL if set (e.g. a CI service),
  *  else a throwaway local instance when we can run one. Sync check for skip. */

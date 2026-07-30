@@ -29,8 +29,12 @@ describe("POST /v1/clones (real clone, served fixture)", { skip: hasChromium() ?
     assert.equal(res.status, 202);
     const queued = await res.json();
     let body: Record<string, unknown> | undefined;
-    for (let i = 0; i < 600; i++) {
+    // Poll up to ~90s: a full Playwright capture + component compile on
+    // `components.html` takes ~33s; we leave headroom for slower fixtures.
+    let lastStatus = "queued";
+    for (let i = 0; i < 1800; i++) {
       const view = await (await app.request(`/v1/clones/${queued.jobId}`)).json();
+      lastStatus = view.status as string;
       if (view.status === "succeeded") {
         body = await (await app.request(`/v1/clones/${queued.jobId}/result`)).json();
         break;
@@ -38,7 +42,7 @@ describe("POST /v1/clones (real clone, served fixture)", { skip: hasChromium() ?
       if (view.status === "failed") assert.fail(view.error);
       await new Promise((r) => setTimeout(r, 50));
     }
-    assert.ok(body);
+    assert.ok(body, `job did not complete within poll budget (lastStatus=${lastStatus})`);
     const files = body!.files as Record<string, { type: string }>;
     assert.equal(body!.status, "succeeded");
     assert.ok(files["src/app/page.tsx"], "has page.tsx");
