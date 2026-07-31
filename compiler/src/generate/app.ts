@@ -2009,6 +2009,16 @@ export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgReg
   });
 }
 
+/** Emit component modules with imports rooted at the framework's generated source tree.
+ * Next components live at src/app/components; Vite components live at src/components. */
+export function componentFilesForFramework(
+  reg: ComponentRegistry | undefined,
+  svgs: SvgRegistry | undefined,
+  framework: AppFramework,
+): Array<{ name: string; module: string }> {
+  return componentFiles(reg, svgs, framework === "vite" ? 1 : 2);
+}
+
 /** Stage 6: the `import Name from "./components/Name"` lines for the page module, one per
  *  extracted component. "" when nothing was extracted. */
 export function componentImports(reg: ComponentRegistry | undefined, depth = 0): string {
@@ -2809,7 +2819,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   if (stylesModule) writeText(join(rootDir, "_styles.ts"), stylesModule);
   // Stage 6: one editable file per extracted component (imported by page.tsx).
   // Files are kebab-case, exports PascalCase (the conventional split).
-  for (const { name, module } of componentFiles(components, svgs)) {
+  for (const { name, module } of componentFilesForFramework(components, svgs, framework)) {
     writeText(join(rootDir, "components", fileBase(name) + ".tsx"), module);
   }
   // Section split: one editable file per hoisted section (imported by page.tsx).
