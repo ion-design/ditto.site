@@ -5,6 +5,7 @@ import {
   CN_UTILS_MODULE,
   cnImportLine,
   componentFiles,
+  componentFilesForFramework,
   generatePageTsx,
   injectLottieDep,
   PACKAGE_JSON,
@@ -110,6 +111,21 @@ describe("cn() is deduplicated into src/lib/utils (fix 2)", () => {
     const card = files.find((f) => f.name === "Card")!.module;
     assert.ok(card.includes('import { cn } from "../../lib/utils";'), "imports shared cn");
     assert.ok(!card.includes("function cn("), "no inline cn definition");
+  });
+
+  it("framework-specific component modules resolve src/lib/utils at the correct depth", () => {
+    const reg = {
+      byName: new Map([["Card", { runs: 1, instances: 2, cids: ["n1"] }]]),
+      funcDefs: new Map([["Card", 'function Card({ styles }: { styles: string }) {\n  return <div className={cn("p-4", styles)} />;\n}']]),
+      fieldTypes: new Map(),
+      dataDecls: [],
+      cidDecls: [],
+      styleDecls: [],
+    } as unknown as ComponentRegistry;
+    const nextCard = componentFilesForFramework(reg, undefined, "next")[0]!.module;
+    const viteCard = componentFilesForFramework(reg, undefined, "vite")[0]!.module;
+    assert.ok(nextCard.includes('import { cn } from "../../lib/utils";'), "Next components live under src/app/components");
+    assert.ok(viteCard.includes('import { cn } from "../lib/utils";'), "Vite components live under src/components");
   });
 });
 
