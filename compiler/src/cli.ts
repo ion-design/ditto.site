@@ -93,8 +93,36 @@ function timestamp(): string {
  *  under `.clone/` — so a later `clone-site --out` can expand into the full site without
  *  re-capturing page 1. Single + multi clones of the same site share this folder. */
 export function namedOutDirs(outDir: string, url: string): { namedDir: string; runDir: string; appDir: string } {
-  const namedDir = join(resolve(outDir), siteName(url));
+  let namedDir = join(resolve(outDir), siteName(url));
+  // siteName collapses subdomains (lideranca.example.com.br → "example"), so two
+  // different sites can map to the same folder — and exportApp would rmSync the
+  // earlier deliverable. Disambiguate with the subdomain slug when the folder
+  // already belongs to a different origin.
+  const priorOrigin = readPriorOrigin(join(namedDir, ".clone"));
+  if (priorOrigin && hostOf(priorOrigin) !== hostOf(url)) {
+    namedDir = join(resolve(outDir), `${siteName(url)}-${subdomainSlug(url) || siteIdFromUrl(url)}`);
+  }
   return { namedDir, runDir: join(namedDir, ".clone"), appDir: join(namedDir, "app") };
+}
+function hostOf(u: string): string {
+  try { return new URL(u).hostname; } catch { return ""; }
+}
+function readPriorOrigin(cloneDir: string): string | null {
+  for (const f of ["site-manifest.json", "crawl.json"]) {
+    try {
+      const j = JSON.parse(readFileSync(join(cloneDir, f), "utf8")) as Record<string, unknown>;
+      const u = j["origin"] ?? j["sourceUrl"] ?? j["entryUrl"];
+      if (typeof u === "string" && u) return u;
+    } catch { /* absent */ }
+  }
+  return null;
+}
+function subdomainSlug(url: string): string {
+  try {
+    const labels = new URL(url).hostname.replace(/^www\./i, "").split(".").filter(Boolean);
+    const tldParts = MULTIPART_TLDS.has(labels.slice(-2).join(".")) ? 2 : 1;
+    return labels.slice(0, Math.max(0, labels.length - 1 - tldParts)).join("-");
+  } catch { return ""; }
 }
 /** Publish the freshly-generated app to the deliverable `app/` dir (replacing any prior). */
 export function exportApp(generatedAppDir: string, appOutDir: string): { removed: number; kept: number } {
