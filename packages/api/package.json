@@ -30,7 +30,7 @@
     "@cloner/storage": "*",
     "@hono/node-server": "^1.13.7",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.12.31",
+    "hono": "^4.13.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
