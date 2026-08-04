@@ -595,19 +595,39 @@ async function recognizePatterns(page: Page): Promise<{ tabs: TabsStruct[]; acco
       arr.push(s); byTrack.set(p, arr);
     }
     const ROOT_SEL = '.swiper, .slick-slider, [aria-roledescription="carousel"], [class*="carousel" i], [class*="slider" i]';
+    const NEXT_SEL = '.swiper-button-next, .slick-next, [aria-label*="next" i]';
+    const PREV_SEL = '.swiper-button-prev, .slick-prev, [aria-label*="prev" i]';
+    const BULLET_SEL = '.swiper-pagination-bullet, .slick-dots button, .slick-dots li';
     for (const [track, slides] of byTrack) {
       if (slides.length < 2 || !visible(track)) continue;
+      // Swiper loop mode appends clone slides (.swiper-slide-duplicate); pagination is
+      // index-aligned with the REAL slides, so an exact bullet match must use that
+      // count — the raw count drops every loop carousel.
+      const realCount = slides.filter((s) => !s.classList.contains("swiper-slide-duplicate")).length || slides.length;
       // Root = nearest carousel-ish ANCESTOR of the track (not the track itself — a
       // BEM track like `.category-carousel__track` matches [class*=carousel], and the
       // prev/next controls are siblings of the track, outside it).
       let anc: Element | null = track.parentElement;
       while (anc && !anc.matches(ROOT_SEL)) anc = anc.parentElement;
       const root = (anc ?? track.parentElement ?? track) as Element;
-      const q1 = (sels: string): Element | null => { for (const s of sels.split(",")) { try { const e = root.querySelector(s.trim()); if (e && root.contains(e)) return e; } catch { /* bad sel */ } } return null; };
-      const nextEl = q1('.swiper-button-next, .slick-next, [aria-label*="next" i]');
-      const prevEl = q1('.swiper-button-prev, .slick-prev, [aria-label*="prev" i]');
-      let bullets = Array.from(root.querySelectorAll('.swiper-pagination-bullet, .slick-dots button, .slick-dots li')).filter((b) => visible(b));
-      if (bullets.length !== slides.length) bullets = []; // only index-aligned pagination
+      const q1 = (scope: Element | null, sels: string): Element | null => { if (!scope) return null; for (const s of sels.split(",")) { try { const e = scope.querySelector(s.trim()); if (e && scope.contains(e)) return e; } catch { /* bad sel */ } } return null; };
+      // Elementor's nested carousel renders arrows/bullets OUTSIDE the matched root
+      // (as siblings of the .swiper container). Prefer controls explicitly wired to
+      // this track via aria-controls, then fall back to the root's parent scope.
+      const trackId = track.getAttribute("id");
+      const wired = (labelRe: RegExp, sels: string): Element | null => {
+        if (!trackId) return null;
+        try {
+          return Array.from(document.querySelectorAll(`[aria-controls="${CSS.escape(trackId)}"]`))
+            .find((c) => labelRe.test(c.getAttribute("aria-label") ?? "") || c.matches(sels)) ?? null;
+        } catch { return null; }
+      };
+      const scopeUp = root.parentElement;
+      const nextEl = q1(root, NEXT_SEL) ?? wired(/next|próxim/i, NEXT_SEL) ?? q1(scopeUp, NEXT_SEL);
+      const prevEl = q1(root, PREV_SEL) ?? wired(/prev|anterior/i, PREV_SEL) ?? q1(scopeUp, PREV_SEL);
+      let bullets = Array.from(root.querySelectorAll(BULLET_SEL)).filter((b) => visible(b));
+      if (!bullets.length && scopeUp) bullets = Array.from(scopeUp.querySelectorAll(BULLET_SEL)).filter((b) => visible(b));
+      if (bullets.length !== realCount) bullets = []; // only index-aligned pagination
       const tc = capOf(track), rc = capOf(root);
       if (!tc || !rc) continue;
       if (!nextEl && bullets.length < 2) continue;
@@ -615,7 +635,7 @@ async function recognizePatterns(page: Page): Promise<{ tabs: TabsStruct[]; acco
         rootCap: rc, trackCap: tc,
         nextCap: capOf(nextEl), prevCap: capOf(prevEl),
         bulletCaps: bullets.map((b) => capOf(b)).filter((x): x is string => !!x),
-        slideCount: slides.length,
+        slideCount: realCount,
       });
     }
 
