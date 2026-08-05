@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Response } from "playwright";
 import { join } from "node:path";
 import { collectPage, type PageSnapshot, type FontFace } from "./walker.js";
 import { tagElements, captureInteractions, type InteractionCapture } from "./interactions.js";
@@ -45,6 +45,14 @@ const DESKTOP_UA =
 const ESBUILD_SHIM =
   "globalThis.__name = globalThis.__name || ((fn) => fn);" +
   "globalThis.__defProp = globalThis.__defProp || Object.defineProperty;";
+
+function blockedAccessError(url: string, status: number | null, wallDetected: boolean): Error {
+  const signals: string[] = [];
+  if (status === 403 || status === 429) signals.push(`HTTP ${status}`);
+  if (wallDetected) signals.push("bot-protection page detected");
+  const suffix = signals.length ? ` (${signals.join(", ")})` : "";
+  return new Error(`target site is blocking automated access at ${url}${suffix} — refusing to clone`);
+}
 
 export type DiscoveredAsset = {
   url: string;
@@ -112,6 +120,31 @@ function viewportHeight(width: number): number {
 const RETRYABLE_ASSET_TYPES = new Set(["image", "svg", "video", "font"]);
 /** Fixed, bounded delay before the single retry — deterministic (no jitter/backoff). */
 export const ASSET_RETRY_DELAY_MS = 750;
+export const MAX_CAPTURED_VIDEO_BYTES = 8 * 1024 * 1024;
+export const MAX_CAPTURED_IMAGE_BYTES = 16 * 1024 * 1024;
+export const MAX_CAPTURED_ASSET_BYTES = 64 * 1024 * 1024;
+export const MAX_CAPTURED_VISUAL_BYTES = 128 * 1024 * 1024;
+
+export function capturedAssetByteLimit(type: string): number {
+  if (type === "video") return MAX_CAPTURED_VIDEO_BYTES;
+  if (type === "image" || type === "svg") return MAX_CAPTURED_IMAGE_BYTES;
+  return MAX_CAPTURED_ASSET_BYTES;
+}
+
+export function shouldCollectAssetBody(type: string, contentLength: number | null): boolean {
+  if (type === "video" && contentLength === null) return false;
+  return contentLength === null || contentLength <= capturedAssetByteLimit(type);
+}
+
+export function fitsCapturedVisualBudget(type: string, bytes: number, storedVisualBytes: number): boolean {
+  if (type !== "image" && type !== "svg" && type !== "video") return true;
+  return storedVisualBytes + bytes <= MAX_CAPTURED_VISUAL_BYTES;
+}
+
+function responseContentLength(headers: Record<string, string>): number | null {
+  const parsed = Number(headers["content-length"]);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
 
 /** Should a failed download of `type` with HTTP `status` (null = network error / no
  *  response) be retried once? Transient states only: connection failures, 5xx, and 429.
@@ -872,7 +905,11 @@ export function discoverLazyAssetsInPage(): string[] {
  * matching the DOM snapshot the walk grades. Writes a PNG to `path`. Throws on any failure so
  * the caller can fall back to the Playwright path.
  */
-export async function captureFullPageViaCDP(page: import("playwright").Page, path: string): Promise<void> {
+export async function captureFullPageViaCDP(
+  page: import("playwright").Page,
+  path: string,
+  timeoutMs = 30_000,
+): Promise<void> {
   const client = await page.context().newCDPSession(page);
   try {
     const metrics = await client.send("Page.getLayoutMetrics") as {
@@ -886,15 +923,26 @@ export async function captureFullPageViaCDP(page: import("playwright").Page, pat
     if (width > CDP_MAX_SHOT_DIMENSION || height > CDP_MAX_SHOT_DIMENSION) {
       throw new Error(`cdp: content ${width}x${height} exceeds max shot dimension`);
     }
-    const shot = await client.send("Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: true,
-      clip: { x: 0, y: 0, width, height, scale: 1 },
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const shot = await Promise.race([
+      client.send("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        clip: { x: 0, y: 0, width, height, scale: 1 },
+      }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`cdp: screenshot timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
     }) as { data: string };
     if (!shot?.data) throw new Error("cdp: no screenshot data");
     writeBytes(path, Buffer.from(shot.data, "base64"));
   } finally {
-    await client.detach().catch(() => { /* ignore */ });
+    await Promise.race([
+      client.detach().catch(() => { /* ignore */ }),
+      new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+    ]);
   }
 }
 
@@ -1106,6 +1154,7 @@ export async function captureSite(opts: {
   const cssStored = new Set<string>();
   const fontFaceMap = new Map<string, FontFace>();
   const seoResourceUrls = new Map<string, SeoResource["kind"]>();
+  let storedVisualBytes = 0;
 
   const sourceOrigin = (() => {
     try {
@@ -1146,6 +1195,11 @@ export async function captureSite(opts: {
 
   const storeBytes = (url: string, type: string, bytes: Buffer): void => {
     if (!bytes || bytes.length === 0) return;
+    if (bytes.length > capturedAssetByteLimit(type)) return;
+    if (!fitsCapturedVisualBudget(type, bytes.length, storedVisualBytes)) {
+      log({ event: "asset_visual_budget_skipped", url, type, bytes: bytes.length, storedVisualBytes });
+      return;
+    }
     // Reject non-container bytes for video from EVERY path (a range fragment or error
     // page stored under first-stored-wins ships a corrupt file). Left unstored, the
     // asset surfaces in visual_assets_missing instead.
@@ -1179,6 +1233,7 @@ export async function captureSite(opts: {
     }
     a.storedAs = name;
     a.bytes = bytes.length;
+    if (type === "image" || type === "svg" || type === "video") storedVisualBytes += bytes.length;
   };
 
   const parseManifestForAssets = (text: string, baseUrl: string): void => {
@@ -1280,6 +1335,11 @@ export async function captureSite(opts: {
           // ship a corrupt file under first-stored-wins and the full-download fallback
           // would then skip the asset. Record only; the fallback pass fetches the 200 body.
           if (status === 206) return;
+          const contentLength = responseContentLength(resp.headers());
+          if (!shouldCollectAssetBody(type, contentLength)) {
+            log({ event: "asset_body_skipped", url, type, contentLength });
+            return;
+          }
           bodyPromises.push(
             (async () => {
               try {
@@ -1331,16 +1391,17 @@ export async function captureSite(opts: {
     // structured error instead of tying up the pipeline. Attempt 0 waits for `load`;
     // later attempts fall back to `domcontentloaded` (a heavy page may never fire `load`).
     const NAV_BUDGET_MS = 90_000;
-    const navigateLoaded = async (pg: import("playwright").Page): Promise<void> => {
+    const navigateLoaded = async (pg: import("playwright").Page): Promise<Response | null> => {
       log({ event: "goto", url: opts.url });
       const navStart = Date.now();
       let navigated = false;
+      let response: Response | null = null;
       let navErr: unknown = null;
       for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
         const remaining = NAV_BUDGET_MS - (Date.now() - navStart);
         if (remaining < 5_000) break; // not enough budget left for a meaningful attempt
         try {
-          await pg.goto(opts.url, {
+          response = await pg.goto(opts.url, {
             waitUntil: attempt === 0 ? "load" : "domcontentloaded",
             timeout: Math.min(attempt === 0 ? 45_000 : 20_000, remaining),
           });
@@ -1356,10 +1417,12 @@ export async function captureSite(opts: {
         );
       }
       await settle(pg);
+      return response;
     };
 
+    let entryResponse: Response | null = null;
     try {
-      await navigateLoaded(page);
+      entryResponse = await navigateLoaded(page);
     } catch (navErr) {
       // Item 3c: one fresh-context retry, but ONLY for a session-death class of failure
       // (browser/page/context closed, crash, transient reset/timeout). A wall or a hard
@@ -1370,7 +1433,7 @@ export async function captureSite(opts: {
       try { if (!page.isClosed()) await page.close(); } catch { /* ignore */ }
       try { await context.close(); } catch { /* ignore */ }
       ({ context, page } = await newSession());
-      await navigateLoaded(page); // second failure propagates (no further retry)
+      entryResponse = await navigateLoaded(page); // second failure propagates (no further retry)
     }
 
     // Item 3b: bot/auth-wall fast-fail. A wall page would otherwise burn the full
@@ -1384,11 +1447,9 @@ export async function captureSite(opts: {
         nodes: document.querySelectorAll("*").length,
       }))
       .catch(() => null);
-    if (isBotWall(wallProbe)) {
-      throw new Error(
-        `auth/bot wall detected at ${opts.url} (${wallProbe!.nodes} nodes, wall text matched): capture aborted early`,
-      );
-    }
+    const entryStatus = entryResponse?.status() ?? null;
+    const wallDetected = isBotWall(wallProbe);
+    if (entryStatus === 403 || entryStatus === 429 || wallDetected) throw blockedAccessError(opts.url, entryStatus, wallDetected);
 
     // Stage 2: lazy-loader promotion. WP Rocket/lazysizes keep a 0-size placeholder in
     // `src` with the real URL in data attrs; autoScroll outruns their IntersectionObserver
@@ -1866,9 +1927,22 @@ export async function captureSite(opts: {
       for (let attempt = 0; attempt < 2; attempt++) {
         let failStatus: number | null = null;
         try {
+          if (a.type === "video") {
+            const head = await fallbackCtx.request.head(a.url, { timeout: 15000 });
+            const contentLength = responseContentLength(head.headers());
+            if (!head.ok() || !shouldCollectAssetBody(a.type, contentLength)) {
+              log({ event: "asset_body_skipped", url: a.url, type: a.type, contentLength });
+              break;
+            }
+          }
           const resp = await fallbackCtx.request.get(a.url, { timeout: 30000 });
           a.status = resp.status();
           if (resp.ok()) {
+            const contentLength = responseContentLength(resp.headers());
+            if (!shouldCollectAssetBody(a.type, contentLength)) {
+              log({ event: "asset_body_skipped", url: a.url, type: a.type, contentLength });
+              break;
+            }
             const buf = await resp.body();
             a.contentType = a.contentType ?? (resp.headers()["content-type"] || null);
             storeBytes(a.url, a.type, buf);

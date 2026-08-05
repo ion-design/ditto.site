@@ -1,12 +1,24 @@
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+} from "node:fs";
 import { join, dirname, normalize } from "node:path";
 import type { FileMap } from "@cloner/core";
 import type { ArtifactStore, StoredFile, StoredManifest } from "./types.js";
+import { packEntryCapture, unpackEntryCapture } from "./entryCapture.js";
 
 /** Reject path traversal — only allow relative paths that stay within the job dir. */
 function safeRel(path: string): string {
   const n = normalize(path);
-  if (n.includes("\0") || n.startsWith("/") || /^[A-Za-z]:/.test(n) || n.split(/[/\\]/).includes("..")) {
+  if (
+    n.includes("\0") ||
+    n.startsWith("/") ||
+    /^[A-Za-z]:/.test(n) ||
+    n.split(/[/\\]/).includes("..")
+  ) {
     throw new Error("unsafe path: " + path);
   }
   return n;
@@ -34,16 +46,51 @@ export class LocalArtifactStore implements ArtifactStore {
       mkdirSync(dirname(dest), { recursive: true });
       writeFileSync(dest, readFileSync(f.absPath));
       if (f.kind === "text") {
-        out.push({ path, kind: "text", bytes: f.bytes, sha256: f.sha256, content: f.content ?? "" });
+        out.push({
+          path,
+          kind: "text",
+          bytes: f.bytes,
+          sha256: f.sha256,
+          content: f.content ?? "",
+        });
       } else {
-        out.push({ path, kind: "binary", bytes: f.bytes, sha256: f.sha256, key: `${jobId}/${rel}` });
+        out.push({
+          path,
+          kind: "binary",
+          bytes: f.bytes,
+          sha256: f.sha256,
+          key: `${jobId}/${rel}`,
+        });
       }
     }
     out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     return { files: out };
   }
 
-  async getFile(jobId: string, path: string): Promise<{ bytes: Buffer } | null> {
+  private entryCapturePath(jobId: string): string {
+    return join(this.baseDir, ".entry-captures", `${jobId}.tgz`);
+  }
+
+  async putEntryCapture(jobId: string, sourceDir: string): Promise<void> {
+    const destination = this.entryCapturePath(jobId);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, packEntryCapture(sourceDir));
+  }
+
+  async restoreEntryCapture(
+    jobId: string,
+    destinationDir: string,
+  ): Promise<boolean> {
+    const source = this.entryCapturePath(jobId);
+    if (!existsSync(source)) return false;
+    unpackEntryCapture(readFileSync(source), destinationDir);
+    return true;
+  }
+
+  async getFile(
+    jobId: string,
+    path: string,
+  ): Promise<{ bytes: Buffer } | null> {
     const dest = join(this.jobDir(jobId), safeRel(path));
     if (!existsSync(dest)) return null;
     return { bytes: readFileSync(dest) };
@@ -56,5 +103,6 @@ export class LocalArtifactStore implements ArtifactStore {
 
   async remove(jobId: string): Promise<void> {
     rmSync(this.jobDir(jobId), { recursive: true, force: true });
+    rmSync(this.entryCapturePath(jobId), { force: true });
   }
 }

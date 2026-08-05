@@ -123,13 +123,13 @@ keys exist. Use `Authorization: Bearer <key>` or `x-api-key: <key>`.
 > an environment variable (`Authorization: Bearer $DITTO_API_KEY`) rather than an
 > inline `dtto_live_...` token — inline keys leak into shell history, logs, and
 > pasted transcripts. Never commit a key; rotate a leaked one from the dashboard.
-Signup routes are intentionally public only when `SIGNUP_ENABLED=true` **and**
-`DATABASE_URL` is set. Direct `POST /v1/signup` mints a `dtto_live_...` key
-immediately when `SIGNUP_DIRECT_ENABLED=true`. For public production signup,
-prefer the Resend-backed verified flow: `POST /v1/signup/request` sends a
-one-time email link, and `POST /v1/signup/verify` consumes the token, stores
-only the API key's SHA-256 hash in Postgres, stores the verified email in the
-key label for attribution, and returns the raw key once.
+> Signup routes are intentionally public only when `SIGNUP_ENABLED=true` **and**
+> `DATABASE_URL` is set. Direct `POST /v1/signup` mints a `dtto_live_...` key
+> immediately when `SIGNUP_DIRECT_ENABLED=true`. For public production signup,
+> prefer the Resend-backed verified flow: `POST /v1/signup/request` sends a
+> one-time email link, and `POST /v1/signup/verify` consumes the token, stores
+> only the API key's SHA-256 hash in Postgres, stores the verified email in the
+> key label for attribution, and returns the raw key once.
 
 Normal product `options` are `{ mode?: "single" | "multi", styling?: "tailwind" | "css", framework?: "next" | "vite", preview?: boolean }`.
 `mode` defaults to `"single"`, `styling` defaults to `"tailwind"`, and `framework` defaults to `"next"`. `preview`
@@ -139,6 +139,12 @@ remain `{ verify?, asyncVerify?, maxRoutes?, maxCollection?, captureConcurrency?
 bypasses the cache. Deprecated aliases (`multiPage`, `humanizeMode`) and dev-only escape
 hatches are still accepted for compatibility, but are not part of the normal product surface.
 `Cache-Control: no-cache` is honored as an alias.
+
+The private Ion CMS integration is available only through the exact opt-in
+`experimentalContentHandoff: "ion-cms-v1"` on a multi-page request. It is not a
+normal product option and does not affect requests where the flag is absent. See
+[EXPERIMENTAL_ION_CMS_HANDOFF.md](EXPERIMENTAL_ION_CMS_HANDOFF.md) for its
+versioned artifact and importer contract.
 
 For fast production responses, keep `verify:false` on the delivery job. The service skips
 validation-only full-page screenshots in that mode. When `verify:true`, multi-page validation
@@ -169,7 +175,7 @@ curl -sS -H "authorization: Bearer $DITTO_API_KEY" \
 JavaScript** (no runtime scripts). It renders the captured page statically: animations are
 frozen at their captured start frame, Lottie/`<video>` mounts show their captured
 poster/first-frame still, and nothing is interactive — no menus, no hover, no scroll
-effects. It is a faithful *picture* of the page, not a working app. For interaction, use the
+effects. It is a faithful _picture_ of the page, not a working app. For interaction, use the
 built export (`/v1/clones/:id/app-preview/`) or the deployed app.
 
 **Relative assets.** `preview.html` references its images and fonts with relative paths
@@ -198,6 +204,12 @@ by a persistent per-URL capture cache (`CAPTURE_CACHE_DIR`, default on under
 `local-data/`; staleness bounded by the cache TTL). The two calls have distinct cache
 keys (single vs multi), so neither shadows the other.
 
+Flagged `ion-cms-v1` jobs use the exact referenced single-page job instead of the
+ambient URL cache. The worker stores that source as a private artifact alongside the
+job's public clone artifacts, then restores it on any worker that processes the planned
+multi-page job. It is not listed by the files API or included in customer bundles, and
+missing/corrupt artifacts fail the experimental job without changing legacy behavior.
+
 ## MCP surface (Streamable-HTTP at `/mcp`)
 
 List-then-read so a clone never floods the agent's context:
@@ -212,30 +224,30 @@ List-then-read so a clone never floods the agent's context:
 
 ## Environment reference
 
-| Var | Used by | Default | Notes |
-|---|---|---|---|
-| `PORT` | api | `8787` | |
-| `DATABASE_URL` | api, worker | — | set ⇒ async DB+queue mode |
-| `ARTIFACTS_DIR` | worker, api | `./local-data/artifacts` | local blob root (when not using S3) |
-| `CACHE_STALE_AFTER` | worker | `24h` | cache TTL (`ms/s/m/h/d`; `0` disables) |
-| `HARNESS_DIR` | worker | `./local-data/harness` | per-worker Next/Vite build harness (verify) |
-| `CAPTURE_CACHE_DIR` | worker, api | `./local-data/capture-cache` | per-URL entry-capture cache for the single→multi reuse path (`""` disables) |
-| `VERIFY_TIER` | worker | `stage2` | perceptual gate tier for verify |
-| `PUBLIC_BASE_URL` | api | — | absolute base for MCP-returned URLs |
-| `API_KEYS` | api | — | comma-separated keys; empty = open |
-| `RATE_LIMIT_PER_MINUTE` | api | `0` | per key/IP cap (0 = unlimited) |
-| `SIGNUP_ENABLED` | api | `false` | DB mode only: expose public API-key signup routes |
-| `SIGNUP_RATE_LIMIT_PER_HOUR` | api | `3` | per-IP signup cap; `0` disables signup throttling |
-| `DEFAULT_SIGNUP_KEY_RATE_LIMIT` | api | `30` | stored on keys minted by signup; service-wide enforcement still uses `RATE_LIMIT_PER_MINUTE` |
-| `SIGNUP_DIRECT_ENABLED` | api | `true` | keep direct `POST /v1/signup` enabled; set `false` when Resend verification is configured |
-| `RESEND_API_KEY` | api | — | enables verified-email signup request/verify endpoints |
-| `SIGNUP_FROM_EMAIL` | api | — | verified sender, e.g. `Ditto <hello@ditto.site>` |
-| `SIGNUP_VERIFY_URL` | api | — | landing-page URL that receives `?token=...`, e.g. `https://www.ditto.site/api-key` |
-| `SIGNUP_TOKEN_TTL_MINUTES` | api | `30` | one-time email verification token lifetime |
-| `SIGNUP_CORS_ORIGINS` | api | `https://ditto.site,https://www.ditto.site` | comma-separated browser origins allowed to call public signup routes |
-| `SSRF_DISABLE` | api | `false` | turn off the SSRF guard (not recommended) |
-| `SSRF_ALLOW_LOOPBACK` | api | `false` | allow cloning localhost (local dev) |
-| `S3_BUCKET` / `S3_ENDPOINT` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_FORCE_PATH_STYLE` / `S3_PUBLIC_URL` | api, worker | — | set `S3_BUCKET` ⇒ object storage |
+| Var                                                                                                                               | Used by     | Default                                     | Notes                                                                                        |
+| --------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `PORT`                                                                                                                            | api         | `8787`                                      |                                                                                              |
+| `DATABASE_URL`                                                                                                                    | api, worker | —                                           | set ⇒ async DB+queue mode                                                                    |
+| `ARTIFACTS_DIR`                                                                                                                   | worker, api | `./local-data/artifacts`                    | local blob root (when not using S3)                                                          |
+| `CACHE_STALE_AFTER`                                                                                                               | worker      | `24h`                                       | cache TTL (`ms/s/m/h/d`; `0` disables)                                                       |
+| `HARNESS_DIR`                                                                                                                     | worker      | `./local-data/harness`                      | per-worker Next/Vite build harness (verify)                                                  |
+| `CAPTURE_CACHE_DIR`                                                                                                               | worker, api | `./local-data/capture-cache`                | per-URL entry-capture cache for the single→multi reuse path (`""` disables)                  |
+| `VERIFY_TIER`                                                                                                                     | worker      | `stage2`                                    | perceptual gate tier for verify                                                              |
+| `PUBLIC_BASE_URL`                                                                                                                 | api         | —                                           | absolute base for MCP-returned URLs                                                          |
+| `API_KEYS`                                                                                                                        | api         | —                                           | comma-separated keys; empty = open                                                           |
+| `RATE_LIMIT_PER_MINUTE`                                                                                                           | api         | `0`                                         | per key/IP cap (0 = unlimited)                                                               |
+| `SIGNUP_ENABLED`                                                                                                                  | api         | `false`                                     | DB mode only: expose public API-key signup routes                                            |
+| `SIGNUP_RATE_LIMIT_PER_HOUR`                                                                                                      | api         | `3`                                         | per-IP signup cap; `0` disables signup throttling                                            |
+| `DEFAULT_SIGNUP_KEY_RATE_LIMIT`                                                                                                   | api         | `30`                                        | stored on keys minted by signup; service-wide enforcement still uses `RATE_LIMIT_PER_MINUTE` |
+| `SIGNUP_DIRECT_ENABLED`                                                                                                           | api         | `true`                                      | keep direct `POST /v1/signup` enabled; set `false` when Resend verification is configured    |
+| `RESEND_API_KEY`                                                                                                                  | api         | —                                           | enables verified-email signup request/verify endpoints                                       |
+| `SIGNUP_FROM_EMAIL`                                                                                                               | api         | —                                           | verified sender, e.g. `Ditto <hello@ditto.site>`                                             |
+| `SIGNUP_VERIFY_URL`                                                                                                               | api         | —                                           | landing-page URL that receives `?token=...`, e.g. `https://www.ditto.site/api-key`           |
+| `SIGNUP_TOKEN_TTL_MINUTES`                                                                                                        | api         | `30`                                        | one-time email verification token lifetime                                                   |
+| `SIGNUP_CORS_ORIGINS`                                                                                                             | api         | `https://ditto.site,https://www.ditto.site` | comma-separated browser origins allowed to call public signup routes                         |
+| `SSRF_DISABLE`                                                                                                                    | api         | `false`                                     | turn off the SSRF guard (not recommended)                                                    |
+| `SSRF_ALLOW_LOOPBACK`                                                                                                             | api         | `false`                                     | allow cloning localhost (local dev)                                                          |
+| `S3_BUCKET` / `S3_ENDPOINT` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_FORCE_PATH_STYLE` / `S3_PUBLIC_URL` | api, worker | —                                           | set `S3_BUCKET` ⇒ object storage                                                             |
 
 ## Testing
 

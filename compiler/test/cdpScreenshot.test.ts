@@ -82,3 +82,30 @@ describe("CDP full-page capture vs Playwright fullPage stitch (static fixture)",
     assert.ok(pct < 0.5, `pixel delta ${pct.toFixed(4)}% (${mismatched} px) must be < 0.5%`);
   });
 });
+
+it("bounds a CDP screenshot command that never resolves", async () => {
+  let detached = false;
+  const client = {
+    send(command: string) {
+      if (command === "Page.getLayoutMetrics") {
+        return Promise.resolve({ cssContentSize: { width: 800, height: 3000 } });
+      }
+      return new Promise(() => {});
+    },
+    detach() {
+      detached = true;
+      return Promise.resolve();
+    },
+  };
+  const page = {
+    context: () => ({
+      newCDPSession: () => Promise.resolve(client),
+    }),
+  } as unknown as Page;
+
+  await assert.rejects(
+    captureFullPageViaCDP(page, join(tmpdir(), "never-written.png"), 10),
+    /screenshot timed out after 10ms/,
+  );
+  assert.equal(detached, true);
+});

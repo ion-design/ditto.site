@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { collectFileMap } from "@cloner/core";
@@ -11,9 +17,17 @@ test("ObjectArtifactStore: binaries → blob (presigned URL), text inline, getFi
   try {
     const app = join(work, "generated", "app");
     mkdirSync(join(app, "src", "app"), { recursive: true });
-    mkdirSync(join(app, "public", "assets", "cloned", "images"), { recursive: true });
-    writeFileSync(join(app, "src", "app", "page.tsx"), "export default () => null\n");
-    writeFileSync(join(app, "public", "assets", "cloned", "images", "a.png"), Buffer.from([9, 8, 7]));
+    mkdirSync(join(app, "public", "assets", "cloned", "images"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(app, "src", "app", "page.tsx"),
+      "export default () => null\n",
+    );
+    writeFileSync(
+      join(app, "public", "assets", "cloned", "images", "a.png"),
+      Buffer.from([9, 8, 7]),
+    );
     const files = collectFileMap(work);
 
     const blob = new InMemoryBlobClient("https://cdn.test");
@@ -25,22 +39,79 @@ test("ObjectArtifactStore: binaries → blob (presigned URL), text inline, getFi
 
     const bin = manifest.files.find((f) => f.path.endsWith("a.png"))!;
     assert.equal(bin.kind, "binary");
-    assert.ok(bin.kind === "binary" && bin.key === "clones/job-1/public/assets/cloned/images/a.png");
-    assert.ok(blob.has("clones/job-1/public/assets/cloned/images/a.png"), "binary uploaded to blob");
-    assert.ok(!blob.has("clones/job-1/src/app/page.tsx"), "text NOT uploaded (stays in manifest)");
+    assert.ok(
+      bin.kind === "binary" &&
+        bin.key === "clones/job-1/public/assets/cloned/images/a.png",
+    );
+    assert.ok(
+      blob.has("clones/job-1/public/assets/cloned/images/a.png"),
+      "binary uploaded to blob",
+    );
+    assert.ok(
+      !blob.has("clones/job-1/src/app/page.tsx"),
+      "text NOT uploaded (stays in manifest)",
+    );
 
-    const got = await store.getFile("job-1", "public/assets/cloned/images/a.png");
+    const got = await store.getFile(
+      "job-1",
+      "public/assets/cloned/images/a.png",
+    );
     assert.deepEqual([...got!.bytes], [9, 8, 7]);
 
-    const url = await store.binaryUrl("job-1", "public/assets/cloned/images/a.png");
-    assert.ok(url.startsWith("https://cdn.test/clones/job-1/"), "presigned/public URL");
+    const url = await store.binaryUrl(
+      "job-1",
+      "public/assets/cloned/images/a.png",
+    );
+    assert.ok(
+      url.startsWith("https://cdn.test/clones/job-1/"),
+      "presigned/public URL",
+    );
 
-    const bundleUrl = await store.uploadBundle("job-1", "tgz", Buffer.from("archive"));
+    const bundleUrl = await store.uploadBundle(
+      "job-1",
+      "tgz",
+      Buffer.from("archive"),
+    );
     assert.ok(bundleUrl.includes("clones/job-1/bundle/clone.tgz"));
 
     await store.remove("job-1");
-    assert.equal(await store.getFile("job-1", "public/assets/cloned/images/a.png"), null);
+    assert.equal(
+      await store.getFile("job-1", "public/assets/cloned/images/a.png"),
+      null,
+    );
   } finally {
     rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test("ObjectArtifactStore: entry captures round-trip through a private object", async () => {
+  const source = mkdtempSync(join(tmpdir(), "obj-capture-src-"));
+  const restored = mkdtempSync(join(tmpdir(), "obj-capture-dest-"));
+  try {
+    mkdirSync(join(source, "capture"), { recursive: true });
+    writeFileSync(
+      join(source, "capture", "capture-result.json"),
+      '{"nodeCount":42}',
+    );
+    const blob = new InMemoryBlobClient();
+    await new ObjectArtifactStore(blob).putEntryCapture("job-2", source);
+    assert.ok(blob.has("entry-captures/job-2.tgz"));
+
+    const recreated = new ObjectArtifactStore(blob);
+    assert.equal(await recreated.restoreEntryCapture("job-2", restored), true);
+    assert.equal(
+      readFileSync(join(restored, "capture", "capture-result.json"), "utf8"),
+      '{"nodeCount":42}',
+    );
+    assert.equal(
+      await recreated.getFile("job-2", "capture/capture-result.json"),
+      null,
+    );
+    await recreated.remove("job-2");
+    assert.equal(blob.has("entry-captures/job-2.tgz"), false);
+    assert.equal(await recreated.restoreEntryCapture("job-2", restored), false);
+  } finally {
+    rmSync(source, { recursive: true, force: true });
+    rmSync(restored, { recursive: true, force: true });
   }
 });

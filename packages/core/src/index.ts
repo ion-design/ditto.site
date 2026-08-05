@@ -12,10 +12,24 @@ export {
   resolveCloneStyling,
 } from "./options.js";
 export { COMPILER_VERSION } from "clone-static";
+export {
+  discoverIonCloneInventory,
+  ION_CLONE_DISCOVERY_VERSION,
+  ION_CLONE_PLAN_VERSION,
+  validateIonClonePlan,
+} from "clone-static";
+export type {
+  IonCloneDiscoveryV1,
+  IonClonePlanV1,
+  IonManifestPlan,
+  IonRendererPlan,
+  IonRouteDispositionPlan,
+} from "clone-static";
 export type {
   CloneMode,
   CloneOptions,
   CloneStyling,
+  ExperimentalContentHandoff,
   CollectedFile,
   FileMap,
   CaptureSanity,

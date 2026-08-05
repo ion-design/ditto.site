@@ -36,19 +36,29 @@ export function normalizeUrl(raw: string): string {
  *  normalized. */
 export function canonicalOptions(options: CloneOptions = {}): string {
   const resolved = resolveCloneOptions(options);
-  const norm = {
+  const norm: Record<string, unknown> = {
     mode: resolved.mode,
     styling: resolved.styling,
     framework: resolved.framework,
-    viewports: resolved.viewports ? [...resolved.viewports].sort((a, b) => a - b) : null,
+    viewports: resolved.viewports
+      ? [...resolved.viewports].sort((a, b) => a - b)
+      : null,
     interactions: resolved.interactions,
     components: resolved.components,
     motion: resolved.motion,
+    respectRobots: resolved.respectRobots,
     verify: !!resolved.verify,
     asyncVerify: !!resolved.asyncVerify,
     maxRoutes: resolved.maxRoutes ?? null,
     maxCollection: resolved.maxCollection ?? null,
+    experimentalContentHandoff: resolved.experimentalContentHandoff ?? null,
   };
+  // Preserve the exact legacy cache-key payload for every unflagged caller.
+  if (resolved.experimentalContentHandoff === "ion-cms-v1") {
+    norm.experimentalClonePlan = resolved.experimentalClonePlan ?? null;
+    norm.experimentalReuseCaptureJobId =
+      resolved.experimentalReuseCaptureJobId ?? null;
+  }
   return JSON.stringify(norm);
 }
 
@@ -56,7 +66,15 @@ export function canonicalOptions(options: CloneOptions = {}): string {
  *  A compilerVersion bump invalidates everything (the output changed). The cache is
  *  freshness-bounded by the caller (CACHE_STALE_AFTER), because two *captures* of a
  *  live site can differ even though generation from one capture is byte-stable. */
-export function cacheKey(url: string, options: CloneOptions | undefined, compilerVersion: string): string {
-  const payload = [normalizeUrl(url), canonicalOptions(options), compilerVersion].join("\n");
+export function cacheKey(
+  url: string,
+  options: CloneOptions | undefined,
+  compilerVersion: string,
+): string {
+  const payload = [
+    normalizeUrl(url),
+    canonicalOptions(options),
+    compilerVersion,
+  ].join("\n");
   return createHash("sha256").update(payload).digest("hex");
 }

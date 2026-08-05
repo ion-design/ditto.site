@@ -49,6 +49,8 @@ never commit one. Rotate a leaked key anytime from the dashboard. See
 ## Full doc list
 
 - [SERVICE.md](SERVICE.md) — REST + MCP service reference (endpoints, options, env vars).
+- [EXPERIMENTAL_ION_CMS_HANDOFF.md](EXPERIMENTAL_ION_CMS_HANDOFF.md) — private,
+  versioned Ditto → Ion content/CMS integration contract.
 - [DEPLOY.md](DEPLOY.md) — production deployment.
 - [METHODOLOGY.md](METHODOLOGY.md) — how the compiler is developed and evaluated.
 - [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) — acceptable-use boundaries.

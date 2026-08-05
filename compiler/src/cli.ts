@@ -2,12 +2,13 @@
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { captureSite, REQUIRED_VIEWPORTS, SAMPLE_VIEWPORTS, type CaptureResult } from "./capture/capture.js";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { generateAll } from "./generate/pipeline.js";
 import { refineSizing } from "./generate/refineSizing.js";
 import { writeJSON, writeText, ensureDir, readJSON, fileExists } from "./util/fsx.js";
 import { doneSummary, serveApp } from "./cliSummary.js";
 import type { AppFramework } from "./generate/app.js";
+import { assertEntryAllowedByRobots } from "./crawl/robotsGuard.js";
 
 export type CloneOptions = {
   url: string;
@@ -27,6 +28,7 @@ export type CloneOptions = {
                     // ON by default at the CLI (--no-reflow to disable); persisted per-run in clone-options.json.
   screenshots?: boolean; // capture per-viewport screenshots (default on); --no-screenshots skips them for a
                          // faster production clone (validation-only artifact — generation ignores pixels).
+  respectRobots?: boolean; // default true
   log?: (event: Record<string, unknown>) => void;
 };
 
@@ -438,6 +440,7 @@ export async function runClone(opts: CloneOptions): Promise<CloneResult> {
   writeJSON(join(runDir, "input.json"), { url: opts.url, siteId, viewports, sampleViewports: captureViewports, startedAt: new Date().toISOString() });
 
   // 1. Capture (or reuse)
+  if (opts.respectRobots ?? true) await assertEntryAllowedByRobots(opts.url);
   let capture: CaptureResult;
   if (opts.reuseSource && fileExists(join(opts.reuseSource, "capture", "capture-result.json"))) {
     logBoth({ event: "capture_reuse", from: opts.reuseSource });
@@ -567,6 +570,13 @@ function parseProductFramework(args: string[]): ProductFramework {
   return args.includes("--vite") ? "vite" : "next";
 }
 
+function parseExperimentalContentHandoff(args: string[]): "ion-cms-v1" | undefined {
+  const raw = flagValue(args, "--experimental-content-handoff");
+  if (raw === undefined) return undefined;
+  if (raw === "ion-cms-v1") return raw;
+  throw new Error(`invalid --experimental-content-handoff=${raw}; expected "ion-cms-v1"`);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const url = args.find((a) => !a.startsWith("--"));
@@ -577,6 +587,13 @@ async function main(): Promise<void> {
   const mode = parseProductMode(args);
   const styling = parseProductStyling(args);
   const framework = parseProductFramework(args);
+  const experimentalContentHandoff = parseExperimentalContentHandoff(args);
+  if (experimentalContentHandoff && mode !== "multi") {
+    throw new Error("--experimental-content-handoff is available only with --mode=multi");
+  }
+  if (experimentalContentHandoff && framework !== "next") {
+    throw new Error("--experimental-content-handoff currently requires --framework=next");
+  }
   // --serve installs deps + starts the dev server after cloning; --open also launches the browser.
   const open = hasAnyFlag(args, ["--open"]);
   const serve = open || hasAnyFlag(args, ["--serve"]);
@@ -608,6 +625,7 @@ async function main(): Promise<void> {
   // Screenshots are a validation-only artifact (generation never reads pixels); --no-screenshots skips
   // the per-viewport full-page shots — the dominant capture cost on tall pages — for a faster production clone.
   const screenshots = !hasAnyFlag(args, ["--dev-no-screenshots", "--no-screenshots"]);
+  const respectRobots = !hasAnyFlag(args, ["--dev-no-respect-robots", "--no-respect-robots"]);
   const runsDir = runsArg ? resolve(runsArg) : resolve(process.cwd(), "..", "runs");
   // --reuse: regenerate from the latest existing capture (skip the browser pass).
   const reuseSource = hasAnyFlag(args, ["--dev-reuse", "--reuse"]) ? latestSourceDir(runsDir, url) ?? undefined : undefined;
@@ -631,6 +649,7 @@ async function main(): Promise<void> {
       captureConcurrency: concurrency ? parseInt(concurrency, 10) : undefined,
       validationConcurrency: validationConcurrency ? parseInt(validationConcurrency, 10) : undefined,
       viewportConcurrency: viewportConcurrency ? parseInt(viewportConcurrency, 10) : undefined,
+      experimentalContentHandoff,
       validate,
       interactions,
       components,
@@ -638,6 +657,7 @@ async function main(): Promise<void> {
       framework,
       reflow,
       screenshots: validate && screenshots,
+      respectRobots,
       outDir,
       tier,
       log: (e) => console.log(JSON.stringify(e)),
@@ -658,6 +678,7 @@ async function main(): Promise<void> {
     refineSizing: refineSizingFlag,
     reflow,
     screenshots,
+    respectRobots,
     humanizeMode: styling,
     framework,
     outDir,
@@ -668,6 +689,6 @@ async function main(): Promise<void> {
   await finish(res);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

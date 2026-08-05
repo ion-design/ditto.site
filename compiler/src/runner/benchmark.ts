@@ -1,5 +1,5 @@
 import { join, resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { runClone, siteIdFromUrl } from "../cli.js";
@@ -172,6 +172,6 @@ async function main(): Promise<void> {
   await runBenchmark({ sites, runsDir, reuseCaptures, interactions, components, motion });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

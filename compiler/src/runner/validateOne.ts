@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { validateRun } from "../validate/validate.js";
+import { pathToFileURL } from "node:url";
 
 /** One-off single-run validator: `validate-one <runDir> [--tier=easy]`.
  *  Used during development to gate-check a specific generated run without the
@@ -18,6 +19,6 @@ async function main(): Promise<void> {
     motion: motion ? { pass: motion.pass, metrics: motion.metrics } : undefined }, null, 2));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

@@ -24,6 +24,7 @@
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, extname, basename, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // ===========================================================================
 // CALIBRATION CONSTANTS
@@ -622,6 +623,6 @@ async function main(): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

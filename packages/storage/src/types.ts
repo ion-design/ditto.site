@@ -3,8 +3,20 @@ import type { FileMap } from "@cloner/core";
 /** A file as persisted: text inline (goes into the DB manifest), binaries by
  *  reference to a storage key (local relative path or S3 key). */
 export type StoredFile =
-  | { path: string; kind: "text"; bytes: number; sha256: string; content: string }
-  | { path: string; kind: "binary"; bytes: number; sha256: string; key: string };
+  | {
+      path: string;
+      kind: "text";
+      bytes: number;
+      sha256: string;
+      content: string;
+    }
+  | {
+      path: string;
+      kind: "binary";
+      bytes: number;
+      sha256: string;
+      key: string;
+    };
 
 export type StoredManifest = {
   files: StoredFile[];
@@ -17,6 +29,11 @@ export type StoredManifest = {
 export interface ArtifactStore {
   /** Persist a clone's files; returns the manifest (text inline, binaries by key). */
   putClone(jobId: string, files: FileMap): Promise<StoredManifest>;
+  /** Persist an entry capture as a private artifact. It is never part of the clone
+   * manifest or customer bundle. */
+  putEntryCapture(jobId: string, sourceDir: string): Promise<void>;
+  /** Restore a private entry capture into `destinationDir`. False means absent. */
+  restoreEntryCapture(jobId: string, destinationDir: string): Promise<boolean>;
   /** Read one file's bytes (for the API's /files/* streaming). null if absent. */
   getFile(jobId: string, path: string): Promise<{ bytes: Buffer } | null>;
   /** A URL a client uses to fetch a binary out-of-band (local: API route;
@@ -24,7 +41,11 @@ export interface ArtifactStore {
   binaryUrl(jobId: string, path: string): Promise<string>;
   /** Persist a prebuilt archive and return a download URL (presigned for S3). When
    *  absent (local store), the API serves the bundle bytes itself. */
-  uploadBundle?(jobId: string, format: "tgz" | "zip", bytes: Buffer): Promise<string>;
+  uploadBundle?(
+    jobId: string,
+    format: "tgz" | "zip",
+    bytes: Buffer,
+  ): Promise<string>;
   /** Delete all artifacts for a job. */
   remove(jobId: string): Promise<void>;
 }

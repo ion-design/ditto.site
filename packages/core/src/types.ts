@@ -6,10 +6,12 @@
  * The core layer is the ONLY place that imports the compiler. Everything above
  * it (api, worker, mcp) speaks these types.
  */
+import type { IonClonePlanV1 } from "clone-static";
 
 export type CloneMode = "single" | "multi";
 export type CloneStyling = "tailwind" | "css";
 export type CloneFramework = "next" | "vite";
+export type ExperimentalContentHandoff = "ion-cms-v1";
 
 /** Clone options accepted by the service/core boundary.
  *
@@ -37,8 +39,18 @@ export type CloneOptions = {
   captureConcurrency?: number;
   validationConcurrency?: number;
   viewportConcurrency?: number;
+  /** Private, explicitly versioned integration surface. Absent by default so
+   *  open-source/API consumers retain the legacy multi-page behavior. */
+  experimentalContentHandoff?: ExperimentalContentHandoff;
+  /** Optional Ion-authored route/manifests plan. Valid only with the explicit
+   *  `ion-cms-v1` multi-page handoff; omitted jobs retain legacy planning. */
+  experimentalClonePlan?: IonClonePlanV1;
+  /** Exact prior single-page job whose entry capture must seed this planned clone.
+   *  Private and valid only with the complete `ion-cms-v1` opt-in. */
+  experimentalReuseCaptureJobId?: string;
   /** Service-level: bypass the cache on read AND write (does not affect output). */
   noCache?: boolean;
+  respectRobots?: boolean;
 
   /** @deprecated Use `mode: "multi"` instead. */
   multiPage?: boolean;
@@ -78,7 +90,12 @@ export type CaptureSanity = {
   blocked: boolean; // bot/egress wall text detected
 };
 
-export type CloneTimings = { captureMs: number; generateMs: number; verifyMs?: number; previewMs?: number };
+export type CloneTimings = {
+  captureMs: number;
+  generateMs: number;
+  verifyMs?: number;
+  previewMs?: number;
+};
 
 export type RouteInfo = { route: string; representativeOf?: string };
 
@@ -102,10 +119,15 @@ export type CloneJobResult = {
   /** the ephemeral local run dir (already collected into `files`); caller cleans up
    *  unless `keepTemp` was set. */
   runDir: string;
+  /** Private ephemeral source for durable entry-capture persistence. This directory
+   * is never included in `files` or a customer clone bundle. */
+  entryCaptureSourceDir?: string;
 };
 
 export type RunCloneJobInput = {
   url: string;
+  /** Current service job id, used to persist an addressable entry capture. */
+  jobId?: string;
   options?: CloneOptions;
   /** override the temp base dir (tests). When set, the dir is NOT auto-removed. */
   runsDir?: string;
@@ -115,6 +137,8 @@ export type RunCloneJobInput = {
    *  capture here; a later multi-page job for the same URL REUSES it as the entry route
    *  (no re-capture) — the "single page first, then expand to the full site" speed path. */
   captureCacheDir?: string;
+  /** Exact prior capture source resolved by the service (in-memory mode). */
+  reuseEntrySource?: string;
   /** Max age (ms) of a cached entry capture that may be reused; older ⇒ re-capture.
    *  Undefined/0 ⇒ no expiry (reuse whenever present). Bounds staleness for a service. */
   captureCacheTtlMs?: number;

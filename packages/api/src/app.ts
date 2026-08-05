@@ -5,10 +5,15 @@ import { z } from "zod";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { normalizeCloneRequestOptions } from "@cloner/core";
+import {
+  discoverIonCloneInventory,
+  normalizeCloneRequestOptions,
+  type IonCloneDiscoveryV1,
+} from "@cloner/core";
 import type { Backend } from "./backend.js";
 import { createMcpServer } from "./mcp.js";
 import { apiKeyAuth, hashApiKey, rateLimit, type AuthConfig } from "./auth.js";
+import { ExperimentalClonePlanSchema } from "./ionSchemas.js";
 
 const OptionsSchema = z
   .object({
@@ -23,6 +28,9 @@ const OptionsSchema = z
     captureConcurrency: z.number().int().positive().optional(),
     validationConcurrency: z.number().int().positive().optional(),
     viewportConcurrency: z.number().int().positive().optional(),
+    experimentalContentHandoff: z.literal("ion-cms-v1").optional(),
+    experimentalClonePlan: ExperimentalClonePlanSchema.optional(),
+    experimentalReuseCaptureJobId: z.string().uuid().optional(),
 
     // Deprecated compatibility aliases and dev-only escape hatches.
     multiPage: z.boolean().optional(),
@@ -33,16 +41,89 @@ const OptionsSchema = z
     motion: z.boolean().optional(),
     noCache: z.boolean().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((options, ctx) => {
+    const mode = options.mode ?? (options.multiPage ? "multi" : "single");
+    if (options.experimentalContentHandoff && mode !== "multi") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experimentalContentHandoff"],
+        message:
+          "experimentalContentHandoff is available only for multi-page clones",
+      });
+    }
+    if (options.experimentalContentHandoff && options.framework === "vite") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experimentalContentHandoff"],
+        message:
+          "experimentalContentHandoff currently requires the Next.js framework",
+      });
+    }
+    if (
+      options.experimentalClonePlan &&
+      options.experimentalContentHandoff !== "ion-cms-v1"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experimentalClonePlan"],
+        message:
+          'experimentalClonePlan requires experimentalContentHandoff "ion-cms-v1"',
+      });
+    }
+    if (
+      options.experimentalContentHandoff === "ion-cms-v1" &&
+      !options.experimentalClonePlan
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experimentalClonePlan"],
+        message: "experimentalContentHandoff requires experimentalClonePlan",
+      });
+    }
+    if (
+      options.experimentalReuseCaptureJobId &&
+      options.experimentalContentHandoff !== "ion-cms-v1"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experimentalReuseCaptureJobId"],
+        message:
+          'experimentalReuseCaptureJobId requires experimentalContentHandoff "ion-cms-v1"',
+      });
+    }
+    if (
+      options.experimentalContentHandoff === "ion-cms-v1" &&
+      !options.experimentalReuseCaptureJobId
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experimentalReuseCaptureJobId"],
+        message:
+          "experimentalContentHandoff requires experimentalReuseCaptureJobId",
+      });
+    }
+  });
 
 const CloneRequest = z.object({
   url: z.string().url(),
   options: OptionsSchema.optional(),
 });
 
+const DiscoveryRequest = z
+  .object({
+    url: z.string().url(),
+    experimentalContentHandoff: z.literal("ion-cms-v1"),
+  })
+  .strict();
+
 const SignupRequest = z
   .object({
-    email: z.string().email().max(320).transform((s) => s.trim().toLowerCase()),
+    email: z
+      .string()
+      .email()
+      .max(320)
+      .transform((s) => s.trim().toLowerCase()),
     label: z.string().trim().min(1).max(120).optional(),
   })
   .strict();
@@ -54,14 +135,26 @@ const SignupVerifyRequest = z
   .strict();
 
 export type SignupDeps = {
-  createApiKey: (input: { keyHash: string; label: string; rateLimit?: number }) => Promise<void>;
+  createApiKey: (input: {
+    keyHash: string;
+    label: string;
+    rateLimit?: number;
+  }) => Promise<void>;
   defaultRateLimit?: number;
   rateLimitPerHour?: number;
   directEnabled?: boolean;
   email?: {
-    createToken: (input: { email: string; tokenHash: string; expiresAt: Date }) => Promise<void>;
+    createToken: (input: {
+      email: string;
+      tokenHash: string;
+      expiresAt: Date;
+    }) => Promise<void>;
     consumeToken: (tokenHash: string) => Promise<{ email: string } | undefined>;
-    sendVerificationEmail: (input: { email: string; verifyUrl: string; expiresAt: Date }) => Promise<void>;
+    sendVerificationEmail: (input: {
+      email: string;
+      verifyUrl: string;
+      expiresAt: Date;
+    }) => Promise<void>;
     verifyUrl: string;
     tokenTtlMs: number;
   };
@@ -83,6 +176,8 @@ export type AppDeps = {
   signupCorsOrigins?: string[];
   /** SSRF guard run on submit (omit = no check — set in production). Throws to reject. */
   assertUrl?: (url: string) => Promise<void>;
+  /** Injectable for tests; production uses the compiler's lightweight crawler. */
+  discover?: (url: string) => Promise<IonCloneDiscoveryV1>;
 };
 
 /** Build the Hono app over a Backend. The in-memory backend (M1) runs clones inline
@@ -110,7 +205,10 @@ export function createApp(deps: AppDeps): Hono {
   if (deps.signup) {
     const signup = deps.signup;
     const signupRateLimit = signup.rateLimitPerHour ?? 3;
-    const signupLimiter = rateLimit({ perMinute: signupRateLimit, windowMs: 60 * 60 * 1000 });
+    const signupLimiter = rateLimit({
+      perMinute: signupRateLimit,
+      windowMs: 60 * 60 * 1000,
+    });
     const mintKey = async (email: string, label?: string) => {
       const apiKey = `dtto_live_${randomBytes(32).toString("base64url")}`;
       const storedLabel = label ? `${email} (${label})` : email;
@@ -126,7 +224,10 @@ export function createApp(deps: AppDeps): Hono {
       const body = await c.req.json().catch(() => null);
       const parsed = SignupRequest.safeParse(body);
       if (!parsed.success) {
-        return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+        return c.json(
+          { error: "invalid request", details: parsed.error.flatten() },
+          400,
+        );
       }
       const apiKey = await mintKey(parsed.data.email, parsed.data.label);
       return c.json(
@@ -139,7 +240,8 @@ export function createApp(deps: AppDeps): Hono {
     };
 
     if (signup.directEnabled !== false) {
-      if (signupRateLimit > 0) app.post("/v1/signup", signupLimiter, directSignupHandler);
+      if (signupRateLimit > 0)
+        app.post("/v1/signup", signupLimiter, directSignupHandler);
       else app.post("/v1/signup", directSignupHandler);
     }
 
@@ -149,7 +251,10 @@ export function createApp(deps: AppDeps): Hono {
         const body = await c.req.json().catch(() => null);
         const parsed = SignupRequest.safeParse(body);
         if (!parsed.success) {
-          return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+          return c.json(
+            { error: "invalid request", details: parsed.error.flatten() },
+            400,
+          );
         }
         const rawToken = `dtto_signup_${randomBytes(32).toString("base64url")}`;
         const expiresAt = new Date(Date.now() + emailSignup.tokenTtlMs);
@@ -165,16 +270,24 @@ export function createApp(deps: AppDeps): Hono {
           verifyUrl: url.toString(),
           expiresAt,
         });
-        return c.json({ message: "Check your email for a verification link." }, 202);
+        return c.json(
+          { message: "Check your email for a verification link." },
+          202,
+        );
       };
 
       const verifySignupHandler = async (c: Context) => {
         const body = await c.req.json().catch(() => null);
         const parsed = SignupVerifyRequest.safeParse(body);
         if (!parsed.success) {
-          return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+          return c.json(
+            { error: "invalid request", details: parsed.error.flatten() },
+            400,
+          );
         }
-        const token = await emailSignup.consumeToken(hashApiKey(parsed.data.token));
+        const token = await emailSignup.consumeToken(
+          hashApiKey(parsed.data.token),
+        );
         if (!token) {
           return c.json({ error: "invalid or expired signup token" }, 400);
         }
@@ -188,7 +301,8 @@ export function createApp(deps: AppDeps): Hono {
         );
       };
 
-      if (signupRateLimit > 0) app.post("/v1/signup/request", signupLimiter, requestSignupHandler);
+      if (signupRateLimit > 0)
+        app.post("/v1/signup/request", signupLimiter, requestSignupHandler);
       else app.post("/v1/signup/request", requestSignupHandler);
       app.post("/v1/signup/verify", verifySignupHandler);
     }
@@ -196,7 +310,12 @@ export function createApp(deps: AppDeps): Hono {
 
   const skipSignup = (mw: MiddlewareHandler): MiddlewareHandler => {
     return async (c, next) => {
-      if (c.req.path === "/v1/signup" || c.req.path === "/v1/signup/request" || c.req.path === "/v1/signup/verify") return next();
+      if (
+        c.req.path === "/v1/signup" ||
+        c.req.path === "/v1/signup/request" ||
+        c.req.path === "/v1/signup/verify"
+      )
+        return next();
       return mw(c, next);
     };
   };
@@ -218,7 +337,10 @@ export function createApp(deps: AppDeps): Hono {
     const body = await c.req.json().catch(() => null);
     const parsed = CloneRequest.safeParse(body);
     if (!parsed.success) {
-      return c.json({ error: "invalid request", details: parsed.error.flatten() }, 400);
+      return c.json(
+        { error: "invalid request", details: parsed.error.flatten() },
+        400,
+      );
     }
     const { url, options } = parsed.data;
     if (!/^https?:\/\//i.test(url)) {
@@ -229,22 +351,80 @@ export function createApp(deps: AppDeps): Hono {
       try {
         await deps.assertUrl(url);
       } catch (e) {
-        return c.json({ error: "url not allowed", reason: String((e as Error).message ?? e) }, 400);
+        return c.json(
+          {
+            error: "url not allowed",
+            reason: String((e as Error).message ?? e),
+          },
+          400,
+        );
       }
     }
     // Header alias for the per-request cache bypass.
-    const noCacheHeader = (c.req.header("cache-control") ?? "").toLowerCase().includes("no-cache");
+    const noCacheHeader = (c.req.header("cache-control") ?? "")
+      .toLowerCase()
+      .includes("no-cache");
     const normalizedOptions = normalizeCloneRequestOptions(options ?? {});
-    const opts = noCacheHeader ? { ...normalizedOptions, noCache: true } : normalizedOptions;
+    const opts = noCacheHeader
+      ? { ...normalizedOptions, noCache: true }
+      : normalizedOptions;
 
     try {
       const out = await backend.submit(url, opts);
-      if (out.status === "queued") return c.json({ jobId: out.jobId, status: "queued" }, out.httpStatus);
+      if (out.status === "queued")
+        return c.json({ jobId: out.jobId, status: "queued" }, out.httpStatus);
       return c.json(out.result, 200);
     } catch (e) {
       const msg = String(e);
-      if (msg.startsWith("BUSY:")) return c.json({ error: msg.slice(5).trim() }, 429);
+      if (msg.startsWith("BUSY:"))
+        return c.json({ error: msg.slice(5).trim() }, 429);
       return c.json({ status: "failed", error: msg.slice(0, 500) }, 500);
+    }
+  });
+
+  app.post("/v1/discoveries", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = DiscoveryRequest.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { error: "invalid request", details: parsed.error.flatten() },
+        400,
+      );
+    }
+    const { url } = parsed.data;
+    if (!/^https?:\/\//i.test(url))
+      return c.json({ error: "url must be http(s)" }, 400);
+    if (deps.assertUrl) {
+      try {
+        await deps.assertUrl(url);
+      } catch (error) {
+        return c.json(
+          {
+            error: "url not allowed",
+            reason: String((error as Error).message ?? error),
+          },
+          400,
+        );
+      }
+    }
+    try {
+      const inventory = deps.discover
+        ? await deps.discover(url)
+        : await discoverIonCloneInventory({
+            url,
+            respectRobots: true,
+            // Ion plans from the lander's complete link inventory plus sitemap
+            // clusters. Following every hub recursively adds minutes on large
+            // commerce sites without changing that contract.
+            maxDepth: 1,
+            maxDiscoverPages: 1,
+          });
+      return c.json(inventory, 200);
+    } catch (error) {
+      return c.json(
+        { status: "failed", error: String(error).slice(0, 500) },
+        500,
+      );
     }
   });
 
@@ -261,7 +441,11 @@ export function createApp(deps: AppDeps): Hono {
   app.get("/v1/clones/:id/result", async (c) => {
     const out = await backend.result(c.req.param("id"));
     if (!out) return c.json({ error: "not found" }, 404);
-    if (!out.ready) return c.json({ jobId: c.req.param("id"), status: out.status, error: out.error }, 409);
+    if (!out.ready)
+      return c.json(
+        { jobId: c.req.param("id"), status: out.status, error: out.error },
+        409,
+      );
     return c.json(out.result, 200);
   });
 
@@ -270,8 +454,14 @@ export function createApp(deps: AppDeps): Hono {
     const b = await backend.bundle(c.req.param("id"), fmt);
     if (!b) return c.json({ error: "not found or not ready" }, 404);
     if (b.url) return c.redirect(b.url, 302); // S3: hand off to the presigned URL
-    c.header("content-type", fmt === "zip" ? "application/zip" : "application/gzip");
-    c.header("content-disposition", `attachment; filename="clone-${c.req.param("id")}.${fmt}"`);
+    c.header(
+      "content-type",
+      fmt === "zip" ? "application/zip" : "application/gzip",
+    );
+    c.header(
+      "content-disposition",
+      `attachment; filename="clone-${c.req.param("id")}.${fmt}"`,
+    );
     c.header("content-length", String(b.bytes.length));
     c.header("x-content-sha256", b.sha256);
     return c.body(b.bytes);
@@ -288,7 +478,9 @@ export function createApp(deps: AppDeps): Hono {
   // Pipeline progress events (poll every ~300ms while a clone runs).
   app.get("/v1/clones/:id/events", async (c) => {
     const after = Math.max(0, Number(c.req.query("after") ?? "0") || 0);
-    const events = backend.events ? await backend.events(c.req.param("id"), after) : null;
+    const events = backend.events
+      ? await backend.events(c.req.param("id"), after)
+      : null;
     if (!events) return c.json({ error: "not found" }, 404);
     return c.json({ jobId: c.req.param("id"), events });
   });
@@ -313,11 +505,21 @@ export function createApp(deps: AppDeps): Hono {
         return c.body(file.bytes);
       }
     }
-    return c.json({ error: "no app preview for this clone (preview builds are on by default for single-page clones; pass options.preview=true otherwise)" }, 404);
+    return c.json(
+      {
+        error:
+          "no app preview for this clone (preview builds are on by default for single-page clones; pass options.preview=true otherwise)",
+      },
+      404,
+    );
   };
-  app.get("/v1/clones/:id/app-preview", (c) => c.redirect(`/v1/clones/${c.req.param("id")}/app-preview/`, 302));
+  app.get("/v1/clones/:id/app-preview", (c) =>
+    c.redirect(`/v1/clones/${c.req.param("id")}/app-preview/`, 302),
+  );
   app.get("/v1/clones/:id/app-preview/", (c) => previewFile(c, "index.html"));
-  app.get("/v1/clones/:id/app-preview/:path{.+}", (c) => previewFile(c, c.req.param("path") ?? ""));
+  app.get("/v1/clones/:id/app-preview/:path{.+}", (c) =>
+    previewFile(c, c.req.param("path") ?? ""),
+  );
 
   app.delete("/v1/clones/:id", async (c) => {
     const ok = await backend.remove(c.req.param("id"));
@@ -329,18 +531,32 @@ export function createApp(deps: AppDeps): Hono {
   // app.request — MCP is exercised in tests via the in-memory transport instead).
   if (deps.mcp !== false) {
     app.all("/mcp", async (c) => {
-      const env = c.env as { incoming?: IncomingMessage; outgoing?: ServerResponse };
+      const env = c.env as {
+        incoming?: IncomingMessage;
+        outgoing?: ServerResponse;
+      };
       if (!env?.incoming || !env?.outgoing) {
-        return c.json({ error: "MCP requires the Node HTTP server (run via @hono/node-server)" }, 501);
+        return c.json(
+          {
+            error:
+              "MCP requires the Node HTTP server (run via @hono/node-server)",
+          },
+          501,
+        );
       }
       const server = createMcpServer(backend, { baseUrl: deps.baseUrl });
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
       env.outgoing.on("close", () => {
         transport.close();
         server.close();
       });
       await server.connect(transport);
-      const body = c.req.method === "POST" ? await c.req.json().catch(() => undefined) : undefined;
+      const body =
+        c.req.method === "POST"
+          ? await c.req.json().catch(() => undefined)
+          : undefined;
       await transport.handleRequest(env.incoming, env.outgoing, body);
       return RESPONSE_ALREADY_SENT;
     });

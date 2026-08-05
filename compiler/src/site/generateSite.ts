@@ -26,7 +26,7 @@ import { SYSTEM_FALLBACK, type FontGraph } from "../infer/fonts.js";
 import { buildSiteColorPalette, type ColorPalette } from "../infer/semanticTokens.js";
 import { recognizePrimitives, inventoryOf } from "../infer/primitives.js";
 import type { IR } from "../normalize/ir.js";
-import type { CaptureResult } from "../capture/capture.js";
+import { capturedAssetByteLimit, type CaptureResult } from "../capture/capture.js";
 import { backfillLazyBackgrounds } from "../normalize/ir.js";
 import { toRoutePath, segmentsOf } from "../crawl/url.js";
 import { buildCanonicalChrome, chromeCssIr, middleChildren, middleIncludeFilter, CHROME_PREFIX, type ChromePlan } from "./sharedLayout.js";
@@ -197,6 +197,66 @@ export type SiteGenResult = {
   seoInventory: SeoInventory;
 };
 
+export const MAX_GENERATED_SITE_VISUAL_BYTES = 256 * 1024 * 1024;
+
+export function applyGeneratedSiteVisualBudget(
+  graphs: AssetGraph[],
+  maxBytes = MAX_GENERATED_SITE_VISUAL_BYTES,
+): { keptBytes: number; skipped: number } {
+  const visual = (type: string) => type === "image" || type === "svg" || type === "video";
+  const queues = graphs.map((graph) =>
+    graph.entries
+      .filter((entry) =>
+        entry.classification === "downloaded" &&
+        Boolean(entry.localPath) &&
+        visual(entry.type),
+      )
+      .sort((a, b) => a.bytes - b.bytes || a.sourceUrl.localeCompare(b.sourceUrl)),
+  );
+  const cursors = queues.map(() => 0);
+  const keptPaths = new Set<string>();
+  let keptBytes = 0;
+  let pending = true;
+  while (pending) {
+    pending = false;
+    for (let routeIndex = 0; routeIndex < queues.length; routeIndex++) {
+      const queue = queues[routeIndex]!;
+      const cursor = cursors[routeIndex]!;
+      if (cursor >= queue.length) continue;
+      pending = true;
+      cursors[routeIndex] = cursor + 1;
+      const entry = queue[cursor]!;
+      const path = entry.localPath!;
+      if (keptPaths.has(path)) continue;
+      if (entry.bytes > capturedAssetByteLimit(entry.type)) continue;
+      if (keptBytes + entry.bytes > maxBytes) continue;
+      keptPaths.add(path);
+      keptBytes += entry.bytes;
+    }
+  }
+
+  let skipped = 0;
+  for (const graph of graphs) {
+    for (const entry of graph.entries) {
+      if (
+        entry.classification !== "downloaded" ||
+        !entry.localPath ||
+        !visual(entry.type) ||
+        keptPaths.has(entry.localPath)
+      ) {
+        continue;
+      }
+      entry.classification = "skipped";
+      entry.localPath = null;
+      entry.storedFile = null;
+      entry.reason = "site_visual_budget";
+      entry.impact = "visual_missing";
+      skipped++;
+    }
+  }
+  return { keptBytes, skipped };
+}
+
 /** A throwaway IR rooted at `ir`'s body but with only the given children — used to run
  *  component detection over exactly the node set a file will render (a route's middle,
  *  or the hoisted chrome), without seeing the rest of the page. */
@@ -225,6 +285,7 @@ export function generateSiteApp(opts: {
   const framework = opts.framework ?? "next";
   const isVite = framework === "vite";
   for (const r of routes) backfillLazyBackgrounds(r.ir);
+  applyGeneratedSiteVisualBudget(routes.map((route) => route.assetGraph));
   const entry = routes.find((r) => r.routePath === opts.entryRoutePath) ?? routes[0]!;
   const seoInventory = buildSeoInventory(entry.ir, entry.assetGraph, entry.capture);
   const seoRoutes: SeoRouteSummary[] = routes.map((route) => {

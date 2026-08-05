@@ -15,6 +15,29 @@ export type { CloneOptions, CloneResult } from "./cli.js";
 // ---- Multi-page / whole-site clone ----
 export { runCloneSite, regenerateSite } from "./site/cloneSite.js";
 export type { CloneSiteOptions, CloneSiteResult } from "./site/cloneSite.js";
+export {
+  ION_CLONE_PLAN_VERSION,
+  buildIonPlannedRoutePlan,
+  validateIonClonePlan,
+} from "./site/plannedClone.js";
+export type {
+  IonClonePlanV1,
+  IonManifestPlan,
+  IonRendererPlan,
+  IonRendererRole,
+  IonRouteDispositionPlan,
+  IonPlannedCloneBundleExtension,
+} from "./site/plannedClone.js";
+export {
+  discoverIonCloneInventory,
+  buildIonCloneInventory,
+  ION_CLONE_DISCOVERY_VERSION,
+} from "./crawl/discovery.js";
+export type {
+  IonCloneDiscoveryV1,
+  IonCloneDiscoveryRoute,
+  IonCloneDiscoveryCluster,
+} from "./crawl/discovery.js";
 
 // ---- Validation / verify (build + serve + re-render + grade) ----
 export { validateRun } from "./validate/validate.js";
@@ -33,8 +56,18 @@ export { buildIR } from "./normalize/ir.js";
 export type { IR } from "./normalize/ir.js";
 
 // ---- Pattern knowledge (frozen catalog; deterministic hints; pin asserted on load) ----
-export { resolvePatternHints, loadPatternIndex, assertPinnedCatalog, matchCatalogNode } from "./knowledge/patternIndex.js";
-export type { PatternHints, PatternMatch, PatternDef, PatternCatalog } from "./knowledge/patternIndex.js";
+export {
+  resolvePatternHints,
+  loadPatternIndex,
+  assertPinnedCatalog,
+  matchCatalogNode,
+} from "./knowledge/patternIndex.js";
+export type {
+  PatternHints,
+  PatternMatch,
+  PatternDef,
+  PatternCatalog,
+} from "./knowledge/patternIndex.js";
 
 // ---- Capture surface + version ----
 export { captureSite, REQUIRED_VIEWPORTS } from "./capture/capture.js";

@@ -26,6 +26,7 @@ describe("runCloneJob multi-page (served fixture site)", { skip: hasChromium() ?
     assert.ok(res.files["src/app/robots.ts"], "robots route emitted");
     assert.ok(res.files["src/app/sitemap.ts"], "sitemap route emitted");
     assert.ok(res.files["src/app/llms.txt/route.ts"], "llms route emitted");
+    assert.equal(res.files[".ion/ditto-content-bundle.json"], undefined, "legacy jobs emit no private handoff artifact");
     assert.ok((res.files["src/app/llms.txt/route.ts"]!.content ?? "").includes("Build faster with Acme"), "generated llms includes captured route content");
     const subRoutePages = Object.keys(res.files).filter((p) => /^src\/app\/.+\/page\.tsx$/.test(p));
     assert.ok(subRoutePages.length >= 1, "at least one sub-route page");

@@ -1,28 +1,79 @@
-import { cacheKey, COMPILER_VERSION, resolveCloneMode, type CloneOptions, type RouteInfo } from "@cloner/core";
+import {
+  cacheKey,
+  COMPILER_VERSION,
+  normalizeUrl,
+  resolveCloneMode,
+  type CloneOptions,
+  type RouteInfo,
+} from "@cloner/core";
 import { repo, enqueueClone, type Db, type PgBoss } from "@cloner/db";
-import { makeTarGz, makeZip, sha256hex, type ArtifactStore, type StoredFile } from "@cloner/storage";
-import type { Backend, BundleFormat, CloneBundle, FileFacet, JobView, JobStatus, ResultOutcome, SubmitOutcome } from "../backend.js";
+import {
+  makeTarGz,
+  makeZip,
+  sha256hex,
+  type ArtifactStore,
+  type StoredFile,
+} from "@cloner/storage";
+import type {
+  Backend,
+  BundleFormat,
+  CloneBundle,
+  FileFacet,
+  JobView,
+  JobStatus,
+  ResultOutcome,
+  SubmitOutcome,
+} from "../backend.js";
 import { contentTypeFor, restResultFromStored } from "../rest.js";
 
 /** The jsonb envelope persisted in clones.fileManifest: text files inline + binary
  *  keys (from the ArtifactStore) plus the reproduced-route map. */
-export type StoredEnvelope = { files: StoredFile[]; routes?: RouteInfo[]; bundleKey?: string };
+export type StoredEnvelope = {
+  files: StoredFile[];
+  routes?: RouteInfo[];
+  bundleKey?: string;
+};
 
 /** Async, DB+queue backend (M2): submit enqueues a job and returns 202; the worker
  *  processes it and writes the result. Reads come from Postgres + the ArtifactStore. */
 export class DbBackend implements Backend {
   constructor(private deps: { db: Db; boss: PgBoss; store: ArtifactStore }) {}
 
-  async submit(url: string, options: CloneOptions | undefined): Promise<SubmitOutcome> {
+  async submit(
+    url: string,
+    options: CloneOptions | undefined,
+  ): Promise<SubmitOutcome> {
+    if (options?.experimentalReuseCaptureJobId) {
+      const prior = await repo.getJob(
+        this.deps.db,
+        options.experimentalReuseCaptureJobId,
+      );
+      if (
+        !prior ||
+        prior.status !== "succeeded" ||
+        prior.kind !== "clone" ||
+        normalizeUrl(prior.url) !== normalizeUrl(url)
+      ) {
+        throw new Error(
+          `requested entry capture is unavailable for job ${options.experimentalReuseCaptureJobId}`,
+        );
+      }
+    }
     const key = cacheKey(url, options, COMPILER_VERSION);
-    const kind: "clone" | "clone_site" = resolveCloneMode(options) === "multi" ? "clone_site" : "clone";
+    const kind: "clone" | "clone_site" =
+      resolveCloneMode(options) === "multi" ? "clone_site" : "clone";
 
     if (!options?.noCache) {
       const hit = await repo.cacheGetFresh(this.deps.db, key, COMPILER_VERSION);
       if (hit?.jobId) {
         const r = await this.result(hit.jobId);
         if (r && r.ready) {
-          return { jobId: hit.jobId, status: "cached", httpStatus: 200, result: { ...r.result, status: "cached" } };
+          return {
+            jobId: hit.jobId,
+            status: "cached",
+            httpStatus: 200,
+            result: { ...r.result, status: "cached" },
+          };
         }
       }
       // In-flight dedup: an identical clone is already queued/running — attach the
@@ -34,7 +85,13 @@ export class DbBackend implements Backend {
       }
     }
 
-    const job = await repo.createJob(this.deps.db, { kind, url, options: options ?? {}, status: "queued", cacheKey: key });
+    const job = await repo.createJob(this.deps.db, {
+      kind,
+      url,
+      options: options ?? {},
+      status: "queued",
+      cacheKey: key,
+    });
     await enqueueClone(this.deps.boss, job.id);
     return { jobId: job.id, status: "queued", httpStatus: 202 };
   }
@@ -58,7 +115,14 @@ export class DbBackend implements Backend {
         const env = clone.fileManifest as StoredEnvelope;
         let totalBytes = 0;
         for (const f of env.files) totalBytes += f.bytes;
-        return { ...base, capture: clone.captureMeta as JobView["capture"], verify: clone.verify ?? undefined, routes: env.routes, fileCount: env.files.length, totalBytes };
+        return {
+          ...base,
+          capture: clone.captureMeta as JobView["capture"],
+          verify: clone.verify ?? undefined,
+          routes: env.routes,
+          fileCount: env.files.length,
+          totalBytes,
+        };
       }
     }
     return base;
@@ -67,7 +131,12 @@ export class DbBackend implements Backend {
   async result(jobId: string): Promise<ResultOutcome | null> {
     const job = await repo.getJob(this.deps.db, jobId);
     if (!job) return null;
-    if (job.status !== "succeeded") return { ready: false, status: job.status as JobStatus, error: job.error ?? undefined };
+    if (job.status !== "succeeded")
+      return {
+        ready: false,
+        status: job.status as JobStatus,
+        error: job.error ?? undefined,
+      };
     const clone = await repo.getClone(this.deps.db, jobId);
     if (!clone) return { ready: false, status: "running" };
     const env = clone.fileManifest as StoredEnvelope;
@@ -76,8 +145,15 @@ export class DbBackend implements Backend {
       kind: job.kind as "clone" | "clone_site",
       options: job.options as CloneOptions,
       compilerVersion: job.compilerVersion ?? COMPILER_VERSION,
-      timings: (job.timings as { captureMs: number; generateMs: number }) ?? { captureMs: 0, generateMs: 0 },
-      capture: clone.captureMeta as { nodeCount: number; pollution: boolean; blocked: boolean },
+      timings: (job.timings as { captureMs: number; generateMs: number }) ?? {
+        captureMs: 0,
+        generateMs: 0,
+      },
+      capture: clone.captureMeta as {
+        nodeCount: number;
+        pollution: boolean;
+        blocked: boolean;
+      },
       routes: env.routes,
       verify: clone.verify ?? undefined,
       files: env.files,
@@ -86,12 +162,19 @@ export class DbBackend implements Backend {
     return { ready: true, result };
   }
 
-  async file(jobId: string, path: string): Promise<{ bytes: Buffer; contentType: string } | null> {
+  async file(
+    jobId: string,
+    path: string,
+  ): Promise<{ bytes: Buffer; contentType: string } | null> {
     // Text lives inline in the manifest (not in blob storage); binaries come from
     // the store. This keeps /files/* working in S3 mode where text isn't uploaded.
     const env = await this.envelope(jobId);
     const meta = env?.files.find((f) => f.path === path);
-    if (meta?.kind === "text") return { bytes: Buffer.from(meta.content, "utf8"), contentType: contentTypeFor(path) };
+    if (meta?.kind === "text")
+      return {
+        bytes: Buffer.from(meta.content, "utf8"),
+        contentType: contentTypeFor(path),
+      };
     const got = await this.deps.store.getFile(jobId, path);
     if (!got) return null;
     return { bytes: got.bytes, contentType: contentTypeFor(path) };
@@ -127,12 +210,27 @@ export class DbBackend implements Backend {
     if (!env) return null;
     return env.files.map((f) =>
       f.kind === "text"
-        ? { path: f.path, kind: "text", bytes: f.bytes, sha256: f.sha256, content: f.content }
-        : { path: f.path, kind: "binary", bytes: f.bytes, sha256: f.sha256, binaryUrl: () => this.deps.store.binaryUrl(jobId, f.path) },
+        ? {
+            path: f.path,
+            kind: "text",
+            bytes: f.bytes,
+            sha256: f.sha256,
+            content: f.content,
+          }
+        : {
+            path: f.path,
+            kind: "binary",
+            bytes: f.bytes,
+            sha256: f.sha256,
+            binaryUrl: () => this.deps.store.binaryUrl(jobId, f.path),
+          },
     );
   }
 
-  async bundle(jobId: string, format: BundleFormat = "tgz"): Promise<CloneBundle | null> {
+  async bundle(
+    jobId: string,
+    format: BundleFormat = "tgz",
+  ): Promise<CloneBundle | null> {
     const env = await this.envelope(jobId);
     if (!env) return null;
     const entries: Array<{ path: string; bytes: Buffer }> = [];
@@ -146,11 +244,16 @@ export class DbBackend implements Backend {
     }
     const bytes = format === "zip" ? makeZip(entries) : makeTarGz(entries);
     // S3 store: upload + presign so the client downloads directly; local: served by the API.
-    const url = this.deps.store.uploadBundle ? await this.deps.store.uploadBundle(jobId, format, bytes) : undefined;
+    const url = this.deps.store.uploadBundle
+      ? await this.deps.store.uploadBundle(jobId, format, bytes)
+      : undefined;
     return { bytes, sha256: sha256hex(bytes), format, url };
   }
 
-  async events(jobId: string, after = 0): Promise<Array<Record<string, unknown>> | null> {
+  async events(
+    jobId: string,
+    after = 0,
+  ): Promise<Array<Record<string, unknown>> | null> {
     const job = await repo.getJob(this.deps.db, jobId);
     if (!job) return null;
     return repo.listJobEvents(this.deps.db, jobId, after);

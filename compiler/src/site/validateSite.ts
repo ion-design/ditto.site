@@ -6,7 +6,7 @@
  * shared-chrome consistency (M4), and site determinism (regenerate → byte-stable).
  */
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { buildIR, isTextChild, type IR, type IRNode } from "../normalize/ir.js";
@@ -355,7 +355,7 @@ function resolveRun(p: string): string {
   return p;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
 

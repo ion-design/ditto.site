@@ -18,6 +18,7 @@ import { exportApp } from "../cli.js";
 import { scoreApp } from "./qualityScore.js";
 import { readJSON, writeJSON, fileExists } from "../util/fsx.js";
 import type { CaptureResult } from "../capture/capture.js";
+import { pathToFileURL } from "node:url";
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -66,6 +67,6 @@ async function main(): Promise<void> {
   }, null, 2));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

@@ -2,7 +2,7 @@ import { chromium, type Page } from "playwright";
 import { PNG } from "pngjs";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildApp, serveStatic } from "../validate/render.js";
 import { buildIR, isTextChild, type IR } from "../normalize/ir.js";
 import { tagElements } from "../capture/interactions.js";
@@ -186,6 +186,6 @@ async function main(): Promise<void> {
   console.log(JSON.stringify({ event: "done", files }));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

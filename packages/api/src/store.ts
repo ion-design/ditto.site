@@ -11,6 +11,9 @@ export type JobRecord = {
   kind: "clone" | "clone_site";
   options: CloneOptions;
   createdAt: number;
+  /** Terminal timestamp. TTL retention starts here so long-running jobs are never
+   * evicted mid-capture or immediately after they finish. */
+  finishedAt?: number;
   result?: CloneJobResult;
   base?: string;
   error?: string;
@@ -53,7 +56,10 @@ export class InMemoryStore {
   sweep(): void {
     const now = Date.now();
     for (const rec of [...this.jobs.values()]) {
-      if (now - rec.createdAt > this.ttlMs) this.remove(rec.id);
+      if (rec.status === "running") continue;
+      if (now - (rec.finishedAt ?? rec.createdAt) > this.ttlMs) {
+        this.remove(rec.id);
+      }
     }
   }
 

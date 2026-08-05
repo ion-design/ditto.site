@@ -1,4 +1,10 @@
-import type { CloneFramework, CloneMode, CloneOptions, CloneStyling } from "./types.js";
+import type {
+  CloneFramework,
+  CloneMode,
+  CloneOptions,
+  CloneStyling,
+} from "./types.js";
+import { validateIonClonePlan } from "clone-static";
 
 export type ResolvedCloneOptions = CloneOptions & {
   mode: CloneMode;
@@ -10,6 +16,7 @@ export type ResolvedCloneOptions = CloneOptions & {
   components: boolean;
   motion: boolean;
   preview: boolean;
+  respectRobots: boolean;
 };
 
 export function resolveCloneMode(options: CloneOptions = {}): CloneMode {
@@ -20,13 +27,59 @@ export function resolveCloneStyling(options: CloneOptions = {}): CloneStyling {
   return options.styling ?? options.humanizeMode ?? "tailwind";
 }
 
-export function resolveCloneFramework(options: CloneOptions = {}): CloneFramework {
+export function resolveCloneFramework(
+  options: CloneOptions = {},
+): CloneFramework {
   return options.framework ?? "next";
 }
 
 /** Normalize the request-facing shape. Deprecated aliases are consumed but not
  * echoed, so REST/MCP results present the product-level option names. */
-export function normalizeCloneRequestOptions(options: CloneOptions = {}): CloneOptions {
+export function normalizeCloneRequestOptions(
+  options: CloneOptions = {},
+): CloneOptions {
+  const rawHandoff = (options as { experimentalContentHandoff?: unknown })
+    .experimentalContentHandoff;
+  if (rawHandoff !== undefined && rawHandoff !== "ion-cms-v1") {
+    throw new Error('experimentalContentHandoff must be "ion-cms-v1"');
+  }
+  if (rawHandoff && resolveCloneMode(options) !== "multi") {
+    throw new Error(
+      "experimentalContentHandoff is available only for multi-page clones",
+    );
+  }
+  if (rawHandoff && resolveCloneFramework(options) !== "next") {
+    throw new Error(
+      "experimentalContentHandoff currently requires the Next.js framework",
+    );
+  }
+  if (rawHandoff === "ion-cms-v1" && !options.experimentalClonePlan) {
+    throw new Error(
+      "experimentalContentHandoff requires experimentalClonePlan",
+    );
+  }
+  if (rawHandoff === "ion-cms-v1" && !options.experimentalReuseCaptureJobId) {
+    throw new Error(
+      "experimentalContentHandoff requires experimentalReuseCaptureJobId",
+    );
+  }
+  if (options.experimentalClonePlan && rawHandoff !== "ion-cms-v1") {
+    throw new Error(
+      'experimentalClonePlan requires experimentalContentHandoff "ion-cms-v1"',
+    );
+  }
+  if (options.experimentalClonePlan)
+    validateIonClonePlan(options.experimentalClonePlan);
+  if (options.experimentalReuseCaptureJobId && rawHandoff !== "ion-cms-v1") {
+    throw new Error(
+      'experimentalReuseCaptureJobId requires experimentalContentHandoff "ion-cms-v1"',
+    );
+  }
+  if (options.experimentalReuseCaptureJobId && !options.experimentalClonePlan) {
+    throw new Error(
+      "experimentalReuseCaptureJobId requires experimentalClonePlan",
+    );
+  }
   const normalized: CloneOptions = {
     ...options,
     mode: resolveCloneMode(options),
@@ -40,10 +93,13 @@ export function normalizeCloneRequestOptions(options: CloneOptions = {}): CloneO
 
 /** Resolve options for the compiler adapter. This is where automatic internal
  * defaults live; callers should not need to choose these in normal use. */
-export function resolveCloneOptions(options: CloneOptions = {}): ResolvedCloneOptions {
+export function resolveCloneOptions(
+  options: CloneOptions = {},
+): ResolvedCloneOptions {
   const mode = resolveCloneMode(options);
   const styling = resolveCloneStyling(options);
   const framework = resolveCloneFramework(options);
+  const ionCmsHandoff = options.experimentalContentHandoff === "ion-cms-v1";
   return {
     ...options,
     mode,
@@ -51,9 +107,10 @@ export function resolveCloneOptions(options: CloneOptions = {}): ResolvedCloneOp
     framework,
     multiPage: mode === "multi",
     humanizeMode: styling,
-    interactions: options.interactions ?? true,
-    components: options.components ?? true,
-    motion: options.motion ?? true,
+    interactions: options.interactions ?? !ionCmsHandoff,
+    components: options.components ?? !ionCmsHandoff,
+    motion: options.motion ?? !ionCmsHandoff,
+    respectRobots: options.respectRobots ?? true,
     // Preview builds are the single-page product surface; multi-page exports can be
     // large, so previewing a site clone stays an explicit opt-in.
     preview: options.preview ?? mode === "single",

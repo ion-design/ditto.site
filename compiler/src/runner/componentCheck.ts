@@ -1,5 +1,5 @@
 import { resolve, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { runClone, latestSourceDir, siteIdFromUrl } from "../cli.js";
 import { validateRun } from "../validate/validate.js";
@@ -67,6 +67,6 @@ async function main(): Promise<void> {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }

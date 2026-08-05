@@ -21,6 +21,7 @@
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
 import { scoreApp, type QualityReport } from "./qualityScore.js";
+import { pathToFileURL } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Target resolution — accept an app dir directly, or discover deliverables.
@@ -136,6 +137,6 @@ function main(): void {
   console.log("\n(scores are out of each dimension's max; grade is the weighted blend, capped to\n D-range if any single file/line/blob is in catastrophic payload territory.)\n");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();
 }
