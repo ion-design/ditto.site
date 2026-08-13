@@ -8,6 +8,8 @@ import { generateInteractionCss } from "./interactionCss.js";
 import { buildRuntimeSpecs, wiresJsx, dittoWireImportPath, DITTO_WIRE_TSX, accordionJsx, accordionImportPath, ACCORDION_TSX, type AccordionRuntimeSpec, type RuntimeSpec } from "./interactive.js";
 import { buildMotionSpec, motionWireJsx, dittoMotionImportPath, motionHasContent, DITTO_MOTION_TSX, type MotionSpec } from "./motion.js";
 import { buildLottieSpec, lottieWireJsx, dittoLottieImportPath, lottieHasContent, DITTO_LOTTIE_TSX, type LottieSpec as LottieRuntimeSpec } from "./lottie.js";
+import { buildHoverSpec, hoverWireJsx, dittoHoverImportPath, hoverHasContent, DITTO_HOVER_TSX, type HoverSpec as HoverRuntimeSpec } from "./hover.js";
+import { buildVideoSpec, videoWireJsx, dittoVideoImportPath, videoHasContent, DITTO_VIDEO_TSX, type VideoSpec as VideoRuntimeSpec } from "./video.js";
 import { buildMenuSpecs, menusJsx, dropdownMenuImportPath, DROPDOWN_MENU_TSX, type RTMenu } from "./menu.js";
 import type { AssetGraph } from "../infer/assets.js";
 import type { FontGraph } from "../infer/fonts.js";
@@ -2253,7 +2255,7 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
   return { files, contentDecls };
 }
 
-export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl: string, ctx?: RenderCtx, wires?: RuntimeSpec[], motionSpec?: MotionSpec, menus?: RTMenu[], accordions?: AccordionRuntimeSpec[], lottieSpec?: LottieRuntimeSpec): string {
+export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl: string, ctx?: RenderCtx, wires?: RuntimeSpec[], motionSpec?: MotionSpec, menus?: RTMenu[], accordions?: AccordionRuntimeSpec[], lottieSpec?: LottieRuntimeSpec, hoverSpec?: HoverRuntimeSpec, videoSpec?: VideoRuntimeSpec): string {
   // page renders the body's children; the <body> element itself (c0) is rendered
   // by layout so cid alignment is preserved.
   const hasWires = !!wires && wires.length > 0;
@@ -2261,11 +2263,15 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
   const hasLottie = !!lottieSpec && lottieHasContent(lottieSpec);
   const hasMenus = !!menus && menus.length > 0;
   const hasAccordions = !!accordions && accordions.length > 0;
+  const hasHover = !!hoverSpec && hoverHasContent(hoverSpec);
+  const hasVideo = !!videoSpec && videoHasContent(videoSpec);
   const wiresBlock = hasWires ? "\n" + wiresJsx(wires!, 3) : "";
   const motionBlock = hasMotion ? "\n" + motionWireJsx(motionSpec!, 3) : "";
   const lottieBlock = hasLottie ? "\n" + lottieWireJsx(lottieSpec!, 3) : "";
   const menusBlock = hasMenus ? "\n" + menusJsx(menus!, 3) : "";
   const accordionBlock = hasAccordions ? "\n" + accordionJsx(accordions!, 3) : "";
+  const hoverBlock = hasHover ? "\n" + hoverWireJsx(hoverSpec!, 3) : "";
+  const videoBlock = hasVideo ? "\n" + videoWireJsx(videoSpec!, 3) : "";
   // Render the body first so component extraction populates the registry, then import
   // each extracted component from its own `components/Name` module (written by
   // generateApp) and its data from the editable ./content module (Stage 6).
@@ -2282,6 +2288,8 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
     hasAccordions ? `import Accordion from "${accordionImportPath(0)}";` : "",
     hasMotion ? `import DittoMotion from "${dittoMotionImportPath(0)}";` : "",
     hasLottie ? `import DittoLottie from "${dittoLottieImportPath(0)}";` : "",
+    hasHover ? `import DittoHover from "${dittoHoverImportPath(0)}";` : "",
+    hasVideo ? `import DittoVideo from "${dittoVideoImportPath(0)}";` : "",
     hasMenus ? `import DropdownMenu from "${dropdownMenuImportPath(0)}";` : "",
     /\bcn\(/.test(body) ? cnImportLine(1) : "", // page.tsx lives at src/app
     ...compImports,
@@ -2290,7 +2298,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
   return `${importBlock}export default function Page() {
   return (
     <>
-${body}${wiresBlock}${accordionBlock}${motionBlock}${lottieBlock}${menusBlock}
+${body}${wiresBlock}${accordionBlock}${motionBlock}${lottieBlock}${hoverBlock}${videoBlock}${menusBlock}
     </>
   );
 }
@@ -2718,6 +2726,8 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const wires = runtimeSpecs.filter((s) => s.kind !== "accordion");
   const motionSpec = buildMotionSpec(ir, input.motion);
   const lottieSpec = buildLottieSpec(ir, input.motion, assetGraph);
+  const hoverSpec = buildHoverSpec(ir, input.interaction);
+  const videoSpec = buildVideoSpec(ir, input.interaction);
   const components = input.components ? buildComponentRegistry(ir, input.primitives, input.recipeReport) : undefined;
   const linkRewrite = sameOriginRelativeLinkRewrite(sourceUrl);
   const menus = buildMenuSpecs(ir, input.interaction?.menus, assetMap, sourceUrl, linkRewrite);
@@ -2742,7 +2752,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   const sectionPlan = humanize ? planSections(ir, input.recipeReport) : undefined;
   const sections: SectionRegistry | undefined = sectionPlan && sectionPlan.roots.size > 0 ? { plan: sectionPlan, modules: new Map(), order: [] } : undefined;
   const svgs: SvgRegistry | undefined = humanize ? { byKey: new Map(), defs: new Map(), order: [], nameCount: new Map() } : undefined;
-  const pageTsx = generatePageTsx(ir, assetMap, sourceUrl, { primitives: input.primitives, components, linkRewrite, classOf, styleOf, sections, svgs }, wires, motionSpec, menus, accordions, lottieSpec);
+  const pageTsx = generatePageTsx(ir, assetMap, sourceUrl, { primitives: input.primitives, components, linkRewrite, classOf, styleOf, sections, svgs }, wires, motionSpec, menus, accordions, lottieSpec, hoverSpec, videoSpec);
   // Tailwind mode: utilities live in the JSX; ditto.css carries only pseudo-elements +
   // keyframes + interaction CSS (keyed by [data-cid], since nodes have no c<id> class).
   // Tailwind mode folds hover/focus into the className as `hover:`/`focus:` variant utilities
@@ -2854,6 +2864,8 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   if (accordions.length) writeText(join(rootDir, "ditto", "Accordion.tsx"), ACCORDION_TSX);
   if (motionHasContent(motionSpec)) writeText(join(rootDir, "ditto", "DittoMotion.tsx"), DITTO_MOTION_TSX);
   if (lottieHasContent(lottieSpec)) writeText(join(rootDir, "ditto", "DittoLottie.tsx"), DITTO_LOTTIE_TSX);
+  if (hoverHasContent(hoverSpec)) writeText(join(rootDir, "ditto", "DittoHover.tsx"), DITTO_HOVER_TSX);
+  if (videoHasContent(videoSpec)) writeText(join(rootDir, "ditto", "DittoVideo.tsx"), DITTO_VIDEO_TSX);
   if (menus.length) writeText(join(rootDir, "ditto", "DropdownMenu.tsx"), DROPDOWN_MENU_TSX);
   const routeSummary = routeSummaryFromIr(ir, "/", "/", sourceUrl);
   if (framework === "next") {

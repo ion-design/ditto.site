@@ -173,6 +173,10 @@ export function stripDeliveryDataCids(appDir: string): { removed: number; kept: 
           for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "lottie");
         } else if (line.includes("<DittoWire") || line.includes("<Accordion")) {
           for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "interaction");
+        } else if (line.includes("<DittoHover")) {
+          for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "hover");
+        } else if (line.includes("<DittoVideo")) {
+          for (const m of line.matchAll(exactCidStringRe)) anchorFor(m[1]!, "video");
         } else if (line.includes("<DropdownMenu")) {
           for (const m of line.matchAll(/"trigger":\s*"([^"]+)"/g)) anchorFor(m[1]!, "menu-trigger");
         }
@@ -394,7 +398,7 @@ function pruneUnusedSvgDittoIds(files: string[]): void {
 }
 
 function rewriteRuntimeAnchorQueries(text: string, fileName: string): string {
-  if (!/^(?:DittoMotion|DittoLottie|DittoWire|DropdownMenu|Accordion)\.tsx$/.test(fileName)) return text;
+  if (!/^(?:DittoMotion|DittoLottie|DittoWire|DittoHover|DittoVideo|DropdownMenu|Accordion)\.tsx$/.test(fileName)) return text;
   let next = text
     .replace(/\bbyCid\b/g, "byDittoId")
     .replace(/const byDittoId = \(cid: string\): HTMLElement \| null => document\.querySelector\('\[data-cid="' \+ cid \+ '"\]'\);/g,

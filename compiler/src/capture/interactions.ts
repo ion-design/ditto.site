@@ -1,4 +1,6 @@
 import type { Page } from "playwright";
+import { captureJsHovers, type HoverJsTrigger } from "./hoverJs.js";
+import { captureVideoPlayers, type VideoPlayerCapture } from "./video.js";
 
 /**
  * Interaction capture driver (Stage 4). Runs AFTER the settled base snapshot, only
@@ -118,6 +120,11 @@ export type InteractionCapture = {
   candidates: number; // how many affordances were driven
   patterns: PatternSpec[]; // M2+: recognized tabs/accordion (capId-keyed)
   menus?: MenuCapture[]; // M4b: mount-on-open dropdowns/mega-menus (panel not in base DOM)
+  // Script-driven hover states (Webflow IX2 / Framer whileHover) — invisible to the
+  // forced-pseudo-class driver, captured by real pointer events + global observation.
+  hoverJs?: HoverJsTrigger[];
+  // Poster + play-affordance video mockups, replayed inline on click (DittoVideo).
+  videos?: VideoPlayerCapture[];
 };
 
 /** A mount-on-open menu (Radix-style portal): the panel is added to <body> on open and
@@ -334,7 +341,15 @@ export async function captureInteractions(page: Page, opts?: { maxCandidates?: n
     for (const el of Array.from(document.querySelectorAll("a, button, [role='button'], input, select, textarea, summary, label, [tabindex]"))) set.add(el);
     for (const el of Array.from(document.querySelectorAll("*"))) {
       if (set.size > 4000) break;
-      try { if (getComputedStyle(el).cursor === "pointer") set.add(el); } catch { /* ignore */ }
+      try {
+        const cs = getComputedStyle(el);
+        if (cs.cursor === "pointer") { set.add(el); continue; }
+        // An animating transform/box-shadow transition advertises a hover-pop target even
+        // without cursor:pointer (a card that scales on :hover but isn't itself a link).
+        // The per-element diff self-limits, so a non-hover transition costs nothing.
+        const tp = (cs.transitionProperty || "").toLowerCase();
+        if (/transform|box-shadow|all/.test(tp) && (cs.transitionDuration || "").split(",").some((d) => parseFloat(d) > 0)) set.add(el);
+      } catch { /* ignore */ }
     }
     const out: Array<{ id: number; cap: string }> = [];
     for (const el of set) { const c = visibleCap(el); if (c != null) out.push({ id: parseInt(c, 10), cap: c }); }
@@ -496,11 +511,32 @@ export async function captureInteractions(page: Page, opts?: { maxCandidates?: n
 
   log({ event: "interactions_hover_focus", candidates: candidates.length, hover: Object.keys(hover).length, focus: Object.keys(focus).length, hoverDesc: Object.keys(hoverDesc).length });
 
+  // Script-driven hovers (IX2 / whileHover) — real pointer events + global observation,
+  // run before the click-driving passes while the page is still in its resting state.
+  const hoverJs = await captureJsHovers(page, { log });
+
+  // Poster + play video mockups (drive-and-undo; leaves the page in its base state).
+  // MUST run before drivePatterns: the non-ARIA disclosure discovery clicks elements
+  // with click listeners, and a play affordance clicked there starts playback and
+  // hides the overlay one-way — the mockup would no longer be recognizable (and its
+  // caps are claimed below so pattern discovery never drives them).
+  const videos = await captureVideoPlayers(page, { log });
+  const videoCaps = new Set<string>();
+  for (const v of videos) {
+    videoCaps.add(v.frameCap); videoCaps.add(v.triggerCap); videoCaps.add(v.media.cap);
+    for (const o of v.overlays) videoCaps.add(o.cap);
+  }
+
   // M2: recognize + drive discrete patterns (tabs / accordion).
-  const patterns = await drivePatterns(page, log);
+  const patterns = await drivePatterns(page, log, videoCaps);
   const menus = await captureMenus(page, log);
 
-  return { hover, focus, hoverDesc: Object.keys(hoverDesc).length ? hoverDesc : undefined, candidates: candidates.length, patterns, menus: menus.length ? menus : undefined };
+  return {
+    hover, focus, hoverDesc: Object.keys(hoverDesc).length ? hoverDesc : undefined,
+    candidates: candidates.length, patterns, menus: menus.length ? menus : undefined,
+    hoverJs: hoverJs.length ? hoverJs : undefined,
+    videos: videos.length ? videos : undefined,
+  };
 }
 
 // ---- M2: tabs + accordion ----
@@ -646,7 +682,7 @@ async function recognizePatterns(page: Page): Promise<{ tabs: TabsStruct[]; acco
   });
 }
 
-async function drivePatterns(page: Page, log: (e: Record<string, unknown>) => void): Promise<PatternSpec[]> {
+async function drivePatterns(page: Page, log: (e: Record<string, unknown>) => void, claimedCaps?: Set<string>): Promise<PatternSpec[]> {
   let struct: { tabs: TabsStruct[]; accordions: AccStruct[]; carousels: CarStruct[]; disclosures: DisclStruct[] };
   try { struct = await recognizePatterns(page); }
   catch { struct = { tabs: [], accordions: [], carousels: [], disclosures: [] }; }
@@ -978,7 +1014,9 @@ async function drivePatterns(page: Page, log: (e: Record<string, unknown>) => vo
   // navigation is detected (URL change) and aborts discovery; only a clean, reversible
   // display flip is kept, so non-disclosure handlers (add-to-cart, analytics) are dropped.
   try {
-    const nonAria = await discoverNonAriaDisclosures(page, usedCapSet(patterns), { readState, clickCap, settle, closeAll, displayDiffers, displayReproducible, relBoxOf, descStyles, descDiff, log });
+    const used = usedCapSet(patterns);
+    for (const c of claimedCaps ?? []) used.add(c); // video-player caps: clicking a play affordance is one-way
+    const nonAria = await discoverNonAriaDisclosures(page, used, { readState, clickCap, settle, closeAll, displayDiffers, displayReproducible, relBoxOf, descStyles, descDiff, log });
     if (nonAria.length) patterns.push({ kind: "disclosure", rootCap: nonAria[0]!.triggerCap, items: nonAria });
   } catch (e) { log({ event: "interactions_nonaria_error", error: String(e).slice(0, 150) }); }
 
