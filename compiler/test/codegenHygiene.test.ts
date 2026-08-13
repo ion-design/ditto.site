@@ -197,3 +197,18 @@ describe("javascript: hrefs are emitted as an inert '#' (FIX 5)", () => {
     assert.equal(hrefOf(a), "https://example.test/products");
   });
 });
+
+// U+00A0 is CONTENT, not collapsible formatting: CSS `white-space:normal` collapses only
+// document white space ([ \t\n\r\f]). An nbsp is what pins a label's min-content to its full
+// width so a flex row can't squeeze-wrap it — collapsing it to a plain space let remento's
+// "YOUR PURCHASE INCLUDES" divider label wrap to three lines.
+describe("non-breaking spaces survive JSX text collapse", () => {
+  it("preserves U+00A0 while still collapsing document whitespace", () => {
+    const label = node("n1", "div", computed(), [{ text: "\n\tYour\u00A0purchase\u00A0includes\n\t" }]);
+    const root = node("n0", "body", computed(), [label]);
+    const tsx = generatePageTsx(irWith(root), new Map(), "https://example.test/");
+    assert.ok(tsx.includes("Your\u00A0purchase\u00A0includes"), "nbsp survives into JSX text");
+    assert.ok(!tsx.includes("Your purchase includes"), "nbsp is not degraded to a plain space");
+    assert.ok(!/\{"[^"]*\\n[^"]*"\}/.test(tsx), "document whitespace still collapses");
+  });
+});

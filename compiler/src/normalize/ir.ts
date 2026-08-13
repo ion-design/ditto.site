@@ -134,24 +134,62 @@ export function irContentExtent(root: IRNode, vp: number): number {
  * If an element has exactly one URL background at some sampled widths and
  * `none`/missing at the rest, treat the gaps as lazy-load misses rather than a
  * responsive swap. Multi-URL cases are left untouched.
+ *
+ * Swap guard: a RESPONSIVE swap (media queries paint the background only at some
+ * widths — remento's gift-certificate card: `url(...)` + 210px/100% 89%/no-repeat at
+ * mobile, `none` at desktop) must NOT be backfilled — grafting the url into a `none`
+ * viewport pairs it with that viewport's captured companions (size:auto, position:0% 0%,
+ * repeat:repeat — the defaults `none` legitimately reports), painting the raw image
+ * tiled from the corner at a width the source shows no image at all. The discriminator
+ * is the companions: size/position/repeat come from CSS at that width regardless of
+ * whether a lazy loader has injected the image yet, so a genuine lazy miss keeps its
+ * authored companions while a swap's `none` viewports report pure defaults. Skip the
+ * fill only on that exact signature (every url viewport authors a companion AND the gap
+ * viewport authors none); ambiguous cases keep the lazy rescue.
  */
 export function backfillLazyBackgrounds(ir: IR): void {
   const hasUrl = (bg: string | undefined): boolean =>
     !!bg && /\burl\(/.test(bg) && !/^\s*(?:linear|radial|conic)-gradient/.test(bg);
+  // A capture-synthesized iframe still (capture.ts frame-still fallback) rides a
+  // `clone-frame.local` URL and exists ONLY at the canonical viewport (with its injected
+  // `100% 100%` / `no-repeat` companions). It is the compiler's own artifact, not source CSS —
+  // the swap discriminator must not apply; spread it, companions included, so the still keeps
+  // covering the iframe box at every width instead of tiling at the defaults.
+  const isSyntheticStill = (bg: string): boolean => bg.includes("//clone-frame.local/");
+  const authorsCompanions = (cs: StyleMap): boolean =>
+    (!!cs.backgroundSize && cs.backgroundSize !== "auto") ||
+    (!!cs.backgroundPosition && cs.backgroundPosition !== "0% 0%" && cs.backgroundPosition !== "0px 0px") ||
+    (!!cs.backgroundRepeat && cs.backgroundRepeat !== "repeat");
   const visit = (n: IRNode): void => {
     const urls = new Set<string>();
     let hasGap = false;
+    let donorsAuthor = true;
+    let donor: StyleMap | undefined;
     for (const k of Object.keys(n.computedByVp)) {
-      const bg = n.computedByVp[Number(k)]?.backgroundImage;
-      if (hasUrl(bg)) urls.add(bg!);
-      else if (bg === undefined || bg === "none" || bg === "") hasGap = true;
+      const cs = n.computedByVp[Number(k)];
+      const bg = cs?.backgroundImage;
+      if (hasUrl(bg)) {
+        urls.add(bg!);
+        donor ??= cs;
+        if (cs && !authorsCompanions(cs)) donorsAuthor = false;
+      } else if (bg === undefined || bg === "none" || bg === "") hasGap = true;
     }
     if (hasGap && urls.size === 1) {
       const bg = [...urls][0]!;
+      const synthetic = isSyntheticStill(bg);
       for (const k of Object.keys(n.computedByVp)) {
         const cs = n.computedByVp[Number(k)];
         if (cs && (cs.backgroundImage === undefined || cs.backgroundImage === "none" || cs.backgroundImage === "")) {
+          if (!synthetic && donorsAuthor && !authorsCompanions(cs)) continue; // responsive swap, not a lazy miss
           cs.backgroundImage = bg;
+          // The still's injected sizing must travel with it (it only ever existed at the
+          // canonical viewport) — without it the spread still paints at background-size:auto,
+          // tiled from the corner, at every other width.
+          if (synthetic && donor && !authorsCompanions(cs)) {
+            if (donor.backgroundSize) cs.backgroundSize = donor.backgroundSize;
+            if (donor.backgroundPosition) cs.backgroundPosition = donor.backgroundPosition;
+            if (donor.backgroundRepeat) cs.backgroundRepeat = donor.backgroundRepeat;
+          }
         }
       }
     }
