@@ -151,3 +151,27 @@ describe("declToUtil text-wrap", () => {
     assert.equal(declToUtil("text-wrap", "stable"), "[text-wrap:stable]");
   });
 });
+
+// Guardrail: a captured non-default background-size / background-position / object-position must
+// NEVER be dropped — Tailwind names only the keyword sizes (cover/contain/auto), so every other
+// value rides the exact arbitrary form. An emitter regression here silently paints a background
+// at the wrong scale/origin (the class of bug behind remento's zoomed gift-certificate card).
+describe("declToUtil background/object props survive as arbitrary values", () => {
+  it("maps keyword background-size, falls back to the exact arbitrary property otherwise", () => {
+    assert.equal(declToUtil("background-size", "cover"), "bg-cover");
+    assert.equal(declToUtil("background-size", "contain"), "bg-contain");
+    assert.equal(declToUtil("background-size", "437px"), "[background-size:437px]");
+    assert.equal(declToUtil("background-size", "100% 100%"), "[background-size:100%_100%]");
+  });
+
+  it("emits background-position via the arbitrary property (no keyword map)", () => {
+    assert.equal(declToUtil("background-position", "50% 20%"), "[background-position:50%_20%]");
+    assert.equal(declToUtil("background-position", "100% 89%"), "[background-position:100%_89%]");
+    assert.equal(declToUtil("background-position", "center top"), "[background-position:center_top]");
+  });
+
+  it("emits object-position as object-[…]", () => {
+    assert.equal(declToUtil("object-position", "50% 20%"), "object-[50%_20%]");
+    assert.equal(declToUtil("object-position", "left bottom"), "object-[left_bottom]");
+  });
+});

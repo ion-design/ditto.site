@@ -288,9 +288,13 @@ function jsxText(raw: string): string {
  *  markup carries content — not the source file's frozen formatting. Leading/trailing single
  *  spaces are KEPT (JSX-significant for inline flow); the boundary is preserved so `word <b>x</b>`
  *  keeps its space. A run that is entirely whitespace collapses to a single space. The text gate
- *  compares whitespace-normalized (gates.ts:normText), so this stays faithful. */
+ *  compares whitespace-normalized (gates.ts:normText), so this stays faithful.
+ *  ONLY document white space ([ \t\n\r\f], the class CSS actually collapses) — never JS `\s`,
+ *  which also eats U+00A0. A non-breaking space is CONTENT, not formatting: it is what pins a
+ *  label's min-content to its full width so a flex row can't squeeze-wrap it (remento's
+ *  "YOUR PURCHASE INCLUDES" divider label wrapped to three lines once its nbsp collapsed). */
 function collapseWs(raw: string): string {
-  const collapsed = raw.replace(/\s+/g, " ");
+  const collapsed = raw.replace(/[ \t\n\r\f]+/g, " ");
   return collapsed;
 }
 
@@ -1845,8 +1849,10 @@ const NORMALIZED_TEXT_CONTENT_FIELDS = new Set([
   "badge", "label", "price", "readTime", "stat", "title", "tooltip",
 ]);
 
+// Same document-white-space class as collapseWs (never JS `\s`): a content field's U+00A0 is
+// content — it survives into content.ts so an extracted label renders with its nbsp intact.
 function normalizeTextContent(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
+  return value.replace(/[ \t\n\r\f]+/g, " ").replace(/^ +| +$/g, "");
 }
 
 function normalizeContentBody(body: string, fields: FieldType[]): string {

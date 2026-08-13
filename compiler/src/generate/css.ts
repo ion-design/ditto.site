@@ -1375,8 +1375,22 @@ function absoluteMediaCoversParent(node: IRNode, parentNode: IRNode | undefined,
     if (pos !== "absolute" && pos !== "fixed") return false;
     if (pos === "absolute" && !/^(relative|absolute|fixed|sticky)$/.test(pcs.position || "")) return false;
     const sideVals = [cs.top, cs.right, cs.bottom, cs.left];
-    if (sideVals.some((v) => v == null || v === "" || v === "auto" || Math.abs(pf(v)) > 1)) return false;
-    if (pf(cs.marginTop) !== 0 || pf(cs.marginRight) !== 0 || pf(cs.marginBottom) !== 0 || pf(cs.marginLeft) !== 0) return false;
+    if (sideVals.some((v) => v == null || v === "" || v === "auto")) return false;
+    // Two ways an absolute media element covers its containing block: the plain `inset:0` fill
+    // (zero insets, zero margins), or the legacy negative-inset cover idiom — Webflow's background
+    // video ships `inset:-100%; margin:auto; width:100%; height:100%; object-fit:cover`, whose USED
+    // values bake as inset:-W/-H + margin:+W/+H. Those frozen constants cancel by construction at
+    // ANY containing-block size (x = cb.left + margin-left + left, and margin-left + left == 0 —
+    // proven by the box-equality checks below at every painted width), so with `w-full h-full`
+    // emitted the box keeps covering between the sampled widths instead of freezing at one band's
+    // px (the remento "Our story" video rendering 576px wide inside a 656px card at 1440). The
+    // relaxed branch is scoped to object-fit cover/contain — the idiom's own safety: the media
+    // re-crops to the box, so no aspect distortion is possible.
+    const coverFit = /cover|contain/.test(cs.objectFit || "");
+    if (!coverFit) {
+      if (sideVals.some((v) => Math.abs(pf(v)) > 1)) return false;
+      if (pf(cs.marginTop) !== 0 || pf(cs.marginRight) !== 0 || pf(cs.marginBottom) !== 0 || pf(cs.marginLeft) !== 0) return false;
+    }
     const cbX = pos === "fixed" ? 0 : pb.x + pf(pcs.borderLeftWidth);
     const cbY = pos === "fixed" ? 0 : pb.y + pf(pcs.borderTopWidth);
     const cbW = pos === "fixed" ? vp : pb.width - pf(pcs.borderLeftWidth) - pf(pcs.borderRightWidth);

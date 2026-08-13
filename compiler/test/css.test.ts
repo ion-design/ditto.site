@@ -1517,3 +1517,47 @@ describe("generateCss sticky full-width wrapper is viewport-tracking (no px free
     assert.ok(/width:280px/.test(allRulesX(css, "n1")), `a fixed-width sticky rail keeps its px, got: ${allRulesX(css, "n1")}`);
   });
 });
+
+// Cover-idiom media fill: Webflow's background video ships `inset:-100%; margin:auto;
+// width:100%; height:100%; object-fit:cover`, whose USED values bake as inset:-W/-H +
+// margin:+W/+H + width/height:W/Hpx. The frozen offsets cancel at any containing-block size
+// (left + margin-left == 0), but the baked width/height freeze one band's px — at an unsampled
+// width the video stops tracking its fluid wrapper (remento's "Our story" video rendering
+// 576px wide inside a 656px card at 1440). absoluteMediaCoversParent recognizes the idiom —
+// border box == containing block at every painted width + object-fit cover/contain — and
+// emits width/height:100% so the media keeps covering between the sampled widths.
+describe("collectNodeRules absolute cover-idiom media fill", () => {
+  const COVER_W: Record<number, number> = { 375: 335, 1280: 576 };
+  const COVER_H: Record<number, number> = { 375: 240, 1280: 578.72 };
+  function coverFixture(objectFit?: string): IRNode {
+    const video = node("n2", "video", computed({ position: "absolute" }));
+    const wrap = node("n1", "div", computed({ position: "absolute" }), [video]);
+    const root = node("n0", "body", computed(), [wrap]);
+    for (const vp of VPS) {
+      const w = COVER_W[vp]!; const h = COVER_H[vp]!;
+      wrap.bboxByVp[vp] = { x: 40, y: 100, width: w, height: h };
+      video.bboxByVp[vp] = { x: 40, y: 100, width: w, height: h };
+      video.computedByVp[vp] = computed({
+        position: "absolute",
+        ...(objectFit ? { objectFit } : {}),
+        top: `${-h}px`, bottom: `${-h}px`, left: `${-w}px`, right: `${-w}px`,
+        marginTop: `${h}px`, marginBottom: `${h}px`, marginLeft: `${w}px`, marginRight: `${w}px`,
+        width: `${w}px`, height: `${h}px`,
+      });
+    }
+    return root;
+  }
+
+  it("emits width/height:100% for an object-cover video whose box equals its containing block", () => {
+    const rules = collectNodeRules(irWith(coverFixture("cover")), new Map());
+    const base = rules.get("n2")!.base;
+    assert.equal(base.get("width"), "100%", "width follows the containing block");
+    assert.equal(base.get("height"), "100%", "height follows the containing block");
+  });
+
+  it("keeps the baked px without object-fit cover/contain (idiom not proven)", () => {
+    const rules = collectNodeRules(irWith(coverFixture()), new Map());
+    const base = rules.get("n2")!.base;
+    assert.equal(base.get("width"), "576px", "non-cover media keeps its captured width");
+  });
+});
