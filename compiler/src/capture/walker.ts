@@ -349,6 +349,12 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       if (name.startsWith("on")) continue;
       attrs[name] = a.value;
     }
+    // `muted` is the one playback flag that does NOT reflect to an attribute: the HTML spec
+    // backs it with `defaultMuted`, so `<video muted>` written by React/Vue (which assign the
+    // IDL property) leaves `el.attributes` empty. Capturing attributes alone therefore emits a
+    // video that Chrome refuses to autoplay — it paints a frozen first frame instead of playing.
+    // Read the live property so generation can mirror it.
+    if ((tag === "video" || tag === "audio") && (el as HTMLMediaElement).muted) attrs.muted = "";
 
     const resolveLH = (style: RawStyle): void => {
       if (style.lineHeight === "normal" && style.fontSize) {

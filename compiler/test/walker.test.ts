@@ -513,3 +513,54 @@ describe("walker shadow-DOM composed-tree serialization (FIX 1)", () => {
     assert.ok(!plain.inShadow, "plain light DOM is not tagged inShadow");
   });
 });
+
+// `muted` is the only playback flag with no attribute reflection: the HTML spec backs it with
+// `defaultMuted`, so frameworks that assign the IDL property (React's `muted` prop, Vue's
+// `:muted`) leave `el.attributes` empty. Serializing attributes alone therefore emitted a
+// <video> that Chrome refuses to autoplay — it paints a frozen first frame instead of playing.
+describe("walker media muted property capture", () => {
+  let browser: Browser;
+  let page: Page;
+  before(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage();
+  });
+  after(async () => {
+    await browser.close();
+  });
+
+  const capture = async (html: string) => {
+    await page.setContent(html);
+    await page.evaluate("globalThis.__name = globalThis.__name || ((fn) => fn);");
+    return page.evaluate(collectPage);
+  };
+
+  it("records muted when only the IDL property is set (the React/Vue case)", async () => {
+    const snap = await capture(`
+      <video id="v" autoplay loop playsinline></video>
+      <script>document.getElementById('v').muted = true;</script>`);
+    const video = findByTag(snap.root, "video")!;
+    assert.equal(video.attrs.muted, "", "the muted property must survive into the capture");
+    assert.equal(video.attrs.autoplay, "", "reflecting attributes are still captured verbatim");
+  });
+
+  it("keeps the muted attribute when it is authored in markup", async () => {
+    const snap = await capture(`<video muted autoplay></video>`);
+    const video = findByTag(snap.root, "video")!;
+    assert.equal(video.attrs.muted, "");
+  });
+
+  it("does not invent muted on an unmuted media element", async () => {
+    const snap = await capture(`<video id="v" controls></video>`);
+    const video = findByTag(snap.root, "video")!;
+    assert.ok(!("muted" in video.attrs), "an audible video must not be silenced by capture");
+  });
+
+  it("captures the muted property on <audio> as well", async () => {
+    const snap = await capture(`
+      <audio id="a" controls></audio>
+      <script>document.getElementById('a').muted = true;</script>`);
+    const audio = findByTag(snap.root, "audio")!;
+    assert.equal(audio.attrs.muted, "");
+  });
+});
