@@ -25,14 +25,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "drizzle-orm": "^0.45.2",
-    "pg": "^8.13.1",
-    "pg-boss": "^10.1.5"
+    "drizzle-orm": "^0.45.3",
+    "pg": "^8.23.0",
+    "pg-boss": "^12.34.0"
   },
   "devDependencies": {
     "@cloner/test-utils": "*",
     "@types/node": "22.10.5",
-    "@types/pg": "^8.11.10",
+    "@types/pg": "^8.23.1",
     "drizzle-kit": "^0.31.10",
     "tsx": "4.22.4",
     "typescript": "5.7.3"
