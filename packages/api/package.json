@@ -28,10 +28,10 @@
     "@cloner/core": "*",
     "@cloner/db": "*",
     "@cloner/storage": "*",
-    "@hono/node-server": "^1.13.7",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.12.31",
-    "zod": "^3.24.1"
+    "@hono/node-server": "^2.1.1",
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "hono": "^4.13.9",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@cloner/test-utils": "*",
