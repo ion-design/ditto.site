@@ -367,11 +367,14 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     // Sizing-intent probe: does the browser re-derive this box when we drop its
     // width/height? Ground truth for whether the generator can omit the baked dimension. Run AFTER
     // the canonical cs/bbox are recorded and fully restored after, so the capture is unchanged — it
-    // only ADDS three booleans. Skipped for out-of-flow, replaced, hidden, and animated elements.
+    // only ADDS sizing evidence. Out-of-flow text boxes need the same evidence: baking their
+    // shrink-to-fit width can round it below max-content and wrap an originally single-line label.
+    // Replaced, hidden, and animated elements remain excluded.
     let sizing: RawSizing | undefined;
     const probePos = cs.position || "static";
+    const positionedText = (probePos === "absolute" || probePos === "fixed") && !!el.textContent?.trim();
     if (
-      (probePos === "static" || probePos === "relative") && r.width > 1 && cs.display !== "none" &&
+      (probePos === "static" || probePos === "relative" || positionedText) && r.width > 1 && cs.display !== "none" &&
       (cs.animationName || "none") === "none" && (el as HTMLElement).style &&
       !/^(img|svg|video|canvas|picture|iframe|input|textarea|select|hr|object|embed|br)$/.test(tag)
     ) {
@@ -436,7 +439,8 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       } finally {
         restore();
       }
-    } else if (
+    }
+    if (
       (probePos === "absolute" || probePos === "fixed") && cs.display !== "none" &&
       (cs.animationName || "none") === "none" && (el as HTMLElement).style
     ) {
@@ -461,7 +465,7 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
           h.style.removeProperty(side); if (sv) h.style.setProperty(side, sv, svp);
         }
       }
-      sizing = { wAuto: false, wFill: false, hAuto: false, insetDrop: drop };
+      sizing = { wAuto: false, wFill: false, hAuto: false, ...sizing, insetDrop: drop };
     }
 
     const node: RawNode = {
