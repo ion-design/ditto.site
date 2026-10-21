@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Positioned badge sizing</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 40px; }
+    .card { position: relative; width: 200px; border: 1px solid #ddd;
+      border-radius: 12px; padding: 28px; margin: 32px 0; }
+    .badge { position: absolute; top: -13px; left: 24px; background: #2f6df6;
+      color: white; font-size: 12px; font-weight: 700; padding: 4px 12px;
+      border-radius: 999px; margin: 0; }
+    .border-box { box-sizing: border-box; }
+    .authored { width: 50px; }
+  </style>
+</head>
+<body>
+  <h1>Positioned badge sizing</h1>
+  <div class="card"><p id="content-box" class="badge">Most popular</p><h2>Content box</h2></div>
+  <div class="card"><p id="border-box" class="badge border-box">Most popular</p><h2>Border box</h2></div>
+  <div class="card"><p id="wrapped-text" class="badge"><span>Most popular</span></p><h2>Inline wrapper</h2></div>
+  <div class="card"><p id="authored" class="badge authored">Most popular</p><h2>Authored width</h2></div>
+</body>
+</html>
