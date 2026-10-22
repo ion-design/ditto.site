@@ -1,0 +1,14 @@
+app = "ion-ditto-worker"
+primary_region = "sjc"
+kill_signal = "SIGTERM"
+kill_timeout = "120s"
+[build]
+  dockerfile = "../../docker/worker.Dockerfile"
+[env]
+  NODE_ENV = "production"
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 4
+  memory = "8gb"
+[[restart]]
+  policy = "always"
