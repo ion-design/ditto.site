@@ -1,0 +1,12 @@
+.git
+**/node_modules
+**/.next
+**/test-results
+**/playwright-report
+**/.env
+**/.env.*
+!**/.env.example
+compiler/.harness2
+artifacts
+data
+*.log

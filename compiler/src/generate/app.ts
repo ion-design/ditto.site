@@ -2908,9 +2908,12 @@ export const PACKAGE_JSON = `{
     "start": "next start"
   },
   "dependencies": {
-    "next": "15.5.19",
+    "next": "15.5.29",
     "react": "19.2.7",
     "react-dom": "19.2.7"
+  },
+  "overrides": {
+    "postcss": "^8.5.33"
   },
   "devDependencies": {
     "typescript": "5.7.3",
@@ -2932,9 +2935,12 @@ export const PACKAGE_JSON_TW = `{
     "start": "next start"
   },
   "dependencies": {
-    "next": "15.5.19",
+    "next": "15.5.29",
     "react": "19.2.7",
     "react-dom": "19.2.7"
+  },
+  "overrides": {
+    "postcss": "^8.5.33"
   },
   "devDependencies": {
     "typescript": "5.7.3",
