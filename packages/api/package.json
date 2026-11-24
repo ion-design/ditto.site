@@ -28,15 +28,15 @@
     "@cloner/core": "*",
     "@cloner/db": "*",
     "@cloner/storage": "*",
-    "@hono/node-server": "^1.13.7",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.12.31",
-    "zod": "^3.24.1"
+    "@hono/node-server": "^2.1.11",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.21",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloner/test-utils": "*",
     "@types/node": "22.10.5",
-    "tsx": "4.22.4",
+    "tsx": "4.23.15",
     "typescript": "5.7.3"
   }
 }

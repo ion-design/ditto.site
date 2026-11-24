@@ -2,9 +2,11 @@
   "name": "clone-build-harness",
   "version": "0.1.0",
   "private": true,
-  "scripts": { "build": "next build" },
+  "scripts": {
+    "build": "next build"
+  },
   "dependencies": {
-    "next": "15.5.19",
+    "next": "15.5.29",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },
@@ -13,5 +15,8 @@
     "@types/node": "22.10.5",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.33"
   }
 }

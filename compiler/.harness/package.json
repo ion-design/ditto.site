@@ -6,7 +6,7 @@
     "build": "next build"
   },
   "dependencies": {
-    "next": "15.5.19",
+    "next": "15.5.29",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },
@@ -19,5 +19,8 @@
     "tailwindcss": "^4.3.1",
     "typescript": "5.7.3",
     "vite": "^6.4.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.33"
   }
 }
