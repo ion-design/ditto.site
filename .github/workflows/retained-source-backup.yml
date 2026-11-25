@@ -1,0 +1,61 @@
+name: Retained source backup
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0,12 * * *'
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: retained-source-backup
+  cancel-in-progress: false
+jobs:
+  capture:
+    if: >-
+      github.ref == 'refs/heads/main' && vars.SOC2_BACKUP_APPROVED == 'true' &&
+      (github.event_name == 'workflow_dispatch' || vars.SOC2_BACKUP_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_REGION: us-west-2
+      AWS_DEFAULT_REGION: us-west-2
+      AWS_PAGER: ''
+      EXPECTED_AWS_ACCOUNT: '644416497645'
+      BACKUP_BUCKET: ion-saas-recovery-644416497645-us-west-2
+      BACKUP_CORE_REPOSITORY: ion-design/ditto.site
+      BACKUP_CORE_ENABLE_APPROVED_NETWORK: '1'
+      BACKUP_CORE_SCOPE_SHA256: '8dcfe1aadf7d415439da480f8aad770c0155178d51366a4446cdae2e943db4d4'
+      BACKUP_APPROVAL_ID: ${{ vars.SOC2_BACKUP_APPROVAL_ID }}
+      BACKUP_IMAGE: ${{ vars.SOC2_BACKUP_IMAGE }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          role-to-assume: ${{ vars.SOC2_BACKUP_CAPTURE_ROLE_ARN }}
+          aws-region: us-west-2
+          allowed-account-ids: '644416497645'
+          role-duration-seconds: 3600
+          role-session-name: source-backup-${{ github.run_id }}
+      - name: Pull the reviewed immutable backup runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$BACKUP_APPROVAL_ID"
+          case "$BACKUP_IMAGE" in
+            644416497645.dkr.ecr.us-west-2.amazonaws.com/*@sha256:fc2bf3943ec4d5e311c321f96e895e3cfdf715663696b7d31c01cd2bc81d1dde) ;;
+            *) echo 'Unreviewed backup image'; exit 1 ;;
+          esac
+          aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 644416497645.dkr.ecr.us-west-2.amazonaws.com
+          docker pull "$BACKUP_IMAGE"
+      - name: Capture only this repository into its retained private prefix
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --read-only --mount type=volume,target=/tmp --cpus 1 --memory 4g \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION -e AWS_DEFAULT_REGION -e EXPECTED_AWS_ACCOUNT \
+            -e GITHUB_TOKEN -e GITHUB_ACTIONS -e GITHUB_REPOSITORY -e GITHUB_REF \
+            -e BACKUP_BUCKET -e BACKUP_CORE_REPOSITORY -e BACKUP_CORE_SCOPE_SHA256 \
+            -e BACKUP_CORE_ENABLE_APPROVED_NETWORK -e BACKUP_APPROVAL_ID \
+            --entrypoint python "$BACKUP_IMAGE" /app/code/critical_runner.py
