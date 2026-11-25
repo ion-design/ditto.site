@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
           test -n "$BACKUP_APPROVAL_ID"
           case "$BACKUP_IMAGE" in
-            644416497645.dkr.ecr.us-west-2.amazonaws.com/*@sha256:fc2bf3943ec4d5e311c321f96e895e3cfdf715663696b7d31c01cd2bc81d1dde) ;;
+            644416497645.dkr.ecr.us-west-2.amazonaws.com/*@sha256:7d90e9b586283f7a050f2cec3512371093848734a523d22c64d7c26ac24dfaf5) ;;
             *) echo 'Unreviewed backup image'; exit 1 ;;
           esac
           aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 644416497645.dkr.ecr.us-west-2.amazonaws.com
